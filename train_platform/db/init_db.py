@@ -17,35 +17,14 @@ def init_db() -> None:
 
 
 def _seed_architectures(db: Session) -> None:
-    from train_platform.models.enums import TaskType
     from train_platform.models.architecture import ModelArchitecture
+    from train_platform.db.seed_data import DEFAULT_ARCHITECTURES
 
-    defaults = [
-        # Ultralytics YOLO (detection)
-        dict(family="YOLOv8", variant="yolov8n", task_type=TaskType.DETECTION, engine="ultralytics-yolo"),
-        dict(family="YOLOv8", variant="yolov8s", task_type=TaskType.DETECTION, engine="ultralytics-yolo"),
-        dict(family="YOLOv11", variant="yolo11n", task_type=TaskType.DETECTION, engine="ultralytics-yolo"),
-        dict(family="YOLOv11", variant="yolo11s", task_type=TaskType.DETECTION, engine="ultralytics-yolo"),
-        # Placeholders for future engines (no trainer yet)
-        dict(family="MMDet", variant="rtmdet_tiny", task_type=TaskType.DETECTION, engine="mmdet"),
-        dict(family="DETR", variant="detr_resnet50", task_type=TaskType.DETECTION, engine="detr"),
-    ]
+    # Only seed when table is empty.
+    # If user already has rows (custom architectures), leave them untouched.
+    has_any = db.query(ModelArchitecture.architecture_id).limit(1).first()
+    if has_any:
+        return
 
-    added = 0
-    for d in defaults:
-        exists = (
-            db.query(ModelArchitecture)
-            .filter(
-                ModelArchitecture.family == d["family"],
-                ModelArchitecture.variant == d["variant"],
-                ModelArchitecture.task_type == d["task_type"],
-            )
-            .first()
-        )
-        if exists:
-            continue
-        db.add(ModelArchitecture(**d))
-        added += 1
-
-    if added:
-        db.commit()
+    db.add_all([ModelArchitecture(**d) for d in DEFAULT_ARCHITECTURES])
+    db.commit()
