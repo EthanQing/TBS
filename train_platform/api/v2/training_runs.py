@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi import WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
+from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
 from train_platform.models.dataset import DatasetVersion
 from train_platform.models.enums import TrainingRunStatus
-from train_platform.models.training_run import TrainingRun, TrainingRunEpochMetric, TrainingRunEvent
+from train_platform.models.training_run import TrainingRun, TrainingRunArtifact, TrainingRunEpochMetric, TrainingRunEvent
 from train_platform.schemas.v2.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v2.training_runs import (
     TrainingRunArtifactOut,
@@ -18,6 +20,8 @@ from train_platform.schemas.v2.training_runs import (
     TrainingRunCompareResponse,
     TrainingRunEpochMetricOut,
     TrainingRunEventOut,
+    TrainingRunExportOut,
+    TrainingRunExportRequest,
     TrainingRunLogTailOut,
     TrainingRunCreate,
     TrainingRunMetaOut,
@@ -123,6 +127,132 @@ def list_training_run_epoch_metrics(run_id: str, limit: int = Query(5000, ge=1, 
 @router.get("/{run_id}/artifacts", response_model=list[TrainingRunArtifactOut])
 def list_training_run_artifacts(run_id: str, db: Session = Depends(get_db)):
     return TrainingRunService().list_artifacts(db, run_id)
+
+
+@router.post("/{run_id}/export", response_model=TrainingRunExportOut)
+def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Session = Depends(get_db)):
+    """
+    Export a training run to a deployable format.
+
+    Currently supported:
+    - pt: raw weights download (best/last)
+    - onnx: Ultralytics export (YOLOv8 -> ONNX)
+    """
+    run = TrainingRunService().get_run(db, run_id)
+
+    fmt = str(payload.format or "pt").strip().lower()
+    weights = str(payload.weights or "best").strip().lower()
+    if fmt not in ("pt", "onnx"):
+        raise ValidationError("Unsupported export format")
+    if weights not in ("best", "last"):
+        raise ValidationError("weights must be 'best' or 'last'")
+
+    weights_dir = (settings.training_dir / str(run.run_id) / "weights").resolve(strict=False)
+    src_pt = (weights_dir / ("best.pt" if weights == "best" else "last.pt")).resolve(strict=False)
+    if settings.training_dir.resolve() not in src_pt.parents:
+        raise ValidationError("Unsafe weights path")
+    if not src_pt.exists():
+        raise ValidationError(f"Weights not found: {src_pt.name}")
+
+    if fmt == "pt":
+        rel = src_pt.relative_to(settings.training_dir).as_posix()
+        url = f"/static/training/{rel}"
+        return TrainingRunExportOut(run_id=str(run.run_id), format=fmt, weights=weights, download_url=url, artifact=None)
+
+    # fmt == onnx
+    out_name = "best.onnx" if weights == "best" else "last.onnx"
+    out_onnx = (weights_dir / out_name).resolve(strict=False)
+    if settings.training_dir.resolve() not in out_onnx.parents:
+        raise ValidationError("Unsafe output path")
+
+    if not out_onnx.exists():
+        # Convert using Ultralytics exporter (best-effort).
+        try:
+            from ultralytics import YOLO
+        except Exception as e:  # pragma: no cover
+            raise ValidationError(f"Ultralytics not installed: {type(e).__name__}: {e}")
+
+        # Ensure safe torch load on Windows for Ultralytics weights.
+        try:
+            from train_platform.training.plugins.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
+
+            _apply_torch_safe_load_patches()
+        except Exception:
+            pass
+
+        model = YOLO(str(src_pt))
+
+        export_kwargs = {"dynamic": bool(payload.dynamic)}
+        if payload.opset is not None:
+            export_kwargs["opset"] = int(payload.opset)
+        if payload.imgsz is not None:
+            export_kwargs["imgsz"] = int(payload.imgsz)
+
+        exported = model.export(format="onnx", **export_kwargs)
+
+        # Ultralytics may return a path; ensure the canonical output exists at out_onnx.
+        exported_path: Path | None = None
+        try:
+            if exported:
+                exported_path = Path(str(exported)).resolve(strict=False)
+        except Exception:
+            exported_path = None
+
+        if not out_onnx.exists():
+            newest: Path | None = None
+            run_root = (settings.training_dir / str(run.run_id)).resolve(strict=False)
+            try:
+                # Prefer weights/*.onnx, fallback to any *.onnx under the run folder.
+                candidates = list(weights_dir.glob("*.onnx"))
+                if not candidates:
+                    candidates = list(run_root.rglob("*.onnx"))
+                for cand in candidates:
+                    if newest is None or cand.stat().st_mtime > newest.stat().st_mtime:
+                        newest = cand
+            except Exception:
+                newest = None
+
+            if exported_path and exported_path.exists():
+                newest = exported_path
+
+            if newest and newest.exists() and newest != out_onnx:
+                try:
+                    newest.replace(out_onnx)
+                except Exception:
+                    import shutil
+
+                    shutil.copy2(newest, out_onnx)
+
+        if not out_onnx.exists():
+            raise ValidationError("ONNX export failed: output file not found")
+
+    # Upsert an artifact row so UI can list/download it later.
+    rel = out_onnx.relative_to(settings.training_dir).as_posix()
+    db.query(TrainingRunArtifact).filter(
+        TrainingRunArtifact.run_id == str(run.run_id),
+        TrainingRunArtifact.kind == "export",
+        TrainingRunArtifact.name == out_name,
+    ).delete()
+
+    size_bytes = None
+    try:
+        size_bytes = int(out_onnx.stat().st_size)
+    except Exception:
+        size_bytes = None
+
+    art = TrainingRunArtifact(run_id=str(run.run_id), kind="export", name=out_name, path=rel, size_bytes=size_bytes)
+    db.add(art)
+    db.commit()
+    db.refresh(art)
+
+    url = f"/static/training/{rel}"
+    return TrainingRunExportOut(
+        run_id=str(run.run_id),
+        format=fmt,
+        weights=weights,
+        download_url=url,
+        artifact=TrainingRunArtifactOut.model_validate(art),
+    )
 
 
 @router.post("/compare", response_model=TrainingRunCompareResponse)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -24,6 +24,7 @@ from train_platform.models.training_run import (
 from train_platform.models.training_run_meta import TrainingRunMeta
 from train_platform.repositories.training_run_meta_repo import TrainingRunMetaRepository
 from train_platform.repositories.training_run_repo import TrainingRunRepository
+from train_platform.utils.training_artifacts import index_completion_artifacts
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -75,6 +76,69 @@ class TrainingRunService:
         self.runs = TrainingRunRepository()
         self.meta_repo = TrainingRunMetaRepository()
 
+    def _stdout_has_completion_marker(self, run_id: str) -> bool:
+        marker = f"[train_entry] completed run_id={str(run_id)}"
+        path = settings.training_dir / str(run_id) / "logs" / "train.stdout.log"
+        tail = _tail_text_file(path, lines=120)
+        return marker in tail
+
+    def _maybe_repair_run_status(self, db: Session, run: TrainingRun) -> bool:
+        """
+        Recover false FAILED/RUNNING status when the worker heartbeat was lost but the training
+        subprocess actually completed and wrote its completion marker to stdout.
+
+        Returns True if the run was modified and needs commit.
+        """
+        if not run:
+            return False
+
+        now = _utcnow()
+        stale_after = int(os.getenv("WORKER_STALE_AFTER_SECONDS", "120"))
+        threshold = now - timedelta(seconds=stale_after)
+
+        msg = str(getattr(run, "error_message", "") or "").strip()
+        heartbeat_lost_failed = (
+            run.status == TrainingRunStatus.FAILED and msg == "Worker heartbeat lost; marking as failed"
+        )
+        stale_running = (
+            run.status == TrainingRunStatus.RUNNING
+            and getattr(run, "heartbeat_at", None) is not None
+            and getattr(run, "heartbeat_at", None) < threshold
+        )
+
+        if not (heartbeat_lost_failed or stale_running):
+            return False
+
+        if not self._stdout_has_completion_marker(run.run_id):
+            return False
+
+        run.status = TrainingRunStatus.COMPLETED
+        run.finished_at = run.finished_at or now
+        run.error_message = None
+        run.worker_id = None
+        run.claimed_at = None
+        run.pid = None
+        run.heartbeat_at = None
+        try:
+            run.progress = max(int(getattr(run, "progress", 0) or 0), 100)
+        except Exception:
+            run.progress = 100
+
+        db.add(
+            TrainingRunEvent(
+                run_id=str(run.run_id),
+                level=LogLevel.INFO,
+                event_type="recovered",
+                message="Recovered run status to COMPLETED (completion marker found in stdout)",
+            )
+        )
+        try:
+            index_completion_artifacts(db, str(run.run_id))
+        except Exception:
+            pass
+
+        return True
+
     # --------------------
     # CRUD
     # --------------------
@@ -82,6 +146,9 @@ class TrainingRunService:
         run = self.runs.get(db, str(run_id))
         if not run:
             raise NotFoundError("Training run not found")
+        if self._maybe_repair_run_status(db, run):
+            db.commit()
+            db.refresh(run)
         return run
 
     def list_runs(
@@ -96,7 +163,7 @@ class TrainingRunService:
         limit: int = 100,
         include_hidden: bool = False,
     ) -> list[TrainingRun]:
-        return self.runs.list(
+        runs = self.runs.list(
             db,
             project_id=project_id,
             status=status,
@@ -106,6 +173,15 @@ class TrainingRunService:
             limit=limit,
             include_hidden=include_hidden,
         )
+
+        dirty = False
+        for r in runs:
+            if self._maybe_repair_run_status(db, r):
+                dirty = True
+        if dirty:
+            db.commit()
+
+        return runs
 
     def create_run(self, db: Session, *, obj: dict) -> TrainingRun:
         project_id = int(obj["project_id"])

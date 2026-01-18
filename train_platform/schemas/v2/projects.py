@@ -38,3 +38,11 @@ class ProjectOut(BaseModel):
 
     model_config = {"from_attributes": True}
 
+
+class ProjectModelSizeOut(BaseModel):
+    project_id: int
+    completed_models_count: int = 0
+    total_size_mb: float = 0.0
+
+    model_config = {"from_attributes": True}
+

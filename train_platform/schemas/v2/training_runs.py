@@ -178,3 +178,29 @@ class TrainingRunLogTailOut(BaseModel):
     which: str
     lines: int
     text: str
+
+
+class TrainingRunExportRequest(BaseModel):
+    """
+    Export/convert a completed YOLOv8 training run's weights to a deployable format.
+
+    Currently supported:
+    - pt: raw weights download (best/last)
+    - onnx: Ultralytics export (YOLOv8 -> ONNX)
+    """
+
+    format: str = Field("pt", description="pt | onnx")
+    weights: str = Field("best", description="best | last")
+
+    # ONNX options (best-effort; ignored for pt)
+    opset: int | None = Field(None, ge=9, le=20)
+    dynamic: bool = Field(True, description="dynamic axes (ONNX)")
+    imgsz: int | None = Field(None, ge=32, le=4096, description="image size (ONNX)")
+
+
+class TrainingRunExportOut(BaseModel):
+    run_id: str
+    format: str
+    weights: str
+    download_url: str
+    artifact: Optional[TrainingRunArtifactOut] = None
