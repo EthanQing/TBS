@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dataset Backend API Tester</title>
+    <style>
+        body { font-family: Segoe UI, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
+        .container { display: flex; gap: 20px; }
+        .controls { flex: 0 0 450px; display: flex; flex-direction: column; gap: 15px; height: 90vh; overflow-y: auto; padding-right: 10px; }
+        .output-area { flex: 1; display: flex; flex-direction: column; height: 90vh; }
+        .card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border: 1px solid #ddd; }
+        h2 { margin-top: 0; font-size: 1.2rem; color: #333; border-bottom: 2px solid #eee; padding-bottom: 8px; }
+        h3 { font-size: 1rem; margin: 10px 0 5px; color: #666; }
+        .form-group { margin-bottom: 10px; }
+        label { display: block; margin-bottom: 4px; font-weight: 500; font-size: 0.9rem; }
+        input[type="text"], input[type="number"], select, textarea { width: 100%; padding: 6px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        button { background-color: #0078d4; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; font-size: 0.9rem; transition: background 0.2s; }
+        button:hover { background-color: #005a9e; }
+        button.secondary { background-color: #e0e0e0; color: #333; }
+        button.secondary:hover { background-color: #ccc; }
+        button.danger { background-color: #d93025; }
+        button.danger:hover { background-color: #b31412; }
+        pre { background: #1e1e1e; color: #d4d4d4; padding: 10px; border-radius: 8px; overflow: auto; height: 100%; margin: 0; font-family: Consolas, monospace; font-size: 0.85rem; }
+        .row { display: flex; gap: 8px; align-items: flex-end; }
+        .row > * { flex: 1; }
+        .row > button { flex: 0 0 auto; }
+        .status-ok { color: green; }
+        .status-err { color: red; }
+        #global-config { position: sticky; top: 0; z-index: 100; margin-bottom: 15px; }
+    </style>
+</head>
+<body>
+
+<div class="card" id="global-config">
+    <div class="row">
+        <div>
+            <label>API Base URL</label>
+            <input type="text" id="api-base" value="http://localhost:18001/api/v2">
+        </div>
+        <button onclick="clearOutput()">清除日志</button>
+    </div>
+</div>
+
+<div class="container">
+    <div class="controls">
+        
+        <!-- 1. Dataset CRUD -->
+        <div class="card">
+            <h2>1. 数据集管理 (CRUD)</h2>
+            
+            <div class="form-group">
+                <button onclick="apiCall('/datasets', 'GET')">获取所有数据集列表 (List)</button>
+            </div>
+
+            <h3>创建数据集</h3>
+            <div class="form-group">
+                <label>Name</label>
+                <input type="text" id="create-name" placeholder="my-dataset">
+            </div>
+            <div class="form-group row">
+                <div>
+                    <label>Type</label>
+                    <select id="create-type">
+                        <option value="detection">Detection</option>
+                        <option value="segmentation">Segmentation</option>
+                        <option value="classification">Classification</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Storage Path (Relative)</label>
+                    <input type="text" id="create-path" placeholder="my-dataset">
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Description</label>
+                <input type="text" id="create-desc" placeholder="Optional description">
+            </div>
+            <button onclick="createDataset()">创建 (Create)</button>
+
+            <h3>单一数据集操作</h3>
+            <div class="form-group row">
+                <div style="flex:2">
+                    <label>Dataset ID</label>
+                    <input type="number" id="target-id" placeholder="ID">
+                </div>
+                <button onclick="apiCall('/datasets/' + val('target-id'), 'GET')" class="secondary">Get</button>
+                <button onclick="apiCall('/datasets/' + val('target-id'), 'DELETE')" class="danger">Del</button>
+            </div>
+            <div class="form-group">
+                <button onclick="apiCall('/datasets/' + val('target-id') + '/detail', 'GET')">获取详情 (Detail check)</button>
+            </div>
+
+            <h3>更新数据集</h3>
+            <div class="form-group row">
+                <div>
+                    <input type="text" id="update-name" placeholder="New Name">
+                </div>
+                <button onclick="updateDataset()">更新 (Patch)</button>
+            </div>
+        </div>
+
+        <!-- 2. Import / Upload -->
+        <div class="card">
+            <h2>2. 导入与上传 (Import/Upload)</h2>
+            
+            <h3>导入压缩包 (Import Zip)</h3>
+            <div class="form-group">
+                <input type="file" id="import-file">
+            </div>
+            <div class="form-group row">
+                <input type="text" id="import-name" placeholder="Dataset Name">
+                <select id="import-type">
+                    <option value="detection">Detection</option>
+                    <option value="segmentation">Segmentation</option>
+                    <option value="classification">Classification</option>
+                </select>
+            </div>
+            <button onclick="importDataset()">导入 (Import)</button>
+
+            <h3>上传图片 (Upload Images to ID)</h3>
+            <div class="form-group">
+                <label>Images (Multiple)</label>
+                <input type="file" id="upload-images" multiple>
+            </div>
+            <div class="form-group">
+                <label>Labels (Multiple, Optional)</label>
+                <input type="file" id="upload-labels" multiple>
+            </div>
+            <div class="form-group row">
+                 <label><input type="checkbox" id="upload-req-labels" checked> Require Labels</label>
+                 <label><input type="checkbox" id="upload-create-ver" checked> Create ver</label>
+            </div>
+             <div class="form-group">
+                 <input type="text" id="upload-msg" placeholder="Commit message">
+             </div>
+            <button onclick="uploadImages()">上传图片 (Upload)</button>
+        </div>
+
+        <!-- 3. Versions & Events -->
+        <div class="card">
+            <h2>3. 版本与事件 (Versions)</h2>
+            <div class="form-group row">
+                 <div style="flex:2"><input type="number" id="ver-ds-id" placeholder="Dataset ID"></div>
+                 <button onclick="apiCall('/datasets/' + val('ver-ds-id') + '/versions', 'GET')">List Vers</button>
+            </div>
+            
+            <h3>创建新版本 (Create Version)</h3>
+            <div class="form-group">
+                <input type="text" id="new-ver-msg" placeholder="Version message">
+            </div>
+            <button onclick="createVersion()">创建版本 (Create)</button>
+
+            <h3>版本操作</h3>
+            <div class="form-group row">
+                <input type="number" id="act-ver-id" placeholder="Version ID">
+                <button onclick="activateVersion()">Activate</button>
+            </div>
+            <div class="form-group row">
+                <input type="number" id="diff-ver-id" placeholder="Ver ID">
+                <input type="number" id="diff-base-id" placeholder="Base ID (Opt)">
+                <button onclick="diffVersions()">Diff</button>
+            </div>
+
+            <h3>其他</h3>
+            <button onclick="apiCall('/datasets/' + val('ver-ds-id') + '/events', 'GET')">列出事件 (Events)</button>
+            <button onclick="apiCall('/datasets/' + val('ver-ds-id') + '/statistics', 'GET')">统计信息 (Stats)</button>
+        </div>
+
+        <!-- 4. Files & Splits -->
+        <div class="card">
+            <h2>4. 文件与切分 (Files/Split)</h2>
+            <div class="form-group">
+                <input type="number" id="file-ds-id" placeholder="Dataset ID">
+            </div>
+            <button onclick="apiCall('/datasets/' + val('file-ds-id') + '/files', 'GET')">列出文件 (List Files)</button>
+
+            <h3>切分 (Split)</h3>
+            <div class="form-group row">
+                <div><label>Train Ratio</label><input type="number" id="split-train" value="0.8" step="0.1"></div>
+                <div><label>Val Ratio</label><input type="number" id="split-val" value="0.2" step="0.1"></div>
+            </div>
+            <button onclick="splitDataset()">执行切分 (Run Split)</button>
+            <button onclick="apiCall('/datasets/' + val('file-ds-id') + '/split', 'GET')" class="secondary">查看切分结果</button>
+        </div>
+
+    </div>
+    
+    <div class="output-area">
+        <div class="card" style="height: 100%; display: flex; flex-direction: column;">
+            <h3>Response Output</h3>
+            <pre id="output">Ready...</pre>
+        </div>
+    </div>
+</div>
+
+<script>
+    const getBase = () => document.getElementById('api-base').value.replace(/\/$/, "");
+    const val = (id) => document.getElementById(id).value;
+    const log = (data) => {
+        const out = document.getElementById('output');
+        const timestamp = new Date().toLocaleTimeString();
+        let text = typeof data === 'object' ? JSON.stringify(data, null, 2) : data;
+        out.innerHTML = `<span style="color:#888">[${timestamp}]</span>\n` + text + "\n\n" + out.innerHTML;
+    };
+
+    const clearOutput = () => document.getElementById('output').innerHTML = "Ready...";
+
+    async function apiCall(endpoint, method, body = null, isMultipart = false) {
+        const url = getBase() + endpoint;
+        const options = {
+            method: method,
+            headers: {}
+        };
+
+        if (body && !isMultipart) {
+            options.headers["Content-Type"] = "application/json";
+            options.body = JSON.stringify(body);
+        } else if (body && isMultipart) {
+            options.body = body; // FormData automatically sets boundary
+        }
+
+        log(`Request: ${method} ${url}`);
+
+        try {
+            const res = await fetch(url, options);
+            let data;
+            const contentType = res.headers.get("content-type");
+            if (contentType && contentType.includes("application/json")) {
+                data = await res.json();
+            } else {
+                data = await res.text();
+            }
+
+            if (!res.ok) {
+                log({ error: true, status: res.status, statusText: res.statusText, data });
+            } else {
+                log(data);
+            }
+            return data;
+        } catch (err) {
+            log({ error: true, message: err.message });
+        }
+    }
+
+    // --- Actions ---
+
+    function createDataset() {
+        apiCall('/datasets', 'POST', {
+            name: val('create-name'),
+            dataset_type: val('create-type'),
+            storage_path: val('create-path'),
+            description: val('create-desc')
+        });
+    }
+
+    function updateDataset() {
+        const id = val('target-id');
+        if(!id) return alert("Enter Dataset ID");
+        const payload = {};
+        if(val('update-name')) payload.name = val('update-name');
+        
+        apiCall('/datasets/' + id, 'PATCH', payload);
+    }
+
+    function importDataset() {
+        const fileInput = document.getElementById('import-file');
+        if (fileInput.files.length === 0) return alert("Select a zip file");
+
+        const formData = new FormData();
+        formData.append("file", fileInput.files[0]);
+        formData.append("name", val('import-name'));
+        formData.append("dataset_type", val('import-type'));
+        
+        // This endpoint expects multipart
+        apiCall('/datasets/import', 'POST', formData, true);
+    }
+
+    function uploadImages() {
+        const id = val('target-id');
+        if(!id) return alert("Enter Dataset ID in Section 1");
+        
+        const imgInput = document.getElementById('upload-images');
+        const lblInput = document.getElementById('upload-labels');
+        
+        if (imgInput.files.length === 0) return alert("Select images");
+
+        const formData = new FormData();
+        for (let i = 0; i < imgInput.files.length; i++) {
+            formData.append("files", imgInput.files[i]);
+        }
+        if (lblInput.files.length > 0) {
+            for (let i = 0; i < lblInput.files.length; i++) {
+                formData.append("labels", lblInput.files[i]);
+            }
+        }
+
+        formData.append("require_labels", document.getElementById('upload-req-labels').checked);
+        formData.append("create_version", document.getElementById('upload-create-ver').checked);
+        if(val('upload-msg')) formData.append("message", val('upload-msg'));
+
+        apiCall(`/datasets/${id}/uploads/images`, 'POST', formData, true);
+    }
+
+    function createVersion() {
+        const id = val('ver-ds-id');
+        if(!id) return alert("Enter Dataset ID in Section 3");
+            
+        apiCall(`/datasets/${id}/versions`, 'POST', {
+            message: val('new-ver-msg'),
+            create_snapshot: false // default false for now
+        });
+    }
+
+    function activateVersion() {
+        const dsId = val('ver-ds-id');
+        const verId = val('act-ver-id');
+        if(!dsId || !verId) return alert("Enter Dataset ID and Version ID");
+
+        apiCall(`/datasets/${dsId}/versions/${verId}/activate`, 'POST', {});
+    }
+
+    function diffVersions() {
+        const dsId = val('ver-ds-id');
+        const verId = val('diff-ver-id');
+        const baseId = val('diff-base-id');
+        if(!dsId || !verId) return alert("Enter IDs");
+
+        let url = `/datasets/${dsId}/versions/${verId}/diff`;
+        if(baseId) url += `?base_version_id=${baseId}`;
+        
+        apiCall(url, 'GET');
+    }
+
+    function splitDataset() {
+        const id = val('file-ds-id');
+        if(!id) return alert("Enter Dataset ID in Section 4");
+        
+        apiCall(`/datasets/${id}/split`, 'POST', {
+            train_ratio: parseFloat(val('split-train')),
+            val_ratio: parseFloat(val('split-val')),
+            shuffle: true,
+            overwrite: true
+        });
+    }
+
+</script>
+
+</body>
+</html>

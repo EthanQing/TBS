@@ -1,0 +1,28 @@
+[project]
+name = "train-platform-backend"
+version = "0.1.0"
+description = "Train platform backend (v2 rewrite)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi==0.111.0",
+  "uvicorn[standard]==0.29.0",
+  "SQLAlchemy==2.0.30",
+  "alembic==1.13.1",
+  "pymysql==1.1.0",
+  "python-dotenv==1.0.1",
+  "python-multipart==0.0.9",
+  "PyYAML==6.0.1",
+  "pandas==2.2.2",
+  "requests==2.32.3",
+  "Pillow==10.4.0",
+  "opencv-python-headless==4.9.0.80",
+  # Training runtimes (YOLO). You can remove/replace these when adding other engines.
+  "torch==2.3.1",
+  "torchvision==0.18.1",
+  "ultralytics==8.2.58",
+  "cryptography>=46.0.3",
+]
+
+[tool.uvicorn]
+factory = false

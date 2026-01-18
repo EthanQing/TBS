@@ -1,0 +1,422 @@
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy.orm import Session
+
+from train_platform.core.config import settings
+from train_platform.models.architecture import ModelArchitecture
+from train_platform.models.dataset import Dataset, DatasetVersion
+from train_platform.models.enums import LogLevel, TrainingRunStatus
+from train_platform.models.project import Project
+from train_platform.models.training_run import (
+    TrainingRun,
+    TrainingRunArtifact,
+    TrainingRunEpochMetric,
+    TrainingRunEvent,
+    TrainingRunParameters,
+    TrainingRunResult,
+)
+from train_platform.models.training_run_meta import TrainingRunMeta
+from train_platform.repositories.training_run_meta_repo import TrainingRunMetaRepository
+from train_platform.repositories.training_run_repo import TrainingRunRepository
+from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _tail_text_file(path, *, lines: int) -> str:
+    """
+    Read last N lines from a text file without loading the whole file.
+
+    Returns empty string if file does not exist.
+    """
+    try:
+        if not path or not path.exists() or not path.is_file():
+            return ""
+    except Exception:
+        return ""
+
+    # Read from end in binary chunks (works for large files and Windows CRLF).
+    chunk_size = 4096
+    data = b""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            while pos > 0 and data.count(b"\n") <= int(lines):
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos, os.SEEK_SET)
+                data = f.read(read_size) + data
+                if pos == 0:
+                    break
+    except Exception:
+        return ""
+
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        text = str(data)
+
+    parts = text.splitlines()
+    tail = parts[-int(lines) :] if parts else []
+    return "\n".join(tail)
+
+
+class TrainingRunService:
+    def __init__(self) -> None:
+        self.runs = TrainingRunRepository()
+        self.meta_repo = TrainingRunMetaRepository()
+
+    # --------------------
+    # CRUD
+    # --------------------
+    def get_run(self, db: Session, run_id: str) -> TrainingRun:
+        run = self.runs.get(db, str(run_id))
+        if not run:
+            raise NotFoundError("Training run not found")
+        return run
+
+    def list_runs(
+        self,
+        db: Session,
+        *,
+        project_id: Optional[int] = None,
+        status: Optional[TrainingRunStatus] = None,
+        dataset_id: Optional[int] = None,
+        architecture_id: Optional[int] = None,
+        skip: int = 0,
+        limit: int = 100,
+        include_hidden: bool = False,
+    ) -> list[TrainingRun]:
+        return self.runs.list(
+            db,
+            project_id=project_id,
+            status=status,
+            dataset_id=dataset_id,
+            architecture_id=architecture_id,
+            skip=skip,
+            limit=limit,
+            include_hidden=include_hidden,
+        )
+
+    def create_run(self, db: Session, *, obj: dict) -> TrainingRun:
+        project_id = int(obj["project_id"])
+        architecture_id = int(obj["architecture_id"])
+        dataset_version_id = obj.get("dataset_version_id")
+        params = obj["parameters"]
+
+        project = db.query(Project).filter(Project.project_id == project_id).first()
+        if not project:
+            raise NotFoundError("Project not found")
+
+        dataset = db.query(Dataset).filter(Dataset.dataset_id == project.dataset_id).first()
+        if not dataset:
+            raise NotFoundError("Dataset not found")
+
+        if dataset_version_id is None:
+            if dataset.active_version_id is None:
+                raise ConflictError("Dataset has no active version; create a dataset version first")
+            dataset_version_id = int(dataset.active_version_id)
+
+        ver = db.query(DatasetVersion).filter(DatasetVersion.version_id == int(dataset_version_id)).first()
+        if not ver:
+            raise NotFoundError("Dataset version not found")
+        if int(ver.dataset_id) != int(dataset.dataset_id):
+            raise ValidationError("dataset_version_id does not belong to this project's dataset")
+
+        arch = db.query(ModelArchitecture).filter(ModelArchitecture.architecture_id == architecture_id).first()
+        if not arch:
+            raise NotFoundError("Architecture not found")
+        if arch.task_type != project.task_type:
+            raise ValidationError("Architecture task_type does not match project task_type")
+
+        run_id = str(uuid.uuid4())
+        name = str(obj.get("name") or "").strip() or f"{arch.variant}-{run_id[:8]}"
+
+        run = TrainingRun(
+            run_id=run_id,
+            project_id=project.project_id,
+            dataset_version_id=int(ver.version_id),
+            architecture_id=arch.architecture_id,
+            name=name,
+            status=TrainingRunStatus.CREATED,
+            progress=0,
+            current_epoch=0,
+            total_epochs=int(params.get("epochs") or 0) if params else None,
+            hidden=False,
+            run_dir=run_id,
+            config=None,
+        )
+        db.add(run)
+        db.flush()
+
+        db.add(
+            TrainingRunParameters(
+                run_id=run_id,
+                epochs=int(params.get("epochs", 100)),
+                batch_size=int(params.get("batch_size", 16)),
+                image_size=int(params.get("image_size", 640)),
+                learning_rate=float(params.get("learning_rate", 0.01)),
+                patience=int(params.get("patience", 50)),
+                device=str(params.get("device") or "auto"),
+                workers=int(params.get("workers", 8)),
+                use_pretrained=bool(params.get("use_pretrained", True)),
+                optimizer=str(params.get("optimizer") or "AdamW"),
+                augmentation=params.get("augmentation"),
+                additional_params=params.get("additional_params"),
+            )
+        )
+
+        db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="created", message="Run created"))
+        db.commit()
+
+        return self.get_run(db, run_id)
+
+    def update_run(self, db: Session, run_id: str, *, patch: dict) -> TrainingRun:
+        run = self.get_run(db, run_id)
+        if "name" in patch and patch["name"] is not None:
+            run.name = str(patch["name"]).strip()
+        db.commit()
+        db.refresh(run)
+        return run
+
+    # --------------------
+    # queue control
+    # --------------------
+    def queue_run(self, db: Session, run_id: str) -> TrainingRun:
+        run = self.get_run(db, run_id)
+
+        if run.status in (TrainingRunStatus.RUNNING, TrainingRunStatus.COMPLETED):
+            raise ConflictError(f"Run status is {run.status}; cannot queue")
+        if run.status == TrainingRunStatus.DELETED:
+            raise ConflictError("Run is deleted")
+
+        if run.queued_at is None:
+            run.queued_at = _utcnow()
+        run.hidden = False
+        run.status = TrainingRunStatus.QUEUED
+        db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="queued", message="Run queued"))
+        db.commit()
+        db.refresh(run)
+        return run
+
+    def request_cancel(self, db: Session, run_id: str, *, reason: Optional[str] = None) -> TrainingRun:
+        run = self.get_run(db, run_id)
+        if run.cancel_requested_at is None:
+            run.cancel_requested_at = _utcnow()
+        if reason:
+            run.cancel_reason = str(reason)
+
+        # If not started yet, cancel immediately.
+        if run.status in (TrainingRunStatus.CREATED, TrainingRunStatus.QUEUED):
+            run.status = TrainingRunStatus.CANCELLED
+            run.finished_at = _utcnow()
+
+        db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="cancel_requested", message=reason or "Cancel requested"))
+        db.commit()
+        db.refresh(run)
+        return run
+
+    def request_delete(self, db: Session, run_id: str) -> TrainingRun:
+        run = self.get_run(db, run_id)
+
+        run.hidden = True
+        if run.delete_requested_at is None:
+            run.delete_requested_at = _utcnow()
+        if run.cancel_requested_at is None:
+            run.cancel_requested_at = _utcnow()
+
+        # If already terminal, mark deleted immediately.
+        if run.status in (TrainingRunStatus.COMPLETED, TrainingRunStatus.FAILED, TrainingRunStatus.CANCELLED):
+            run.status = TrainingRunStatus.DELETED
+            run.finished_at = run.finished_at or _utcnow()
+
+        db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="delete_requested", message="Delete requested"))
+        db.commit()
+        db.refresh(run)
+        return run
+
+    # --------------------
+    # metrics/events/artifacts
+    # --------------------
+    def list_events(self, db: Session, run_id: str, *, limit: int = 200) -> list[TrainingRunEvent]:
+        self.get_run(db, run_id)
+        return (
+            db.query(TrainingRunEvent)
+            .filter(TrainingRunEvent.run_id == str(run_id))
+            .order_by(TrainingRunEvent.created_at.desc())
+            .limit(int(limit))
+            .all()
+        )
+
+    def list_epoch_metrics(self, db: Session, run_id: str, *, limit: int = 5000) -> list[TrainingRunEpochMetric]:
+        self.get_run(db, run_id)
+        return (
+            db.query(TrainingRunEpochMetric)
+            .filter(TrainingRunEpochMetric.run_id == str(run_id))
+            .order_by(TrainingRunEpochMetric.epoch.asc())
+            .limit(int(limit))
+            .all()
+        )
+
+    def list_artifacts(self, db: Session, run_id: str) -> list[TrainingRunArtifact]:
+        self.get_run(db, run_id)
+        return (
+            db.query(TrainingRunArtifact)
+            .filter(TrainingRunArtifact.run_id == str(run_id))
+            .order_by(TrainingRunArtifact.created_at.desc())
+            .all()
+        )
+
+    # --------------------
+    # meta
+    # --------------------
+    def get_meta(self, db: Session, run_id: str) -> TrainingRunMeta:
+        self.get_run(db, run_id)
+        meta = self.meta_repo.get_by_run_id(db, run_id)
+        if meta:
+            return meta
+
+        meta = TrainingRunMeta(run_id=str(run_id))
+        db.add(meta)
+        db.commit()
+        db.refresh(meta)
+        return meta
+
+    def update_meta(self, db: Session, run_id: str, *, patch: dict) -> TrainingRunMeta:
+        self.get_run(db, run_id)
+        meta = self.meta_repo.get_by_run_id(db, run_id)
+        if not meta:
+            meta = TrainingRunMeta(run_id=str(run_id))
+            db.add(meta)
+            db.flush()
+
+        if "creator" in patch:
+            meta.creator = patch["creator"]
+        if "group" in patch:
+            meta.group_name = patch["group"]
+        if "tags" in patch:
+            meta.tags = patch["tags"]
+        if "notes" in patch:
+            meta.notes = patch["notes"]
+        if "extra" in patch:
+            meta.extra = patch["extra"]
+
+        db.commit()
+        db.refresh(meta)
+        return meta
+
+    # --------------------
+    # logs
+    # --------------------
+    def tail_logs(self, db: Session, run_id: str, *, which: str = "stdout", lines: int = 200) -> str:
+        """
+        Best-effort tail of worker-produced logs.
+
+        `which`: stdout | stderr
+        """
+        self.get_run(db, run_id)
+
+        which = (which or "").strip().lower()
+        if which not in ("stdout", "stderr"):
+            raise ValidationError("which must be 'stdout' or 'stderr'")
+
+        lines = int(lines)
+        if lines < 1 or lines > 2000:
+            raise ValidationError("lines must be between 1 and 2000")
+
+        log_name = "train.stdout.log" if which == "stdout" else "train.stderr.log"
+        path = settings.training_dir / str(run_id) / "logs" / log_name
+        return _tail_text_file(path, lines=lines)
+
+    # --------------------
+    # compare
+    # --------------------
+    def compare_runs(self, db: Session, run_ids: List[str]) -> Dict[str, Any]:
+        ids: List[str] = []
+        seen = set()
+        for x in run_ids or []:
+            s = str(x or "").strip()
+            if not s or s in seen:
+                continue
+            ids.append(s)
+            seen.add(s)
+
+        if len(ids) < 2:
+            raise ValidationError("At least 2 distinct run_ids are required for comparison")
+
+        runs_out: List[Dict[str, Any]] = []
+        params_by_run: Dict[str, Dict[str, Any]] = {}
+
+        for rid in ids:
+            run = self.get_run(db, rid)
+
+            p: Dict[str, Any] = {}
+            if run.parameters is not None:
+                p = {
+                    "epochs": int(run.parameters.epochs),
+                    "batch_size": int(run.parameters.batch_size),
+                    "image_size": int(run.parameters.image_size),
+                    "learning_rate": float(run.parameters.learning_rate),
+                    "patience": int(run.parameters.patience),
+                    "device": str(run.parameters.device),
+                    "workers": int(run.parameters.workers),
+                    "use_pretrained": bool(run.parameters.use_pretrained),
+                    "optimizer": str(run.parameters.optimizer),
+                }
+                add = run.parameters.additional_params or {}
+                if isinstance(add, dict):
+                    for k, v in add.items():
+                        if k not in p:
+                            p[k] = v
+
+            best_metrics = None
+            final_metrics = None
+            model_size_mb = None
+            if run.result is not None:
+                best_metrics = run.result.best_metrics
+                final_metrics = run.result.final_metrics
+                try:
+                    model_size_mb = float(run.result.model_size_mb) if run.result.model_size_mb is not None else None
+                except Exception:
+                    model_size_mb = None
+
+            runs_out.append(
+                {
+                    "run_id": run.run_id,
+                    "name": run.name,
+                    "status": run.status,
+                    "project_id": int(run.project_id),
+                    "dataset_version_id": int(run.dataset_version_id),
+                    "architecture_id": int(run.architecture_id),
+                    "created_at": run.created_at,
+                    "parameters": p,
+                    "best_metrics": best_metrics,
+                    "final_metrics": final_metrics,
+                    "model_size_mb": model_size_mb,
+                }
+            )
+            params_by_run[run.run_id] = p
+
+        def _norm(v: Any) -> str:
+            try:
+                return json.dumps(v, ensure_ascii=False, sort_keys=True, default=str)
+            except Exception:
+                return str(v)
+
+        all_keys = sorted({k for d in params_by_run.values() for k in d.keys()})
+        diff: Dict[str, Dict[str, Any]] = {}
+        for k in all_keys:
+            vals = {rid: params_by_run[rid].get(k) for rid in params_by_run.keys()}
+            if len({_norm(v) for v in vals.values()}) > 1:
+                diff[k] = vals
+
+        return {"runs": runs_out, "parameter_diff": diff}

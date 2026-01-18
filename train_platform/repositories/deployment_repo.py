@@ -1,0 +1,42 @@
+from __future__ import annotations
+
+from typing import Optional
+
+from sqlalchemy.orm import Session, joinedload
+
+from train_platform.models.deployment import Deployment
+from train_platform.models.enums import DeploymentStatus
+from train_platform.repositories.base import BaseRepository
+
+
+class DeploymentRepository(BaseRepository[Deployment]):
+    def __init__(self) -> None:
+        super().__init__(Deployment)
+
+    def get(self, db: Session, deployment_id: int) -> Optional[Deployment]:
+        return (
+            db.query(Deployment)
+            .options(joinedload(Deployment.logs))
+            .filter(Deployment.deployment_id == int(deployment_id))
+            .first()
+        )
+
+    def list(
+        self,
+        db: Session,
+        *,
+        model_version_id: Optional[int] = None,
+        status: Optional[DeploymentStatus] = None,
+        is_active: Optional[bool] = None,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> list[Deployment]:
+        q = db.query(Deployment)
+        if model_version_id is not None:
+            q = q.filter(Deployment.model_version_id == int(model_version_id))
+        if status is not None:
+            q = q.filter(Deployment.status == status)
+        if is_active is not None:
+            q = q.filter(Deployment.is_active == bool(is_active))
+        return q.order_by(Deployment.updated_at.desc()).offset(skip).limit(limit).all()
+

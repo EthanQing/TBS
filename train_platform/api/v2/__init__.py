@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+from fastapi import APIRouter
+
+from train_platform.api.v2.architectures import router as architectures_router
+from train_platform.api.v2.datasets import router as datasets_router
+from train_platform.api.v2.deployments import router as deployments_router
+from train_platform.api.v2.inference import router as inference_router
+from train_platform.api.v2.model_versions import router as model_versions_router
+from train_platform.api.v2.projects import router as projects_router
+from train_platform.api.v2.stats import router as stats_router
+from train_platform.api.v2.training_runs import router as training_runs_router
+
+
+router = APIRouter()
+router.include_router(datasets_router)
+router.include_router(projects_router)
+router.include_router(architectures_router)
+router.include_router(training_runs_router)
+router.include_router(model_versions_router)
+router.include_router(deployments_router)
+router.include_router(inference_router)
+router.include_router(stats_router)
