@@ -1,0 +1,38 @@
+# --- 必须忽略 (Git 白名单例外) ---
+# 如果你想强调 train_platform 是源码目录，保留也没事，但通常不需要
+# !train_platform/
+
+# --- 敏感文件 (必须忽略) ---
+.env
+.env.local
+*.key
+*.pem
+
+# --- Python 基础 ---
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- 虚拟环境 ---
+.venv/
+venv/
+env/
+
+# --- 项目数据与临时文件 ---
+datasets/
+training_runs/
+temp/
+*.log
+
+# --- IDE 配置 (个人配置不应提交) ---
+.vscode/
+.idea/
+
+# --- Python 构建与分发 (如果有打包需求) ---
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
