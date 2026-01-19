@@ -32,6 +32,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _ensure_aware_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _tail_text_file(path, *, lines: int) -> str:
     """
     Read last N lines from a text file without loading the whole file.
@@ -100,11 +108,8 @@ class TrainingRunService:
         heartbeat_lost_failed = (
             run.status == TrainingRunStatus.FAILED and msg == "Worker heartbeat lost; marking as failed"
         )
-        stale_running = (
-            run.status == TrainingRunStatus.RUNNING
-            and getattr(run, "heartbeat_at", None) is not None
-            and getattr(run, "heartbeat_at", None) < threshold
-        )
+        heartbeat_at = _ensure_aware_utc(getattr(run, "heartbeat_at", None))
+        stale_running = run.status == TrainingRunStatus.RUNNING and heartbeat_at is not None and heartbeat_at < threshold
 
         if not (heartbeat_lost_failed or stale_running):
             return False
