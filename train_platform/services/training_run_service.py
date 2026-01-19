@@ -411,8 +411,8 @@ class TrainingRunService:
             raise ValidationError("which must be 'stdout' or 'stderr'")
 
         lines = int(lines)
-        if lines < 1 or lines > 2000:
-            raise ValidationError("lines must be between 1 and 2000")
+        if lines < 1 or lines > 20000:
+            raise ValidationError("lines must be between 1 and 20000")
 
         log_name = "train.stdout.log" if which == "stdout" else "train.stderr.log"
         path = settings.training_dir / str(run_id) / "logs" / log_name

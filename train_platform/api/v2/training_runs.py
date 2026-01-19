@@ -274,12 +274,164 @@ def update_training_run_meta(run_id: str, payload: TrainingRunMetaUpdate, db: Se
 def tail_training_run_logs(
     run_id: str,
     which: str = Query("stdout", description="stdout|stderr"),
-    lines: int = Query(200, ge=1, le=2000),
+    lines: int = Query(200, ge=1, le=20000),
     db: Session = Depends(get_db),
 ):
     which_norm = str(which or "").strip().lower()
     text = TrainingRunService().tail_logs(db, run_id, which=which_norm, lines=lines)
     return TrainingRunLogTailOut(run_id=str(run_id), which=which_norm, lines=int(lines), text=text)
+
+
+@router.websocket("/{run_id}/logs/stream")
+async def stream_training_run_logs(websocket: WebSocket, run_id: str):
+    """
+    WebSocket: stream worker stdout/stderr logs by tailing the log files.
+
+    Path: /api/v2/training-runs/{run_id}/logs/stream?which=stdout|stderr|both&tail=200
+    """
+
+    def _read_new_lines(path: Path, pos: int, carry: str) -> tuple[int, str, list[str]]:
+        try:
+            if not path.exists() or not path.is_file():
+                return pos, carry, []
+
+            size = int(path.stat().st_size)
+            if pos < 0 or size < pos:
+                pos = 0
+                carry = ""
+
+            with open(path, "rb") as f:
+                f.seek(int(pos))
+                chunk = f.read()
+
+            if not chunk:
+                return pos, carry, []
+
+            pos = int(pos) + int(len(chunk))
+            text = chunk.decode("utf-8", errors="replace")
+            text = (carry or "") + text
+
+            # Keep the last partial line (if any) in carry to avoid flicker.
+            if text.endswith("\n") or text.endswith("\r"):
+                return pos, "", text.splitlines()
+
+            parts = text.splitlines()
+            if not parts:
+                return pos, text, []
+            carry = parts.pop()
+            return pos, carry, parts
+        except Exception:
+            return pos, carry, []
+
+    async def _send_lines(which: str, mode: str, lines: list[str]) -> None:
+        if not lines:
+            return
+        await websocket.send_json({"type": "log", "data": {"which": which, "mode": mode, "lines": lines}})
+
+    await websocket.accept()
+
+    which = str(websocket.query_params.get("which") or "stdout").strip().lower()
+    tail_raw = websocket.query_params.get("tail")
+    try:
+        tail_lines = int(tail_raw) if tail_raw is not None else 200
+    except Exception:
+        tail_lines = 200
+    tail_lines = max(0, min(int(tail_lines), 5000))
+
+    want_stdout = which in ("stdout", "both", "all")
+    want_stderr = which in ("stderr", "both", "all")
+    if not (want_stdout or want_stderr):
+        want_stdout = True
+
+    stdout_path = (settings.training_dir / str(run_id) / "logs" / "train.stdout.log").resolve(strict=False)
+    stderr_path = (settings.training_dir / str(run_id) / "logs" / "train.stderr.log").resolve(strict=False)
+
+    pos_stdout = 0
+    pos_stderr = 0
+    carry_stdout = ""
+    carry_stderr = ""
+
+    try:
+        # Validate run exists & send an initial tail for context.
+        with SessionLocal() as db:
+            run = db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id)).first()
+            if not run:
+                await websocket.send_json({"type": "error", "data": {"message": "run not found"}})
+                await websocket.close(code=1008)
+                return
+
+            if tail_lines > 0:
+                svc = TrainingRunService()
+                if want_stdout:
+                    text = svc.tail_logs(db, str(run_id), which="stdout", lines=int(tail_lines))
+                    await _send_lines("stdout", "tail", (text or "").splitlines())
+                if want_stderr:
+                    text = svc.tail_logs(db, str(run_id), which="stderr", lines=int(tail_lines))
+                    await _send_lines("stderr", "tail", (text or "").splitlines())
+
+        # Start streaming from the end (tail already sent).
+        try:
+            if want_stdout and stdout_path.exists():
+                pos_stdout = int(stdout_path.stat().st_size)
+        except Exception:
+            pos_stdout = 0
+        try:
+            if want_stderr and stderr_path.exists():
+                pos_stderr = int(stderr_path.stat().st_size)
+        except Exception:
+            pos_stderr = 0
+
+        while True:
+            if want_stdout:
+                pos_stdout, carry_stdout, lines = _read_new_lines(stdout_path, pos_stdout, carry_stdout)
+                if lines:
+                    await _send_lines("stdout", "append", lines)
+            if want_stderr:
+                pos_stderr, carry_stderr, lines = _read_new_lines(stderr_path, pos_stderr, carry_stderr)
+                if lines:
+                    await _send_lines("stderr", "append", lines)
+
+            with SessionLocal() as db:
+                run = db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id)).first()
+                if not run:
+                    await websocket.send_json({"type": "error", "data": {"message": "run not found"}})
+                    await websocket.close(code=1008)
+                    return
+
+                if run.status in (
+                    TrainingRunStatus.COMPLETED,
+                    TrainingRunStatus.FAILED,
+                    TrainingRunStatus.CANCELLED,
+                    TrainingRunStatus.DELETED,
+                ):
+                    # Best-effort: flush remaining lines once before closing.
+                    if want_stdout:
+                        pos_stdout, carry_stdout, lines = _read_new_lines(stdout_path, pos_stdout, carry_stdout)
+                        if lines:
+                            await _send_lines("stdout", "append", lines)
+                    if want_stderr:
+                        pos_stderr, carry_stderr, lines = _read_new_lines(stderr_path, pos_stderr, carry_stderr)
+                        if lines:
+                            await _send_lines("stderr", "append", lines)
+
+                    await websocket.send_json({"type": "done", "data": {"status": getattr(run.status, "value", run.status)}})
+                    await asyncio.sleep(0.5)
+                    await websocket.close()
+                    return
+
+            await asyncio.sleep(1.0)
+
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "data": {"message": f"{type(e).__name__}: {e}"}})
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
 
 @router.websocket("/{run_id}/metrics/stream")
