@@ -138,7 +138,11 @@ def update_project(project_id: int, payload: ProjectUpdate, db: Session = Depend
 
 
 @router.delete("/{project_id}", response_model=DeleteResponse)
-def delete_project(project_id: int, db: Session = Depends(get_db)):
-    ProjectService().delete_project(db, project_id)
+def delete_project(
+    project_id: int,
+    force: bool = Query(False, description="Delete project and all related training runs/model versions"),
+    db: Session = Depends(get_db),
+):
+    ProjectService().delete_project(db, project_id, force=bool(force))
     return DeleteResponse(ok=True, message="Project deleted")
 

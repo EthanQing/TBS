@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
@@ -71,9 +71,36 @@ def update_dataset(dataset_id: int, payload: DatasetUpdate, db: Session = Depend
 
 
 @router.delete("/{dataset_id}", response_model=DeleteResponse)
-def delete_dataset(dataset_id: int, delete_files: bool = False, db: Session = Depends(get_db)):
-    DatasetService().delete_dataset(db, dataset_id, delete_files=bool(delete_files))
+def delete_dataset(
+    dataset_id: int,
+    delete_files: bool = False,
+    force: bool = Query(False, description="Delete dataset and all related projects/training runs/model versions"),
+    db: Session = Depends(get_db),
+):
+    DatasetService().delete_dataset(db, dataset_id, delete_files=bool(delete_files), force=bool(force))
     return DeleteResponse(ok=True, message="Dataset deleted")
+
+
+@router.post("/{dataset_id}/upload", response_model=DatasetOut, status_code=201)
+async def upload_dataset_archive(
+    dataset_id: int,
+    file: UploadFile = File(...),
+    message: str | None = Form(None),
+    created_by: str | None = Form(None),
+    create_version: bool = Form(True),
+    activate: bool = Form(True),
+    db: Session = Depends(get_db),
+):
+    ds, _ver = DatasetService().upload_dataset_archive(
+        db,
+        int(dataset_id),
+        file=file,
+        message=message,
+        created_by=created_by,
+        create_version=bool(create_version),
+        activate=bool(activate),
+    )
+    return ds
 
 
 @router.post("/import", response_model=DatasetOut, status_code=201)

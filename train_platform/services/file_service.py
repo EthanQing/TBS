@@ -83,6 +83,86 @@ class FileService:
             self._safe_cleanup(dataset_dir, temp_extract_dir, temp_file)
             raise
 
+    def upload_dataset_into_existing(self, file: UploadFile, dataset_dir: Path, dataset_type: DatasetType) -> Path:
+        dataset_dir = Path(dataset_dir)
+        datasets_root = settings.datasets_dir.resolve()
+        dataset_dir = dataset_dir.resolve()
+        if dataset_dir == datasets_root or (datasets_root not in dataset_dir.parents and dataset_dir != datasets_root):
+            raise ValidationError("Dataset directory must be under BASE_DATASETS_DIR")
+
+        filename = file.filename or ""
+        if not filename.endswith((".zip", ".tar.gz", ".tar", ".tgz")):
+            raise ValidationError("Unsupported file format.")
+
+        # Ensure target dir is empty (allow pre-created empty folder).
+        if dataset_dir.exists():
+            try:
+                if any(dataset_dir.iterdir()):
+                    raise ConflictError("Dataset directory is not empty.")
+            except ConflictError:
+                raise
+            except Exception:
+                pass
+            # Remove empty dir so move/copy can create it.
+            try:
+                dataset_dir.rmdir()
+            except Exception:
+                pass
+
+        temp_extract_dir = datasets_root / f"_tmp_extract_{dataset_dir.name}"
+        safe_upload_name = Path(filename).name or "upload"
+        temp_file = datasets_root / f"_tmp_upload_{dataset_dir.name}_{safe_upload_name}"
+
+        try:
+            with open(temp_file, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+
+            temp_extract_dir.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.chmod(temp_extract_dir, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+
+            if filename.endswith(".zip"):
+                with zipfile.ZipFile(temp_file, "r") as zip_ref:
+                    self._safe_extract_zip(zip_ref, temp_extract_dir)
+            elif filename.endswith((".tar.gz", ".tgz")):
+                with tarfile.open(temp_file, "r:gz") as tar_ref:
+                    self._safe_extract_tar(tar_ref, temp_extract_dir)
+            elif filename.endswith(".tar"):
+                with tarfile.open(temp_file, "r") as tar_ref:
+                    self._safe_extract_tar(tar_ref, temp_extract_dir)
+
+            extracted = list(temp_extract_dir.iterdir())
+            extracted_root = temp_extract_dir
+            if len(extracted) == 1 and extracted[0].is_dir():
+                extracted_root = extracted[0]
+
+            source_root = extracted_root
+            if dataset_type == DatasetType.DETECTION:
+                yolo_root = self._find_yolo_export_root(extracted_root)
+                if yolo_root is not None:
+                    source_root = yolo_root
+
+            # Move into datasets/<dataset_name>.
+            try:
+                shutil.move(str(source_root), str(dataset_dir))
+            except Exception:
+                shutil.copytree(source_root, dataset_dir)
+
+            self._validate_dataset_structure(dataset_dir, dataset_type)
+
+            self._safe_cleanup(temp_extract_dir, temp_file)
+            return dataset_dir
+        except Exception:
+            # Best-effort cleanup; keep an empty dir so dataset record remains usable.
+            self._safe_cleanup(temp_extract_dir, temp_file)
+            try:
+                if not dataset_dir.exists():
+                    dataset_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            raise
+
+
     def _safe_extract_zip(self, zip_ref: zipfile.ZipFile, target_dir: Path) -> None:
         for info in zip_ref.infolist():
             rel = Path(str(info.filename or "").replace("\\", "/"))

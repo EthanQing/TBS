@@ -13,6 +13,7 @@ from train_platform.repositories.training_run_repo import TrainingRunRepository
 from train_platform.training.plugins.base import TrainContext
 from train_platform.training.registry import get_trainer
 from train_platform.utils.path_utils import resolve_dataset_path
+from train_platform.utils.mlflow_utils import init_mlflow_logger
 
 
 def _utcnow() -> datetime:
@@ -64,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
     run_id = str(args.run_id)
 
     db = SessionLocal()
+    mlflow_logger = None
+    mlflow_status = None
     try:
         run = TrainingRunRepository().get(db, run_id)
         if not run or not run.parameters or not run.project or not run.project.dataset or not run.dataset_version or not run.architecture:
@@ -93,35 +96,47 @@ def main(argv: list[str] | None = None) -> int:
         trainer = get_trainer(model_family=key)
         run_dir = settings.training_dir / run_id
 
+        mlflow_logger = init_mlflow_logger(run, dataset_path=str(dataset_path), run_dir=str(run_dir))
+
+        def upsert_epoch_metrics(epoch: int, metrics: Dict[str, float]) -> None:
+            _upsert_epoch_metrics(run_id, epoch, metrics)
+            if mlflow_logger:
+                mlflow_logger.log_metrics(metrics, step=int(epoch))
+
         ctx = TrainContext(
             job_id=run_id,
             job=run,
             dataset_path=dataset_path,
             run_dir=run_dir,
             cancel_requested=lambda: _cancel_requested(run_id),
-            upsert_epoch_metrics=lambda epoch, metrics: _upsert_epoch_metrics(run_id, epoch, metrics),
+            upsert_epoch_metrics=upsert_epoch_metrics,
         )
 
         print(f"[train_entry] start run_id={run_id} trainer={getattr(trainer, 'name', type(trainer).__name__)}", flush=True)
         trainer.run(ctx)
+        mlflow_status = "FINISHED"
         print(f"[train_entry] completed run_id={run_id}", flush=True)
         return 0
     except KeyboardInterrupt:
+        mlflow_status = "KILLED"
         print(f"[train_entry] interrupted run_id={run_id}", file=sys.stderr, flush=True)
         return 130
     except SystemExit as e:
+        mlflow_status = "KILLED" if _cancel_requested(run_id) else "FAILED"
         try:
             return int(e.code or 0)
         except Exception:
             return 0
     except Exception as e:
+        mlflow_status = "FAILED"
         print(f"[train_entry] error run_id={run_id}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         traceback.print_exc()
         return 1
     finally:
+        if mlflow_logger:
+            mlflow_logger.terminate(status=mlflow_status or "FAILED")
         db.close()
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

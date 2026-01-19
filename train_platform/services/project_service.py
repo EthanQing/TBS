@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from train_platform.models.deployment import Deployment
+from train_platform.models.model_registry import ModelVersion
 from train_platform.models.project import Project
 from train_platform.models.training_run import TrainingRun
 from train_platform.repositories.dataset_repo import DatasetRepository
@@ -79,12 +81,32 @@ class ProjectService:
         db.refresh(p)
         return p
 
-    def delete_project(self, db: Session, project_id: int) -> None:
+    def delete_project(self, db: Session, project_id: int, *, force: bool = False) -> None:
         p = self.get_project(db, project_id)
 
-        runs_count = db.query(TrainingRun).filter(TrainingRun.project_id == p.project_id).count()
-        if runs_count > 0:
-            raise ConflictError(f"Cannot delete project; {runs_count} training run(s) still reference it")
+        runs = db.query(TrainingRun).filter(TrainingRun.project_id == p.project_id).all()
+        model_versions = db.query(ModelVersion).filter(ModelVersion.project_id == p.project_id).all()
+
+        if not force and (runs or model_versions):
+            parts = []
+            if runs:
+                parts.append(f"{len(runs)} training run(s)")
+            if model_versions:
+                parts.append(f"{len(model_versions)} model version(s)")
+            detail = " and ".join(parts) if parts else "references exist"
+            raise ConflictError(f"Cannot delete project; {detail} still reference it")
+
+        if model_versions:
+            mv_ids = [int(m.model_version_id) for m in model_versions]
+            if mv_ids:
+                deployments = db.query(Deployment).filter(Deployment.model_version_id.in_(mv_ids)).all()
+                for dep in deployments:
+                    db.delete(dep)
+            for mv in model_versions:
+                db.delete(mv)
+
+        for run in runs:
+            db.delete(run)
 
         db.delete(p)
         db.commit()

@@ -31,6 +31,7 @@ from train_platform.schemas.v2.training_runs import (
 )
 from train_platform.services.training_run_service import TrainingRunService
 from train_platform.utils.exceptions import ValidationError
+from train_platform.utils.mlflow_utils import fetch_mlflow_epoch_metrics
 
 
 router = APIRouter(prefix="/training-runs", tags=["training-runs"])
@@ -120,7 +121,17 @@ def list_training_run_events(run_id: str, limit: int = Query(200, ge=1, le=5000)
 
 
 @router.get("/{run_id}/metrics/epochs", response_model=list[TrainingRunEpochMetricOut])
-def list_training_run_epoch_metrics(run_id: str, limit: int = Query(5000, ge=1, le=100000), db: Session = Depends(get_db)):
+def list_training_run_epoch_metrics(
+    run_id: str,
+    limit: int = Query(5000, ge=1, le=100000),
+    source: str | None = Query(None, description="auto|db|mlflow"),
+    db: Session = Depends(get_db),
+):
+    source_norm = str(source or "auto").strip().lower()
+    if source_norm in ("auto", "mlflow"):
+        rows = fetch_mlflow_epoch_metrics(db, run_id, limit=int(limit))
+        if rows is not None:
+            return rows
     return TrainingRunService().list_epoch_metrics(db, run_id, limit=limit)
 
 
@@ -534,6 +545,50 @@ async def stream_training_run_metrics(websocket: WebSocket, run_id: str):
                     TrainingRunStatus.CANCELLED,
                     TrainingRunStatus.DELETED,
                 ):
+                    # Flush any remaining metrics/events before closing.
+                    metrics = (
+                        db.query(TrainingRunEpochMetric)
+                        .filter(TrainingRunEpochMetric.run_id == str(run_id), TrainingRunEpochMetric.metric_id > int(last_metric_id))
+                        .order_by(TrainingRunEpochMetric.metric_id.asc())
+                        .limit(500)
+                        .all()
+                    )
+                    for m in metrics:
+                        last_metric_id = max(int(last_metric_id), int(m.metric_id))
+                        await websocket.send_json(
+                            {
+                                "type": "metric",
+                                "data": {
+                                    "epoch": int(m.epoch),
+                                    "metrics": m.metrics,
+                                    "progress": int(getattr(run, "progress", 0) or 0),
+                                },
+                            }
+                        )
+
+                    events = (
+                        db.query(TrainingRunEvent)
+                        .filter(TrainingRunEvent.run_id == str(run_id), TrainingRunEvent.event_id > int(last_event_id))
+                        .order_by(TrainingRunEvent.event_id.asc())
+                        .limit(200)
+                        .all()
+                    )
+                    for ev in events:
+                        last_event_id = max(int(last_event_id), int(ev.event_id))
+                        await websocket.send_json(
+                            {
+                                "type": "event",
+                                "data": {
+                                    "event_id": int(ev.event_id),
+                                    "level": getattr(ev.level, "value", str(ev.level)),
+                                    "event_type": str(ev.event_type),
+                                    "message": ev.message,
+                                    "data": ev.data,
+                                    "created_at": ev.created_at.isoformat() if ev.created_at else None,
+                                },
+                            }
+                        )
+
                     await websocket.send_json({"type": "done", "data": {"status": getattr(run.status, "value", run.status)}})
                     await asyncio.sleep(0.5)
                     await websocket.close()

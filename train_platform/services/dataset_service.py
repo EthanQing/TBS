@@ -23,6 +23,7 @@ from train_platform.repositories.dataset_event_repo import DatasetEventRepositor
 from train_platform.repositories.dataset_repo import DatasetRepository
 from train_platform.repositories.dataset_version_repo import DatasetVersionRepository
 from train_platform.services.file_service import FileService
+from train_platform.services.project_service import ProjectService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.path_utils import resolve_dataset_path
 
@@ -84,6 +85,16 @@ class DatasetService:
 
         storage_token = _normalize_storage_token(obj.get("storage_path"))
 
+        dataset_dir = resolve_dataset_path(storage_token)
+        base_dir = settings.datasets_dir.resolve()
+        if dataset_dir == base_dir or (base_dir not in dataset_dir.parents and dataset_dir != base_dir):
+            raise ValidationError("storage_path must be under BASE_DATASETS_DIR")
+        if dataset_dir.exists():
+            if dataset_dir.is_file():
+                raise ConflictError("Dataset path already exists as a file")
+        else:
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+
         ds = self.datasets.create(
             db,
             obj_in={
@@ -139,13 +150,19 @@ class DatasetService:
         db.refresh(ds)
         return ds
 
-    def delete_dataset(self, db: Session, dataset_id: int, *, delete_files: bool = False) -> None:
+    def delete_dataset(self, db: Session, dataset_id: int, *, delete_files: bool = False, force: bool = False) -> None:
         ds = self.get_dataset(db, dataset_id)
 
-        # Prevent deleting dataset that is still used by any project.
-        projects_count = db.query(Project).filter(Project.dataset_id == ds.dataset_id).count()
-        if projects_count > 0:
-            raise ConflictError(f"Cannot delete dataset; {projects_count} project(s) still reference it")
+        projects = db.query(Project).filter(Project.dataset_id == ds.dataset_id).all()
+        if projects and not force:
+            raise ConflictError(f"Cannot delete dataset; {len(projects)} project(s) still reference it")
+
+        if projects and force:
+            svc = ProjectService()
+            for p in projects:
+                svc.delete_project(db, int(p.project_id), force=True)
+            # Refresh dataset after project deletions/commits.
+            ds = self.get_dataset(db, dataset_id)
 
         # Remove DB rows first.
         db.delete(ds)
@@ -160,11 +177,76 @@ class DatasetService:
             raise ConflictError("Refusing to delete dataset outside BASE_DATASETS_DIR")
 
         try:
-            if abs_path.exists() and abs_path.is_dir():
-                shutil.rmtree(abs_path, ignore_errors=True)
+            if abs_path.exists():
+                if abs_path.is_dir():
+                    shutil.rmtree(abs_path, ignore_errors=True)
+                else:
+                    abs_path.unlink(missing_ok=True)
         except Exception:
             # Best-effort.
             pass
+
+        # Also remove version snapshots/manifests for this dataset name.
+        try:
+            versions_dir = (base / ".versions" / str(ds.name)).resolve(strict=False)
+            if base == versions_dir or base in versions_dir.parents:
+                if versions_dir.exists() and versions_dir.is_dir():
+                    shutil.rmtree(versions_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+    def upload_dataset_archive(
+        self,
+        db: Session,
+        dataset_id: int,
+        *,
+        file,
+        message: Optional[str] = None,
+        created_by: Optional[str] = None,
+        create_version: bool = True,
+        activate: bool = True,
+    ):
+        ds = self.get_dataset(db, dataset_id)
+
+        dataset_root = resolve_dataset_path(ds.storage_path)
+        base = settings.datasets_dir.resolve()
+        if dataset_root == base or (base not in dataset_root.parents and dataset_root != base):
+            raise ValidationError("Invalid dataset storage_path (must be under BASE_DATASETS_DIR)")
+
+        FileService().upload_dataset_into_existing(file, dataset_root, ds.dataset_type)
+
+        ver = None
+        if create_version:
+            ver = self._create_version_row(
+                db,
+                ds,
+                message=message or "upload",
+                created_by=created_by,
+                create_snapshot=False,
+            )
+            if activate:
+                ds.active_version_id = ver.version_id
+
+        try:
+            db.add(
+                DatasetEvent(
+                    dataset_id=int(ds.dataset_id),
+                    version_id=int(ver.version_id) if ver is not None else None,
+                    event_type="upload_archive",
+                    message=message or "Dataset archive uploaded",
+                    created_by=created_by,
+                    data={"storage_path": ds.storage_path, "dataset_type": str(getattr(ds.dataset_type, "value", ds.dataset_type))},
+                )
+            )
+        except Exception:
+            pass
+
+        db.commit()
+        db.refresh(ds)
+        if ver is not None:
+            db.refresh(ver)
+        return ds, ver
 
     # --------------------
     # dataset uploads / events
@@ -1437,10 +1519,18 @@ class DatasetService:
                         .yield_per(1000)
                     )
                     for row in q:
-                        rel = str(row[0] or "").strip().replace("\\", "/")
+                        rel = str(row[0] or "").strip().replace("\\", "/").lstrip("/")
                         if not rel:
                             continue
-                        f.write(rel + "\n")
+                        rel_path = Path(rel)
+                        if rel_path.is_absolute():
+                            abs_path = rel_path
+                        else:
+                            abs_path = (dataset_root / rel_path).resolve(strict=False)
+                        # Safety guard: ensure we only emit paths under dataset_root.
+                        if abs_path != dataset_root and dataset_root not in abs_path.parents:
+                            continue
+                        f.write(abs_path.as_posix() + "\n")
                         count += 1
                 tmp_path.replace(out_path)
             finally:
