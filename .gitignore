@@ -36,3 +36,6 @@ dist/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# --- Pytorch model checkpoints ---
+*.pt
