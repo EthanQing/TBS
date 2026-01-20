@@ -29,6 +29,7 @@ class Settings:
     datasets_dir: Path = Path(os.getenv("BASE_DATASETS_DIR") or (home_dir / "datasets")).resolve()
     training_dir: Path = Path(os.getenv("BASE_TRAINING_DIR") or (home_dir / "training_runs")).resolve()
     temp_dir: Path = Path(os.getenv("BASE_TEMP_DIR") or (home_dir / "temp")).resolve()
+    pretrain_models_dir: Path = Path(os.getenv("BASE_PRETRAIN_MODELS_DIR") or (home_dir / "pretrain_models")).resolve()
 
     @property
     def database_url(self) -> str:
@@ -43,6 +44,7 @@ class Settings:
         self.datasets_dir.mkdir(parents=True, exist_ok=True)
         self.training_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.pretrain_models_dir.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

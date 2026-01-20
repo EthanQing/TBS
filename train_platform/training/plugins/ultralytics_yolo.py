@@ -8,6 +8,7 @@ import yaml
 
 from train_platform.core.config import settings
 from train_platform.training.plugins.base import TrainContext
+from train_platform.utils.path_utils import resolve_pretrain_path
 
 
 def _apply_torch_safe_load_patches() -> None:
@@ -74,6 +75,21 @@ class UltralyticsYOLOTrainer:
         return "yolo" in mf
 
     def run(self, ctx: TrainContext) -> None:
+        def _coerce_bool(value, default: bool) -> bool:
+            if value is None:
+                return bool(default)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                s = value.strip().lower()
+                if s in ("1", "true", "yes", "y", "on"):
+                    return True
+                if s in ("0", "false", "no", "n", "off", ""):
+                    return False
+            return bool(value)
+
         try:
             import torch
         except Exception as e:  # pragma: no cover
@@ -91,9 +107,12 @@ class UltralyticsYOLOTrainer:
             model_variant = str(getattr(job.architecture, "variant", "") or "")
         model_variant = (model_variant or "yolov8n").strip()
 
-        resume_training = bool(add.get("resume_training", False))
+        resume_training = _coerce_bool(add.get("resume_training", False), False)
         resume_job_id = add.get("resume_job_id")
-        use_pretrained = bool(add.get("use_pretrained", True))
+        use_pretrained = _coerce_bool(
+            add.get("use_pretrained", None),
+            getattr(getattr(job, "parameters", None), "use_pretrained", True),
+        )
         pretrained_model_path = add.get("pretrained_model_path")
 
         if resume_training and resume_job_id:
@@ -102,8 +121,18 @@ class UltralyticsYOLOTrainer:
                 raise ValueError(f"resume weights not found: {resume_weights_path}")
             model_path = str(resume_weights_path)
         elif use_pretrained:
-            if pretrained_model_path and Path(pretrained_model_path).exists():
-                model_path = str(pretrained_model_path)
+            resolved_pretrain = None
+            if pretrained_model_path:
+                direct = Path(str(pretrained_model_path))
+                if direct.exists():
+                    resolved_pretrain = direct
+                else:
+                    candidate = resolve_pretrain_path(str(pretrained_model_path))
+                    if candidate.exists():
+                        resolved_pretrain = candidate
+
+            if resolved_pretrain is not None:
+                model_path = str(resolved_pretrain)
             else:
                 model_path = f"{model_variant}.pt"
         else:

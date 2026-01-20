@@ -52,6 +52,7 @@ def create_app() -> FastAPI:
     app.mount("/static/datasets", StaticFiles(directory=str(settings.datasets_dir)), name="datasets")
     app.mount("/static/training", StaticFiles(directory=str(settings.training_dir)), name="training")
     app.mount("/static/temp", StaticFiles(directory=str(settings.temp_dir)), name="temp")
+    app.mount("/static/pretrain", StaticFiles(directory=str(settings.pretrain_models_dir)), name="pretrain")
 
     @app.get("/health")
     def health():

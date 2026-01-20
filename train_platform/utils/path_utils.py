@@ -75,3 +75,29 @@ def resolve_temp_path(raw_path: Optional[str]) -> Path:
         return abs_candidate.resolve()
 
     return (base_dir / p).resolve(strict=False)
+
+
+def resolve_pretrain_path(raw_path: Optional[str]) -> Path:
+    base_dir = settings.pretrain_models_dir.resolve()
+    if not raw_path:
+        return base_dir
+
+    p = str(raw_path).strip().replace("\\", "/")
+    marker = "/static/pretrain/"
+    if marker in p:
+        p = p.split(marker, 1)[1]
+
+    p = p.strip("/\\")
+    if not p:
+        return base_dir
+
+    abs_candidate = Path(p)
+    if abs_candidate.is_absolute() and abs_candidate.exists():
+        return abs_candidate.resolve()
+
+    # Prevent path traversal for relative paths.
+    rel = Path(p)
+    if ".." in rel.parts:
+        return base_dir
+
+    return (base_dir / p).resolve(strict=False)
