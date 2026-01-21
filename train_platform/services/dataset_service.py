@@ -83,7 +83,7 @@ class DatasetService:
         if exists:
             raise ConflictError(f"Dataset '{name}' already exists")
 
-        storage_token = _normalize_storage_token(obj.get("storage_path"))
+        storage_token = _normalize_storage_token(obj.get("storage_path") or name)
 
         dataset_dir = resolve_dataset_path(storage_token)
         base_dir = settings.datasets_dir.resolve()
@@ -105,9 +105,19 @@ class DatasetService:
             },
         )
 
-        # Create initial version (manifest-only) and mark it as active.
-        self.create_version(db, ds.dataset_id, message="initial", created_by=obj.get("created_by"), create_snapshot=False)
-        db.refresh(ds)
+        # Create initial version only if there is already data in the dataset directory.
+        has_files = False
+        try:
+            has_files = any(dataset_dir.iterdir())
+        except Exception:
+            has_files = False
+
+        if has_files:
+            self.create_version(db, ds.dataset_id, message="initial", created_by=obj.get("created_by"), create_snapshot=False)
+            db.refresh(ds)
+        else:
+            db.commit()
+            db.refresh(ds)
 
         try:
             db.add(
@@ -305,6 +315,8 @@ class DatasetService:
 
         labels = list(labels or [])
         use_labels = ds.dataset_type == DatasetType.DETECTION
+        if use_labels:
+            require_labels = True
 
         def _sanitize_relative_dir(raw: str | None, *, field: str) -> tuple[str, Path]:
             s = str(raw or "").strip().replace("\\", "/").strip("/\\")

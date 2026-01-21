@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 from train_platform.api.deps import get_db
 from train_platform.models.dataset_event import DatasetEvent
 from train_platform.models.dataset import Dataset, DatasetVersion
-from train_platform.models.enums import DatasetType
 from train_platform.schemas.v2.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v2.datasets import (
     DatasetCreate,
@@ -25,7 +24,6 @@ from train_platform.schemas.v2.datasets import (
     DatasetVersionOut,
 )
 from train_platform.services.dataset_service import DatasetService
-from train_platform.services.file_service import FileService
 from train_platform.utils.exceptions import ValidationError
 
 
@@ -107,33 +105,34 @@ async def upload_dataset_archive(
 @router.post("/upload", response_model=DatasetOut, status_code=201)
 async def import_dataset(
     file: UploadFile = File(...),
-    name: str = Form(...),
-    dataset_type: str = Form(...),
-    description: str | None = Form(None),
+    dataset_id: int | None = Form(None),
+    message: str | None = Form(None),
+    created_by: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
-    try:
-        dt = DatasetType(str(dataset_type))
-    except Exception as e:
-        raise ValidationError("Invalid dataset_type")
-    FileService().upload_dataset(file, name, dt)
-    return DatasetService().create_dataset(
+    if dataset_id is None:
+        raise ValidationError("dataset_id is required; create the dataset first and upload to /datasets/{id}/upload")
+
+    ds, _ver = DatasetService().upload_dataset_archive(
         db,
-        obj={
-            "name": name,
-            "dataset_type": dt,
-            "storage_path": name,  # upload_dataset extracts to BASE_DATASETS_DIR/<name>
-            "description": description,
-        },
+        int(dataset_id),
+        file=file,
+        message=message,
+        created_by=created_by,
+        create_version=True,
+        activate=True,
     )
+    return ds
 
 
 @router.post("/{dataset_id}/uploads/images", response_model=DatasetImageUploadOut, status_code=201)
 async def upload_dataset_images(
     dataset_id: int,
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] | None = File(None),
+    images: list[UploadFile] | None = File(None),
     relative_dir: str = Form("images"),
     labels: list[UploadFile] | None = File(None),
+    annotations: list[UploadFile] | None = File(None),
     labels_relative_dir: str | None = Form(None),
     require_labels: bool = Form(True),
     message: str | None = Form(None),
@@ -143,19 +142,34 @@ async def upload_dataset_images(
     activate: bool = Form(True),
     db: Session = Depends(get_db),
 ):
+    image_files: list[UploadFile] = []
+    if files:
+        image_files.extend(list(files))
+    if images:
+        image_files.extend(list(images))
+
+    label_files: list[UploadFile] = []
+    if labels:
+        label_files.extend(list(labels))
+    if annotations:
+        label_files.extend(list(annotations))
+
+    if not image_files:
+        raise ValidationError("images are required")
+
     return DatasetService().upload_images(
         db,
         int(dataset_id),
-        files=files,
+        files=image_files,
         relative_dir=relative_dir,
-        labels=labels,
+        labels=label_files,
         labels_relative_dir=labels_relative_dir,
-        require_labels=bool(require_labels),
+        require_labels=True,
         message=message,
         created_by=created_by,
-        create_version=bool(create_version),
+        create_version=True,
         create_snapshot=bool(create_snapshot),
-        activate=bool(activate),
+        activate=True,
     )
 
 

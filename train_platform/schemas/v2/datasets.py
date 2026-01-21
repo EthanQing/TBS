@@ -12,7 +12,12 @@ from train_platform.schemas.v2.common import PageMeta
 class DatasetCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     dataset_type: DatasetType
-    storage_path: str = Field(..., min_length=1, max_length=500, description="建议存 token/相对路径（相对于 BASE_DATASETS_DIR）")
+    storage_path: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=500,
+        description="Optional token/relative path under BASE_DATASETS_DIR (defaults to name).",
+    )
     description: Optional[str] = None
 
 
