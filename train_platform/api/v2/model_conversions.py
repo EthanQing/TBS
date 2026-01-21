@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import time
-import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import APIRouter, File, Form, UploadFile
+import requests
 
 from train_platform.core.config import settings
 from train_platform.schemas.v2.model_conversions import ModelConversionOut
@@ -404,9 +405,23 @@ async def create_model_conversion(
     }
     _write_status(job_id, status)
 
-    # Start conversion in a background thread to avoid blocking the API worker.
-    t = threading.Thread(target=_run_pt_to_onnx, args=(job_id,), kwargs={"opset": opset, "dynamic": dynamic}, daemon=True)
-    t.start()
+    worker_url = os.getenv("INFERENCE_WORKER_URL", "http://inference-worker:18002").rstrip("/")
+    try:
+        resp = requests.post(
+            f"{worker_url}/internal/model-conversions/pt-to-onnx",
+            json={"job_id": job_id, "opset": opset, "dynamic": dynamic},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+        _append_log(status, "dispatched to worker")
+        _write_status(job_id, status)
+    except Exception as e:
+        status["status"] = "failed"
+        status["progress"] = 100
+        status["error_message"] = f"Failed to dispatch to worker: {type(e).__name__}: {e}"
+        _append_log(status, status["error_message"])
+        _write_status(job_id, status)
 
     return ModelConversionOut.model_validate(status)
 

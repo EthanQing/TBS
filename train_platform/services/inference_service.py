@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -157,60 +158,34 @@ class InferenceService:
         return out_path, token
 
     def _run_ultralytics_yolo(self, weights_path: Path, image_path: Path, *, conf: float, iou: float) -> Dict[str, Any]:
+        worker_url = os.getenv("INFERENCE_WORKER_URL", "http://inference-worker:18002").rstrip("/")
+        timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "120"))
+        payload = {
+            "weights_path": str(weights_path),
+            "image_path": str(image_path),
+            "conf": float(conf),
+            "iou": float(iou),
+        }
+
         try:
-            from ultralytics import YOLO
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError("Ultralytics not installed") from e
+            resp = requests.post(f"{worker_url}/internal/inference/yolo", json=payload, timeout=timeout)
+        except Exception as e:
+            raise RuntimeError(f"Inference worker request failed: {e}") from e
 
-        # Reuse our training-side safe-load patch to avoid common torch.serialization issues.
+        if resp.status_code != 200:
+            raise RuntimeError(f"Inference worker error {resp.status_code}: {resp.text}")
+
         try:
-            from train_platform.training.plugins.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
+            data = resp.json()
+        except Exception as e:
+            raise RuntimeError(f"Inference worker returned non-JSON response: {e}") from e
 
-            _apply_torch_safe_load_patches()
-        except Exception:
-            pass
+        err = data.get("error")
+        if err:
+            raise RuntimeError(err)
 
-        model = YOLO(str(weights_path))
-        results = model.predict(source=str(image_path), conf=float(conf), iou=float(iou), verbose=False)
-        if not results:
-            return {"predictions": [], "names": {}}
+        output = data.get("output")
+        if output is None:
+            raise RuntimeError("Inference worker response missing output")
 
-        r0 = results[0]
-        names = getattr(r0, "names", None) or getattr(model, "names", None) or {}
-        out: Dict[str, Any] = {"predictions": [], "names": names}
-
-        boxes = getattr(r0, "boxes", None)
-        if boxes is None:
-            return out
-
-        for b in boxes:
-            try:
-                cls_id = int(getattr(b, "cls")[0])
-            except Exception:
-                try:
-                    cls_id = int(b.cls)
-                except Exception:
-                    cls_id = -1
-            try:
-                conf_v = float(getattr(b, "conf")[0])
-            except Exception:
-                try:
-                    conf_v = float(b.conf)
-                except Exception:
-                    conf_v = 0.0
-            try:
-                xyxy = getattr(b, "xyxy")[0].tolist()
-                xyxy = [float(x) for x in xyxy]
-            except Exception:
-                xyxy = None
-
-            out["predictions"].append(
-                {
-                    "class_id": cls_id,
-                    "class_name": names.get(cls_id) if isinstance(names, dict) else None,
-                    "confidence": conf_v,
-                    "xyxy": xyxy,
-                }
-            )
-
-        return out
+        return output

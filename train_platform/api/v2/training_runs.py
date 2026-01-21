@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi import WebSocket, WebSocketDisconnect
+import requests
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
@@ -35,6 +37,42 @@ from train_platform.utils.mlflow_utils import fetch_mlflow_epoch_metrics
 
 
 router = APIRouter(prefix="/training-runs", tags=["training-runs"])
+
+
+def _export_onnx_via_worker(
+    src_pt: Path,
+    out_onnx: Path,
+    *,
+    dynamic: bool,
+    opset: int | None,
+    imgsz: int | None,
+) -> None:
+    worker_url = os.getenv("INFERENCE_WORKER_URL", "http://inference-worker:18002").rstrip("/")
+    timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "1200"))
+    payload = {
+        "src_pt": str(src_pt),
+        "out_onnx": str(out_onnx),
+        "dynamic": bool(dynamic),
+        "opset": int(opset) if opset is not None else None,
+        "imgsz": int(imgsz) if imgsz is not None else None,
+    }
+
+    try:
+        resp = requests.post(f"{worker_url}/internal/training-runs/export-onnx", json=payload, timeout=timeout)
+    except Exception as e:
+        raise ValidationError(f"Failed to reach inference worker: {e}") from e
+
+    if resp.status_code != 200:
+        raise ValidationError(f"Inference worker error {resp.status_code}: {resp.text}")
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise ValidationError(f"Inference worker returned non-JSON response: {e}") from e
+
+    err = data.get("error")
+    if err:
+        raise ValidationError(err)
 
 
 @router.get("", response_model=Page[TrainingRunOut])
@@ -177,29 +215,15 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
         raise ValidationError("Unsafe output path")
 
     if not out_onnx.exists():
-        # Convert using Ultralytics exporter (best-effort).
-        try:
-            from ultralytics import YOLO
-        except Exception as e:  # pragma: no cover
-            raise ValidationError(f"Ultralytics not installed: {type(e).__name__}: {e}")
+        _export_onnx_via_worker(
+            src_pt,
+            out_onnx,
+            dynamic=bool(payload.dynamic),
+            opset=payload.opset,
+            imgsz=payload.imgsz,
+        )
 
-        # Ensure safe torch load on Windows for Ultralytics weights.
-        try:
-            from train_platform.training.plugins.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
-
-            _apply_torch_safe_load_patches()
-        except Exception:
-            pass
-
-        model = YOLO(str(src_pt))
-
-        export_kwargs = {"dynamic": bool(payload.dynamic)}
-        if payload.opset is not None:
-            export_kwargs["opset"] = int(payload.opset)
-        if payload.imgsz is not None:
-            export_kwargs["imgsz"] = int(payload.imgsz)
-
-        exported = model.export(format="onnx", **export_kwargs)
+        exported = None
 
         # Ultralytics may return a path; ensure the canonical output exists at out_onnx.
         exported_path: Path | None = None

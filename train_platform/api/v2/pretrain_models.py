@@ -23,7 +23,7 @@ def _sanitize_name(name: str) -> str:
 @router.post("/upload", response_model=PretrainUploadOut, status_code=201)
 async def upload_pretrain_weights(file: UploadFile = File(...)):
     """
-    Upload a single pretrain weights file to BASE_PRETRAIN_MODELS_DIR.
+    Upload a single pretrain weights file to BASE_TEMP_DIR (short-lived).
     """
     filename = file.filename or ""
     suffix = Path(filename).suffix.lower()
@@ -31,17 +31,17 @@ async def upload_pretrain_weights(file: UploadFile = File(...)):
         raise ValidationError("Unsupported weights format (.pt/.pth/.ckpt)")
 
     settings.ensure_dirs()
-    out_dir = settings.pretrain_models_dir
+    out_dir = settings.temp_dir / "pretrain_uploads"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     stem = _sanitize_name(Path(filename).stem)
     out_name = f"{stem}-{uuid.uuid4().hex}{suffix}"
-    out_path = (out_dir / out_name).resolve(strict=False)
-    if settings.pretrain_models_dir.resolve() not in out_path.parents:
+    token = f"pretrain_uploads/{out_name}"
+    out_path = (settings.temp_dir / token).resolve(strict=False)
+    if settings.temp_dir.resolve() not in out_path.parents:
         raise ValidationError("Unsafe upload path")
 
     with open(out_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    token = out_name
-    return PretrainUploadOut(token=token, path=f"/static/pretrain/{token}", filename=Path(filename).name or out_name)
+    return PretrainUploadOut(token=token, path=f"/static/temp/{token}", filename=Path(filename).name or out_name)

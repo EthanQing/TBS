@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# 运行时数据目录（通过 volume 挂载）
+datasets/
+training_runs/
+temp/
+pretrain_models/
+
+# 测试
+tests/
+pytest_cache/
+.coverage
+htmlcov/
+
+# 其他
+*.log
+*.tmp
+.env
+.env.*
+*.md
+!README.md
