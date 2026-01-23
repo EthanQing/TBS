@@ -32,6 +32,11 @@ class Settings:
     pretrain_models_dir: Path = Path(os.getenv("BASE_PRETRAIN_MODELS_DIR") or (home_dir / "pretrain_models")).resolve()
 
     @property
+    def thumbnails_dir(self) -> Path:
+        # Keep thumbnails under the datasets root so they can be managed together.
+        return (self.datasets_dir / ".thumbnails").resolve()
+
+    @property
     def database_url(self) -> str:
         if self.database_url_override:
             return str(self.database_url_override)
@@ -42,6 +47,7 @@ class Settings:
 
     def ensure_dirs(self) -> None:
         self.datasets_dir.mkdir(parents=True, exist_ok=True)
+        self.thumbnails_dir.mkdir(parents=True, exist_ok=True)
         self.training_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.pretrain_models_dir.mkdir(parents=True, exist_ok=True)

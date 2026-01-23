@@ -18,7 +18,7 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    dataset_id: Mapped[int] = mapped_column(Integer, ForeignKey("datasets.dataset_id"), nullable=False, index=True)
+    dataset_id: Mapped[int] = mapped_column(Integer, ForeignKey("datasets.dataset_id", ondelete="CASCADE"), nullable=False, index=True)
     task_type: Mapped[TaskType] = mapped_column(
         Enum(TaskType, values_callable=lambda x: [e.value for e in x]),
         nullable=False,

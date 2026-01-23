@@ -15,8 +15,8 @@ class ModelVersion(Base):
     __tablename__ = "model_versions"
 
     model_version_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.project_id"), nullable=False, index=True)
-    run_id: Mapped[str] = mapped_column(String(36), ForeignKey("training_runs.run_id"), nullable=False, index=True)
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(String(36), ForeignKey("training_runs.run_id", ondelete="CASCADE"), nullable=False, index=True)
 
     version: Mapped[str] = mapped_column(String(50), nullable=False)
     stage: Mapped[ModelStage] = mapped_column(

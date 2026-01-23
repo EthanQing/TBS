@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
+
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from train_platform.core.config import settings
 from train_platform.models.deployment import Deployment
+from train_platform.models.inference import InferenceRun
 from train_platform.models.model_registry import ModelVersion
 from train_platform.models.project import Project
 from train_platform.models.training_run import TrainingRun
 from train_platform.repositories.dataset_repo import DatasetRepository
 from train_platform.repositories.project_repo import ProjectRepository
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
+
+
+def _safe_remove_dir(path: Path) -> None:
+    try:
+        if path.exists() and path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
 
 
 class ProjectService:
@@ -98,14 +112,22 @@ class ProjectService:
 
         if model_versions:
             mv_ids = [int(m.model_version_id) for m in model_versions]
+            dep_ids: list[int] = []
             if mv_ids:
                 deployments = db.query(Deployment).filter(Deployment.model_version_id.in_(mv_ids)).all()
+                dep_ids = [int(d.deployment_id) for d in deployments]
+                inf_filters = [InferenceRun.model_version_id.in_(mv_ids)]
+                if dep_ids:
+                    inf_filters.append(InferenceRun.deployment_id.in_(dep_ids))
+                for inf in db.query(InferenceRun).filter(or_(*inf_filters)).all():
+                    db.delete(inf)
                 for dep in deployments:
                     db.delete(dep)
             for mv in model_versions:
                 db.delete(mv)
 
         for run in runs:
+            _safe_remove_dir(settings.training_dir / str(run.run_id))
             db.delete(run)
 
         db.delete(p)

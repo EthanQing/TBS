@@ -89,7 +89,7 @@ async def upload_dataset_archive(
     activate: bool = Form(True),
     db: Session = Depends(get_db),
 ):
-    ds, _ver = DatasetService().upload_dataset_archive(
+    ds, _ver = await DatasetService().upload_dataset_archive_async(
         db,
         int(dataset_id),
         file=file,
@@ -113,7 +113,7 @@ async def import_dataset(
     if dataset_id is None:
         raise ValidationError("dataset_id is required; create the dataset first and upload to /datasets/{id}/upload")
 
-    ds, _ver = DatasetService().upload_dataset_archive(
+    ds, _ver = await DatasetService().upload_dataset_archive_async(
         db,
         int(dataset_id),
         file=file,
@@ -125,14 +125,37 @@ async def import_dataset(
     return ds
 
 
+@router.post("/{dataset_id}/append", response_model=DatasetOut, status_code=201)
+async def append_dataset_archive(
+    dataset_id: int,
+    file: UploadFile = File(...),
+    message: str | None = Form(None),
+    created_by: str | None = Form(None),
+    create_version: bool = Form(True),
+    activate: bool = Form(True),
+    db: Session = Depends(get_db),
+):
+    """Append ZIP archive contents to an existing (possibly non-empty) dataset."""
+    ds, _ver = await DatasetService().append_dataset_archive_async(
+        db,
+        int(dataset_id),
+        file=file,
+        message=message,
+        created_by=created_by,
+        create_version=bool(create_version),
+        activate=bool(activate),
+    )
+    return ds
+
+
 @router.post("/{dataset_id}/uploads/images", response_model=DatasetImageUploadOut, status_code=201)
 async def upload_dataset_images(
     dataset_id: int,
-    files: list[UploadFile] | None = File(None),
-    images: list[UploadFile] | None = File(None),
+    files: list[UploadFile] | UploadFile | None = File(None),
+    images: list[UploadFile] | UploadFile | None = File(None),
     relative_dir: str = Form("images"),
-    labels: list[UploadFile] | None = File(None),
-    annotations: list[UploadFile] | None = File(None),
+    labels: list[UploadFile] | UploadFile | None = File(None),
+    annotations: list[UploadFile] | UploadFile | None = File(None),
     labels_relative_dir: str | None = Form(None),
     require_labels: bool = Form(True),
     message: str | None = Form(None),
@@ -142,17 +165,20 @@ async def upload_dataset_images(
     activate: bool = Form(True),
     db: Session = Depends(get_db),
 ):
+    def _as_upload_list(value: list[UploadFile] | UploadFile | None) -> list[UploadFile]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
+
     image_files: list[UploadFile] = []
-    if files:
-        image_files.extend(list(files))
-    if images:
-        image_files.extend(list(images))
+    image_files.extend(_as_upload_list(files))
+    image_files.extend(_as_upload_list(images))
 
     label_files: list[UploadFile] = []
-    if labels:
-        label_files.extend(list(labels))
-    if annotations:
-        label_files.extend(list(annotations))
+    label_files.extend(_as_upload_list(labels))
+    label_files.extend(_as_upload_list(annotations))
 
     if not image_files:
         raise ValidationError("images are required")
@@ -164,12 +190,12 @@ async def upload_dataset_images(
         relative_dir=relative_dir,
         labels=label_files,
         labels_relative_dir=labels_relative_dir,
-        require_labels=True,
+        require_labels=bool(require_labels),
         message=message,
         created_by=created_by,
-        create_version=True,
+        create_version=bool(create_version),
         create_snapshot=bool(create_snapshot),
-        activate=True,
+        activate=bool(activate),
     )
 
 

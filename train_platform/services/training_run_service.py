@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import uuid
 from pathlib import Path
 import yaml
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
 from train_platform.models.architecture import ModelArchitecture
 from train_platform.models.dataset import Dataset, DatasetVersion
+from train_platform.models.deployment import Deployment
 from train_platform.models.enums import LogLevel, TrainingRunStatus
+from train_platform.models.inference import InferenceRun
+from train_platform.models.model_registry import ModelVersion
 from train_platform.models.project import Project
 from train_platform.models.training_run import (
     TrainingRun,
@@ -81,6 +86,14 @@ def _tail_text_file(path, *, lines: int) -> str:
     parts = text.splitlines()
     tail = parts[-int(lines) :] if parts else []
     return "\n".join(tail)
+
+
+def _safe_remove_dir(path: Path) -> None:
+    try:
+        if path.exists() and path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
 
 
 class TrainingRunService:
@@ -375,6 +388,35 @@ class TrainingRunService:
         db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="delete_requested", message="Delete requested"))
         db.commit()
         db.refresh(run)
+        return run
+
+    def delete_run(self, db: Session, run_id: str, *, force: bool = False) -> TrainingRun:
+        run = self.get_run(db, run_id)
+
+        model_versions = db.query(ModelVersion).filter(ModelVersion.run_id == str(run.run_id)).all()
+        if model_versions and not force:
+            detail = f"{len(model_versions)} model version(s)"
+            raise ConflictError(f"Cannot delete training run; {detail} still reference it")
+
+        if model_versions and force:
+            mv_ids = [int(m.model_version_id) for m in model_versions]
+            dep_ids: list[int] = []
+            if mv_ids:
+                deployments = db.query(Deployment).filter(Deployment.model_version_id.in_(mv_ids)).all()
+                dep_ids = [int(d.deployment_id) for d in deployments]
+                inf_filters = [InferenceRun.model_version_id.in_(mv_ids)]
+                if dep_ids:
+                    inf_filters.append(InferenceRun.deployment_id.in_(dep_ids))
+                for inf in db.query(InferenceRun).filter(or_(*inf_filters)).all():
+                    db.delete(inf)
+                for dep in deployments:
+                    db.delete(dep)
+            for mv in model_versions:
+                db.delete(mv)
+
+        run = self.request_delete(db, str(run.run_id))
+        if run.status != TrainingRunStatus.RUNNING:
+            _safe_remove_dir(settings.training_dir / str(run.run_id))
         return run
 
     # --------------------

@@ -11,6 +11,7 @@ from train_platform.api.v2.model_versions import router as model_versions_router
 from train_platform.api.v2.pretrain_models import router as pretrain_models_router
 from train_platform.api.v2.projects import router as projects_router
 from train_platform.api.v2.stats import router as stats_router
+from train_platform.api.v2.thumbnails import router as thumbnails_router
 from train_platform.api.v2.training_runs import router as training_runs_router
 
 
@@ -25,3 +26,4 @@ router.include_router(model_conversions_router)
 router.include_router(inference_router)
 router.include_router(pretrain_models_router)
 router.include_router(stats_router)
+router.include_router(thumbnails_router)

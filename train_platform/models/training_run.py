@@ -27,9 +27,9 @@ class TrainingRun(Base):
     __tablename__ = "training_runs"
 
     run_id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.project_id"), nullable=False, index=True)
-    dataset_version_id: Mapped[int] = mapped_column(Integer, ForeignKey("dataset_versions.version_id"), nullable=False, index=True)
-    architecture_id: Mapped[int] = mapped_column(Integer, ForeignKey("model_architectures.architecture_id"), nullable=False, index=True)
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    dataset_version_id: Mapped[int] = mapped_column(Integer, ForeignKey("dataset_versions.version_id", ondelete="CASCADE"), nullable=False, index=True)
+    architecture_id: Mapped[int] = mapped_column(Integer, ForeignKey("model_architectures.architecture_id", ondelete="CASCADE"), nullable=False, index=True)
 
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     status: Mapped[TrainingRunStatus] = mapped_column(

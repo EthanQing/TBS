@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -247,6 +248,186 @@ class DatasetService:
                     message=message or "Dataset archive uploaded",
                     created_by=created_by,
                     data={"storage_path": ds.storage_path, "dataset_type": str(getattr(ds.dataset_type, "value", ds.dataset_type))},
+                )
+            )
+        except Exception:
+            pass
+
+        db.commit()
+        db.refresh(ds)
+        if ver is not None:
+            db.refresh(ver)
+        return ds, ver
+
+    async def upload_dataset_archive_async(
+        self,
+        db: Session,
+        dataset_id: int,
+        *,
+        file,
+        message: Optional[str] = None,
+        created_by: Optional[str] = None,
+        create_version: bool = True,
+        activate: bool = True,
+    ):
+        """
+        Async wrapper for large uploads.
+
+        FastAPI async endpoints should not do heavy blocking I/O in the event loop;
+        we offload archive extraction to a threadpool and keep DB work in the request
+        thread.
+        """
+        ds = self.get_dataset(db, dataset_id)
+
+        dataset_root = resolve_dataset_path(ds.storage_path)
+        base = settings.datasets_dir.resolve()
+        if dataset_root == base or (base not in dataset_root.parents and dataset_root != base):
+            raise ValidationError("Invalid dataset storage_path (must be under BASE_DATASETS_DIR)")
+
+        await run_in_threadpool(FileService().upload_dataset_into_existing, file, dataset_root, ds.dataset_type)
+
+        ver = None
+        if create_version:
+            ver = self._create_version_row(
+                db,
+                ds,
+                message=message or "upload",
+                created_by=created_by,
+                create_snapshot=False,
+            )
+            if activate:
+                ds.active_version_id = ver.version_id
+
+        try:
+            db.add(
+                DatasetEvent(
+                    dataset_id=int(ds.dataset_id),
+                    version_id=int(ver.version_id) if ver is not None else None,
+                    event_type="upload_archive",
+                    message=message or "Dataset archive uploaded",
+                    created_by=created_by,
+                    data={"storage_path": ds.storage_path, "dataset_type": str(getattr(ds.dataset_type, "value", ds.dataset_type))},
+                )
+            )
+        except Exception:
+            pass
+
+        db.commit()
+        db.refresh(ds)
+        if ver is not None:
+            db.refresh(ver)
+        return ds, ver
+
+    def append_dataset_archive(
+        self,
+        db: Session,
+        dataset_id: int,
+        *,
+        file,
+        message: Optional[str] = None,
+        created_by: Optional[str] = None,
+        create_version: bool = True,
+        activate: bool = True,
+    ):
+        """Append ZIP archive contents to an existing (possibly non-empty) dataset."""
+        ds = self.get_dataset(db, dataset_id)
+
+        dataset_root = resolve_dataset_path(ds.storage_path)
+        base = settings.datasets_dir.resolve()
+        if dataset_root == base or (base not in dataset_root.parents and dataset_root != base):
+            raise ValidationError("Invalid dataset storage_path (must be under BASE_DATASETS_DIR)")
+
+        # Get class info from the append operation
+        _, class_info = FileService().append_dataset_archive(file, dataset_root, ds.dataset_type)
+        added_classes = class_info.get("added_classes", [])
+        total_classes = class_info.get("total_classes", 0)
+
+        ver = None
+        if create_version:
+            ver = self._create_version_row(
+                db,
+                ds,
+                message=message or "append",
+                created_by=created_by,
+                create_snapshot=False,
+            )
+            if activate:
+                ds.active_version_id = ver.version_id
+
+        try:
+            db.add(
+                DatasetEvent(
+                    dataset_id=int(ds.dataset_id),
+                    version_id=int(ver.version_id) if ver is not None else None,
+                    event_type="append_archive",
+                    message=message or "Dataset archive appended",
+                    created_by=created_by,
+                    data={
+                        "storage_path": ds.storage_path,
+                        "dataset_type": str(getattr(ds.dataset_type, "value", ds.dataset_type)),
+                        "added_classes": added_classes,
+                        "total_classes": total_classes,
+                    },
+                )
+            )
+        except Exception:
+            pass
+
+        db.commit()
+        db.refresh(ds)
+        if ver is not None:
+            db.refresh(ver)
+        return ds, ver
+
+    async def append_dataset_archive_async(
+        self,
+        db: Session,
+        dataset_id: int,
+        *,
+        file,
+        message: Optional[str] = None,
+        created_by: Optional[str] = None,
+        create_version: bool = True,
+        activate: bool = True,
+    ):
+        ds = self.get_dataset(db, dataset_id)
+
+        dataset_root = resolve_dataset_path(ds.storage_path)
+        base = settings.datasets_dir.resolve()
+        if dataset_root == base or (base not in dataset_root.parents and dataset_root != base):
+            raise ValidationError("Invalid dataset storage_path (must be under BASE_DATASETS_DIR)")
+
+        # Get class info from the append operation (in threadpool).
+        _path, class_info = await run_in_threadpool(FileService().append_dataset_archive, file, dataset_root, ds.dataset_type)
+        added_classes = class_info.get("added_classes", [])
+        total_classes = class_info.get("total_classes", 0)
+
+        ver = None
+        if create_version:
+            ver = self._create_version_row(
+                db,
+                ds,
+                message=message or "append",
+                created_by=created_by,
+                create_snapshot=False,
+            )
+            if activate:
+                ds.active_version_id = ver.version_id
+
+        try:
+            db.add(
+                DatasetEvent(
+                    dataset_id=int(ds.dataset_id),
+                    version_id=int(ver.version_id) if ver is not None else None,
+                    event_type="append_archive",
+                    message=message or "Dataset archive appended",
+                    created_by=created_by,
+                    data={
+                        "storage_path": ds.storage_path,
+                        "dataset_type": str(getattr(ds.dataset_type, "value", ds.dataset_type)),
+                        "added_classes": added_classes,
+                        "total_classes": total_classes,
+                    },
                 )
             )
         except Exception:

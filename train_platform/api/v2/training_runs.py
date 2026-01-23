@@ -149,8 +149,12 @@ def cancel_training_run(run_id: str, reason: str | None = Body(None), db: Sessio
 
 
 @router.delete("/{run_id}", response_model=TrainingRunOut)
-def delete_training_run(run_id: str, db: Session = Depends(get_db)):
-    return TrainingRunService().request_delete(db, run_id)
+def delete_training_run(
+    run_id: str,
+    force: bool = Query(False, description="Delete training run and related model versions/deployments"),
+    db: Session = Depends(get_db),
+):
+    return TrainingRunService().delete_run(db, run_id, force=bool(force))
 
 
 @router.get("/{run_id}/events", response_model=list[TrainingRunEventOut])
