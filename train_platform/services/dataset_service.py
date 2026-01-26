@@ -59,6 +59,32 @@ def _normalize_storage_token(storage_path: str) -> str:
     return rel.as_posix()
 
 
+def _versions_token(ds: Dataset) -> str:
+    """
+    Token used for storing version manifests/snapshots under:
+      BASE_DATASETS_DIR/.versions/<token>/v<version>/...
+
+    Backwards-compatible layout:
+    - Legacy datasets store versions under `.versions/<dataset_name>/...`
+    - New datasets (this repo) store data under `<dataset_id>/`, so we store versions
+      under `.versions/<dataset_id>/...` when dataset.storage_path == str(dataset_id).
+    """
+    name = str(getattr(ds, "name", "") or getattr(ds, "dataset_id", "dataset"))
+    try:
+        token = _normalize_storage_token(str(getattr(ds, "storage_path", "") or ""))
+    except Exception:
+        return name
+
+    try:
+        if token == str(int(getattr(ds, "dataset_id"))):
+            return token
+    except Exception:
+        pass
+
+    # Keep legacy layout for existing datasets.
+    return name
+
+
 class DatasetService:
     def __init__(self) -> None:
         self.datasets = DatasetRepository()
@@ -84,7 +110,23 @@ class DatasetService:
         if exists:
             raise ConflictError(f"Dataset '{name}' already exists")
 
-        storage_token = _normalize_storage_token(obj.get("storage_path") or name)
+        # Always use dataset_id as the dataset directory name (stable + unique).
+        # Clients may still send `storage_path`; ignore it for consistency.
+        tmp_token = f"_tmp_{uuid.uuid4().hex}"
+
+        ds = self.datasets.create(
+            db,
+            obj_in={
+                "name": name,
+                "dataset_type": obj["dataset_type"],
+                "storage_path": tmp_token,
+                "description": obj.get("description"),
+            },
+        )
+
+        storage_token = str(int(ds.dataset_id))
+        ds.storage_path = storage_token
+        db.flush()
 
         dataset_dir = resolve_dataset_path(storage_token)
         base_dir = settings.datasets_dir.resolve()
@@ -95,16 +137,6 @@ class DatasetService:
                 raise ConflictError("Dataset path already exists as a file")
         else:
             dataset_dir.mkdir(parents=True, exist_ok=True)
-
-        ds = self.datasets.create(
-            db,
-            obj_in={
-                "name": name,
-                "dataset_type": obj["dataset_type"],
-                "storage_path": storage_token,
-                "description": obj.get("description"),
-            },
-        )
 
         # Create initial version only if there is already data in the dataset directory.
         has_files = False
@@ -197,9 +229,9 @@ class DatasetService:
             # Best-effort.
             pass
 
-        # Also remove version snapshots/manifests for this dataset name.
+        # Also remove version snapshots/manifests for this dataset.
         try:
-            versions_dir = (base / ".versions" / str(ds.name)).resolve(strict=False)
+            versions_dir = (base / ".versions" / _versions_token(ds)).resolve(strict=False)
             if base == versions_dir or base in versions_dir.parents:
                 if versions_dir.exists() and versions_dir.is_dir():
                     shutil.rmtree(versions_dir, ignore_errors=True)
@@ -769,7 +801,7 @@ class DatasetService:
                     created_by=created_by,
                     create_snapshot=bool(create_snapshot),
                 )
-                created_version_dir = settings.datasets_dir.resolve() / ".versions" / ds.name / f"v{int(version_row.version)}"
+                created_version_dir = settings.datasets_dir.resolve() / ".versions" / _versions_token(ds) / f"v{int(version_row.version)}"
                 if activate:
                     ds.active_version_id = version_row.version_id
 
@@ -1011,11 +1043,18 @@ class DatasetService:
         if not dataset_path.exists() or not dataset_path.is_dir():
             raise ValidationError(f"Dataset path does not exist: {dataset_path}")
 
-        manifest_rel, file_count, size_bytes, stats = self._write_manifest(ds.name, dataset_path, next_version, ds.dataset_type)
+        manifest_rel, file_count, size_bytes, stats = self._write_manifest(
+            dataset_token=_versions_token(ds),
+            dataset_id=int(ds.dataset_id),
+            dataset_name=str(ds.name),
+            dataset_path=dataset_path,
+            version=next_version,
+            dataset_type=ds.dataset_type,
+        )
 
         snapshot_rel = None
         if create_snapshot:
-            snapshot_rel = self._create_snapshot(ds.name, dataset_path, next_version)
+            snapshot_rel = self._create_snapshot(dataset_token=_versions_token(ds), dataset_path=dataset_path, version=next_version)
 
         meta: dict | None = None
         try:
@@ -1211,13 +1250,22 @@ class DatasetService:
             },
         }
 
-    def _write_manifest(self, dataset_name: str, dataset_path: Path, version: int, dataset_type: DatasetType) -> tuple[str, int, int, dict]:
+    def _write_manifest(
+        self,
+        *,
+        dataset_token: str,
+        dataset_id: int,
+        dataset_name: str,
+        dataset_path: Path,
+        version: int,
+        dataset_type: DatasetType,
+    ) -> tuple[str, int, int, dict]:
         """
         Stores a portable NDJSON manifest under:
-        BASE_DATASETS_DIR/.versions/<dataset_name>/v<version>/manifest.ndjson
+        BASE_DATASETS_DIR/.versions/<dataset_token>/v<version>/manifest.ndjson
         """
         base = settings.datasets_dir.resolve()
-        out_dir = base / ".versions" / dataset_name / f"v{int(version)}"
+        out_dir = base / ".versions" / str(dataset_token) / f"v{int(version)}"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "manifest.ndjson"
 
@@ -1228,7 +1276,9 @@ class DatasetService:
 
         with out_path.open("w", encoding="utf-8") as f:
             header = {
-                "dataset_name": dataset_name,
+                "dataset_id": int(dataset_id),
+                "dataset_name": str(dataset_name),
+                "dataset_token": str(dataset_token),
                 "version": int(version),
                 "dataset_type": str(getattr(dataset_type, "value", dataset_type)),
                 "generated_at": _utcnow().isoformat(),
@@ -1284,15 +1334,15 @@ class DatasetService:
         }
         return rel_manifest, file_count, size_bytes, stats
 
-    def _create_snapshot(self, dataset_name: str, dataset_path: Path, version: int) -> str:
+    def _create_snapshot(self, *, dataset_token: str, dataset_path: Path, version: int) -> str:
         """
         Creates a filesystem snapshot copy (heavy for large datasets).
 
         Stored under:
-        BASE_DATASETS_DIR/.versions/<dataset_name>/v<version>/snapshot/
+        BASE_DATASETS_DIR/.versions/<dataset_token>/v<version>/snapshot/
         """
         base = settings.datasets_dir.resolve()
-        out_dir = base / ".versions" / dataset_name / f"v{int(version)}" / "snapshot"
+        out_dir = base / ".versions" / str(dataset_token) / f"v{int(version)}" / "snapshot"
         if out_dir.exists():
             shutil.rmtree(out_dir, ignore_errors=True)
         shutil.copytree(dataset_path, out_dir)

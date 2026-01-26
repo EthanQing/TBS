@@ -16,7 +16,7 @@ class DatasetCreate(BaseModel):
         None,
         min_length=1,
         max_length=500,
-        description="Optional token/relative path under BASE_DATASETS_DIR (defaults to name).",
+        description="Deprecated/ignored. Dataset files are stored under BASE_DATASETS_DIR/<dataset_id>/.",
     )
     description: Optional[str] = None
 
