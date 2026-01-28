@@ -21,6 +21,9 @@ class BaseRepository(Generic[ModelType]):
     def get_multi(self, db: Session, *, skip: int = 0, limit: int = 100) -> list[ModelType]:
         return db.query(self.model).offset(skip).limit(limit).all()
 
+    def get_query(self, db: Session):
+        return db.query(self.model)
+
     def create(self, db: Session, *, obj_in: dict) -> ModelType:
         """
         Create without committing.

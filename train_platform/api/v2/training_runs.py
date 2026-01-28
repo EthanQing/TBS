@@ -201,18 +201,26 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
         raise ValidationError("weights must be 'best' or 'last'")
 
     weights_dir = (settings.training_dir / str(run.run_id) / "weights").resolve(strict=False)
-    src_pt = (weights_dir / ("best.pt" if weights == "best" else "last.pt")).resolve(strict=False)
-    if settings.training_dir.resolve() not in src_pt.parents:
+    src_primary = (weights_dir / ("best.pt" if weights == "best" else "last.pt")).resolve(strict=False)
+    src_fallback = (weights_dir / ("best.pth" if weights == "best" else "last.pth")).resolve(strict=False)
+
+    # Prefer .pt (Ultralytics); fallback to .pth (MMDet) for raw download.
+    src_weights = src_primary if src_primary.exists() else src_fallback
+
+    if settings.training_dir.resolve() not in src_weights.parents:
         raise ValidationError("Unsafe weights path")
-    if not src_pt.exists():
-        raise ValidationError(f"Weights not found: {src_pt.name}")
+    if not src_weights.exists():
+        raise ValidationError("Weights not found")
 
     if fmt == "pt":
-        rel = src_pt.relative_to(settings.training_dir).as_posix()
+        rel = src_weights.relative_to(settings.training_dir).as_posix()
         url = f"/static/training/{rel}"
         return TrainingRunExportOut(run_id=str(run.run_id), format=fmt, weights=weights, download_url=url, artifact=None)
 
     # fmt == onnx
+    if not src_primary.exists():
+        raise ValidationError("ONNX export is only supported for .pt weights (Ultralytics).")
+
     out_name = "best.onnx" if weights == "best" else "last.onnx"
     out_onnx = (weights_dir / out_name).resolve(strict=False)
     if settings.training_dir.resolve() not in out_onnx.parents:
@@ -220,7 +228,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
 
     if not out_onnx.exists():
         _export_onnx_via_worker(
-            src_pt,
+            src_primary,
             out_onnx,
             dynamic=bool(payload.dynamic),
             opset=payload.opset,

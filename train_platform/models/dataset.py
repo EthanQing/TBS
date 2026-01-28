@@ -21,6 +21,8 @@ class Dataset(Base):
         nullable=False,
     )
 
+    format: Mapped[str] = mapped_column(String(50), nullable=False, server_default="yolo")
+
     # Store a portable token / relative path under BASE_DATASETS_DIR.
     storage_path: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

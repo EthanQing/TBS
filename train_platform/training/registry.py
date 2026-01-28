@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List
 
 from train_platform.training.plugins.base import TrainerPlugin
+from train_platform.training.plugins.mmdet import MMDetTrainer
 from train_platform.training.plugins.stubs import NotImplementedTrainer
 from train_platform.training.plugins.ultralytics_yolo import UltralyticsYOLOTrainer
 
@@ -11,8 +12,7 @@ def get_trainer(*, model_family: str) -> TrainerPlugin:
     mf = (model_family or "").strip()
     plugins: List[TrainerPlugin] = [
         UltralyticsYOLOTrainer(),
-        NotImplementedTrainer(name="mmdet", model_family="mmdet"),
-        NotImplementedTrainer(name="mmdet", model_family="mmdetection"),
+        MMDetTrainer(),
         NotImplementedTrainer(name="detr", model_family="detr"),
         NotImplementedTrainer(name="detr", model_family="dert"),
     ]
@@ -24,4 +24,3 @@ def get_trainer(*, model_family: str) -> TrainerPlugin:
         except Exception:
             continue
     raise ValueError(f"No trainer registered for model_family='{mf}'")
-

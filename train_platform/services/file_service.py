@@ -18,7 +18,7 @@ from train_platform.utils.exceptions import ConflictError, ValidationError
 
 
 class FileService:
-    def upload_dataset(self, file: UploadFile, dataset_name: str, dataset_type: DatasetType) -> Path:
+    def upload_dataset(self, file: UploadFile, dataset_name: str, dataset_type: DatasetType) -> tuple[Path, dict]:
         dataset_name = (dataset_name or "").strip()
         if not dataset_name:
             raise ValidationError("Dataset name is required.")
@@ -64,10 +64,47 @@ class FileService:
                 extracted_root = extracted[0]
 
             source_root = extracted_root
+            detected_format = "yolo"
+            
             if dataset_type == DatasetType.DETECTION:
-                yolo_root = self._find_yolo_export_root(extracted_root)
-                if yolo_root is not None:
-                    source_root = yolo_root
+                # 1. Check for COCO
+                coco_json = self._find_coco_annotation_file(extracted_root)
+                if coco_json:
+                    from train_platform.services.dataset_conversion_service import DatasetConversionService
+                    
+                    # Convert to YOLO in place (or in a subfolder)
+                    # We'll use source_root as the base for images
+                    # And generate labels into source_root/labels
+                    # class_names.txt into source_root/class_names.txt
+                    detected_format = "coco"
+                    
+                    # If conversion service needs images dir, we assume they are relative to json or in common folders
+                    # But _find_coco_annotation_file returns the json path.
+                    # Images might be in 'images', 'train2017', or same dir.
+                    # For simplicty, let's assume they are under coco_json.parent or coco_json.parent/images
+                    
+                    # Try to find images dir
+                    images_dir = coco_json.parent
+                    if (coco_json.parent / "images").exists():
+                        images_dir = coco_json.parent / "images"
+                    elif (coco_json.parent / "train2017").exists():
+                        images_dir = coco_json.parent / "train2017"
+                        
+                    DatasetConversionService().conversion_coco_2_yolo(
+                        coco_json_path=coco_json,
+                        output_labels_dir=images_dir.parent / "labels" if images_dir.name == "images" else coco_json.parent / "labels",
+                        output_class_names_path=images_dir.parent / "class_names.txt" if images_dir.name == "images" else coco_json.parent / "class_names.txt"
+                    )
+                    
+                    # After conversion, we treat it as YOLO. 
+                    # Set source_root to where we generated stuff.
+                    source_root = images_dir.parent if images_dir.name == "images" else coco_json.parent
+                    
+                else:
+                    # 2. Check for YOLO
+                    yolo_root = self._find_yolo_export_root(extracted_root)
+                    if yolo_root is not None:
+                        source_root = yolo_root
 
             # "Paste" to datasets/<dataset_name>.
             # Use move for speed; fall back to copy if needed.
@@ -79,12 +116,12 @@ class FileService:
             self._validate_dataset_structure(dataset_dir, dataset_type)
 
             self._safe_cleanup(temp_extract_dir, temp_file)
-            return dataset_dir
+            return dataset_dir, {"format": detected_format}
         except Exception:
             self._safe_cleanup(dataset_dir, temp_extract_dir, temp_file)
             raise
 
-    def upload_dataset_into_existing(self, file: UploadFile, dataset_dir: Path, dataset_type: DatasetType) -> Path:
+    def upload_dataset_into_existing(self, file: UploadFile, dataset_dir: Path, dataset_type: DatasetType) -> tuple[Path, dict]:
         dataset_dir = Path(dataset_dir)
         datasets_root = settings.datasets_dir.resolve()
         dataset_dir = dataset_dir.resolve()
@@ -138,10 +175,33 @@ class FileService:
                 extracted_root = extracted[0]
 
             source_root = extracted_root
+            detected_format = "yolo"
+
             if dataset_type == DatasetType.DETECTION:
-                yolo_root = self._find_yolo_export_root(extracted_root)
-                if yolo_root is not None:
-                    source_root = yolo_root
+                # 1. Check for COCO
+                coco_json = self._find_coco_annotation_file(extracted_root)
+                if coco_json:
+                    from train_platform.services.dataset_conversion_service import DatasetConversionService
+                    
+                    detected_format = "coco"
+                    images_dir = coco_json.parent
+                    if (coco_json.parent / "images").exists():
+                        images_dir = coco_json.parent / "images"
+                    elif (coco_json.parent / "train2017").exists():
+                        images_dir = coco_json.parent / "train2017"
+                        
+                    DatasetConversionService().conversion_coco_2_yolo(
+                        coco_json_path=coco_json,
+                        output_labels_dir=images_dir.parent / "labels" if images_dir.name == "images" else coco_json.parent / "labels",
+                        output_class_names_path=images_dir.parent / "class_names.txt" if images_dir.name == "images" else coco_json.parent / "class_names.txt"
+                    )
+                    source_root = images_dir.parent if images_dir.name == "images" else coco_json.parent
+
+                else:
+                    # 2. Check for YOLO
+                    yolo_root = self._find_yolo_export_root(extracted_root)
+                    if yolo_root is not None:
+                        source_root = yolo_root
 
             # Move into datasets/<dataset_name>.
             try:
@@ -152,7 +212,7 @@ class FileService:
             self._validate_dataset_structure(dataset_dir, dataset_type)
 
             self._safe_cleanup(temp_extract_dir, temp_file)
-            return dataset_dir
+            return dataset_dir, {"format": detected_format}
         except Exception:
             # Best-effort cleanup; keep an empty dir so dataset record remains usable.
             self._safe_cleanup(temp_extract_dir, temp_file)
@@ -604,6 +664,58 @@ class FileService:
                     best = cand
 
         return best[2] if best else None
+
+    def _find_coco_annotation_file(self, root: Path) -> Optional[Path]:
+        """
+        Scan for a likely COCO JSON annotation file.
+        Look for .json files that contain 'images' and 'categories' top-level keys.
+        """
+        if not root.exists():
+            return None
+            
+        # Limit scan depth
+        for cur, dirnames, filenames in os.walk(root):
+            cur_p = Path(cur)
+            if len(cur_p.relative_to(root).parts) > 4:
+                dirnames[:] = []
+                continue
+                
+            for fname in filenames:
+                if not fname.lower().endswith(".json"):
+                    continue
+                
+                # Check content
+                p = cur_p / fname
+                try:
+                    # quick read first 1KB to check basic structure if possible, 
+                    # but keys might be anywhere.
+                    # better to parse but limited length?
+                    # COCO jsons can be huge. parsing whole file just to check is slow.
+                    # simple heuristic: check file name or just try to parse if size is reasonable?
+                    # Common names: instances_default.json, result.json, _annotations.coco.json
+                    
+                    # Heuristic name check first
+                    lower_name = fname.lower()
+                    likely_coco = "instances" in lower_name or "coco" in lower_name or "annotations" in lower_name
+                    
+                    if not likely_coco:
+                        # Skip unlikely names to avoid parsing irrelevant jsons
+                        continue
+                        
+                    # Basic check
+                    import json
+                    with open(p, "r", encoding="utf-8") as f:
+                        # streaming check would be better but let's just read start
+                        head = f.read(1024)
+                        if '"images":' in head and '"categories":' in head:
+                            return p
+                        if '"images":' in head and '"annotations":' in head:
+                            return p
+                            
+                except Exception:
+                    continue
+                    
+        return None
 
     def _read_class_names_txt(self, dataset_dir: Path) -> list[str]:
         """
