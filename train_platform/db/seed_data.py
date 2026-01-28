@@ -44,9 +44,27 @@ def yolov8_classification_variants(*, engine: str = "ultralytics-yolo") -> list[
         for v in variants
     ]
 
+def yolov8_segmentation_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
+    """
+    Default YOLOv8 segmentation architectures.
+
+    Five standard variants: n/s/m/l/x.
+    """
+    variants = ["yolov8n-seg", "yolov8s-seg", "yolov8m-seg", "yolov8l-seg", "yolov8x-seg"]
+    return [
+        {
+            "family": "YOLOv8-seg",
+            "variant": v,
+            "task_type": TaskType.SEGMENTATION,
+            "engine": engine,
+        }
+        for v in variants
+    ]
+
 
 DEFAULT_ARCHITECTURES: list[dict] = [
     *yolov8_detection_variants(),
-    *yolov8_classification_variants(),
+    # *yolov8_classification_variants(),
+    *yolov8_segmentation_variants(),
 ]
 

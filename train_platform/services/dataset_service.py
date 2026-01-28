@@ -7,7 +7,7 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Tuple
 
 import yaml
 from fastapi.concurrency import run_in_threadpool
@@ -237,7 +237,6 @@ class DatasetService:
                     shutil.rmtree(versions_dir, ignore_errors=True)
         except Exception:
             pass
-
 
     def upload_dataset_archive(
         self,
@@ -1911,3 +1910,5 @@ class DatasetService:
                 except Exception:
                     continue
                 yield obj.get("path"), obj.get("size_bytes"), obj.get("mtime")
+
+    
