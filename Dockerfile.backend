@@ -1,23 +1,97 @@
 # Backend-only image (no GPU/torch stack)
+
+# ---------- build stage: cythonize train_platform ----------
+FROM python:3.10-slim-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+# C toolchain needed for building Cython extension modules.
+# (Retry to tolerate occasional transient 5xx responses from Debian mirrors.)
+RUN set -eux; \
+    apt-get update; \
+    for i in 1 2 3 4 5; do \
+        if apt-get install -y --no-install-recommends build-essential; then \
+            ok=1; \
+            break; \
+        fi; \
+        echo "apt-get install failed, retrying (${i}/5)..." >&2; \
+        sleep 5; \
+        apt-get update; \
+    done; \
+    test "${ok:-}" = "1"; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip
+
+COPY requirements/build.txt ./requirements/build.txt
+RUN pip install --no-cache-dir -r requirements/build.txt
+
+COPY setup.py ./setup.py
+COPY train_platform/ ./train_platform/
+COPY alembic.ini ./alembic.ini
+
+# Compile only "core" modules. FastAPI relies heavily on inspect.signature() / annotations
+# for dependency injection, so we enable signature metadata for compiled callables.
+#
+# NOTE: `Path.match("dir/**/*.py")` does NOT match files directly under `dir/`, so we include both patterns.
+ENV CYTHON_BINDING=1
+ENV CYTHON_EMBED_SIGNATURE=1
+ENV CYTHON_INCLUDE_GLOBS="train_platform/*.py,train_platform/services/*.py,train_platform/services/**/*.py,train_platform/repositories/*.py,train_platform/repositories/**/*.py,train_platform/schemas/*.py,train_platform/schemas/**/*.py,train_platform/models/*.py,train_platform/models/**/*.py,train_platform/utils/*.py,train_platform/utils/**/*.py,train_platform/training/*.py,train_platform/training/**/*.py,train_platform/core/*.py,train_platform/core/**/*.py,train_platform/db/*.py,train_platform/api/*.py,train_platform/api/**/*.py"
+RUN python setup.py build_ext --inplace
+
+# Remove only Python sources that were successfully compiled to an extension module.
+RUN python - <<'PY'
+from __future__ import annotations
+
+from pathlib import Path
+
+pkg = Path("train_platform")
+for py in pkg.rglob("*.py"):
+    if py.name == "__init__.py":
+        continue
+    # If a compiled extension exists alongside it, drop the source.
+    if any(py.parent.glob(py.stem + ".*.so")):
+        py.unlink()
+
+# Remove generated C/C++ sources (avoid leaking readable code) and build artifacts.
+for pat in ("*.c", "*.cpp"):
+    for f in pkg.rglob(pat):
+        f.unlink()
+PY
+RUN rm -rf build
+
+
+# ---------- runtime stage ----------
 FROM python:3.10-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
 # Runtime deps: mysql client for health/entrypoint checks.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    default-mysql-client \
-    && rm -rf /var/lib/apt/lists/*
+# (Retry to tolerate occasional transient 5xx responses from Debian mirrors.)
+RUN set -eux; \
+    apt-get update; \
+    for i in 1 2 3 4 5; do \
+        if apt-get install -y --no-install-recommends default-mysql-client; then \
+            ok=1; \
+            break; \
+        fi; \
+        echo "apt-get install failed, retrying (${i}/5)..." >&2; \
+        sleep 5; \
+        apt-get update; \
+    done; \
+    test "${ok:-}" = "1"; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# update pip
 RUN pip install --no-cache-dir --upgrade pip
 
 COPY requirements/backend.txt ./requirements/backend.txt
 RUN pip install --no-cache-dir -r requirements/backend.txt
 
-COPY train_platform/ ./train_platform/
+COPY --from=builder /app/train_platform/ ./train_platform/
 COPY alembic.ini .
 
 RUN mkdir -p /app/datasets /app/training_runs /app/temp

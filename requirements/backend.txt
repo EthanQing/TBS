@@ -7,4 +7,5 @@ python-dotenv==1.0.1
 python-multipart==0.0.9
 PyYAML==6.0.1
 requests==2.32.3
+Pillow==10.4.0
 cryptography>=46.0.3
