@@ -5,10 +5,17 @@ import shutil
 import tempfile
 import uuid
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
 from train_platform.utils.exceptions import ValidationError
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
 
 
 class DatasetConversionService:
@@ -256,6 +263,275 @@ class DatasetConversionService:
                     f.write("\n".join(class_names) + "\n")
 
         return out
+
+    def conversion_coco_2_yolo(
+        self,
+        coco_json_path: str | Path,
+        output_labels_dir: str | Path,
+        output_class_names_path: str | Path,
+    ) -> Dict[str, List[str]]:
+        """
+        Convert COCO JSON annotations to YOLO txt format.
+        
+        Args:
+            coco_json_path: Path to the COCO annotations json file.
+            output_labels_dir: Directory to write YOLO txt files.
+            output_class_names_path: Path to write extracted class names.
+        
+        Returns:
+            Dictionary mapping image filename (stem) to list of YOLO lines.
+        """
+        json_path = Path(coco_json_path).expanduser().resolve(strict=False)
+        labels_dir = Path(output_labels_dir).expanduser().resolve(strict=False)
+        class_names_file = Path(output_class_names_path).expanduser().resolve(strict=False)
+        
+        if not json_path.exists():
+            raise ValidationError(f"COCO JSON not found: {json_path}")
+            
+        data = self._read_json(json_path)
+        
+        # 1. Extract class names (categories)
+        categories = data.get("categories", [])
+        if not isinstance(categories, list):
+            categories = []
+        
+        # Sort by id to ensure stable ordering if ids are sequential
+        # But commonly COCO ids might be non-contiguous.
+        # We Map COCO category_id -> YOLO class_id (0-indexed based on list order)
+        categories_sorted = sorted(categories, key=lambda x: x.get("id", 0))
+        
+        class_names: List[str] = []
+        coco_id_to_yolo_id: Dict[int, int] = {}
+        
+        for cat in categories_sorted:
+            cid = cat.get("id")
+            cname = cat.get("name")
+            if cid is not None and cname:
+                yolo_id = len(class_names)
+                class_names.append(cname)
+                coco_id_to_yolo_id[cid] = yolo_id
+                
+        # Write class names
+        class_names_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(class_names_file, "w", encoding="utf-8") as f:
+            if class_names:
+                f.write("\n".join(class_names) + "\n")
+                
+        # 2. Index images by ID
+        # images: [{"id": 1, "width": 640, "height": 480, "file_name": "0001.jpg"}, ...]
+        images_info: Dict[int, Dict[str, Any]] = {}
+        for img in data.get("images", []):
+            iid = img.get("id")
+            if iid is not None:
+                images_info[iid] = img
+                
+        # 3. Iterate annotations
+        # annotations: [{"id": 1, "image_id": 1, "category_id": 1, "bbox": [x, y, w, h], ...}]
+        labels_dir.mkdir(parents=True, exist_ok=True)
+        
+        # We group annotations by image_id first
+        img_annotations: Dict[int, List[Dict[str, Any]]] = {}
+        for ann in data.get("annotations", []):
+            iid = ann.get("image_id")
+            if iid is not None:
+                if iid not in img_annotations:
+                    img_annotations[iid] = []
+                img_annotations[iid].append(ann)
+                
+        out_mapping: Dict[str, List[str]] = {}
+        
+        # 4. Generate YOLO files
+        for iid, img in images_info.items():
+            fname = img.get("file_name")
+            if not fname:
+                continue
+            
+            # Use file stem for label filename
+            stem = Path(fname).stem
+            anns = img_annotations.get(iid, [])
+            
+            w = img.get("width")
+            h = img.get("height")
+            
+            lines: List[str] = []
+            
+            if w and h:
+                w_f, h_f = float(w), float(h)
+                for ann in anns:
+                    cid = ann.get("category_id")
+                    bbox = ann.get("bbox") # [x, y, w, h]
+                    
+                    yolo_cid = coco_id_to_yolo_id.get(cid)
+                    if yolo_cid is not None and bbox and len(bbox) >= 4:
+                        x, y, bw, bh = bbox[0], bbox[1], bbox[2], bbox[3]
+                        
+                        # COCO bbox is top-left x, y, width, height (absolute)
+                        # Normalize to YOLO: center_x, center_y, width, height (relative)
+                        
+                        center_x = x + bw / 2.0
+                        center_y = y + bh / 2.0
+                        
+                        nx = center_x / w_f
+                        ny = center_y / h_f
+                        nw = bw / w_f
+                        nh = bh / h_f
+                        
+                        # Clip to [0, 1]
+                        nx = max(0.0, min(1.0, nx))
+                        ny = max(0.0, min(1.0, ny))
+                        nw = max(0.0, min(1.0, nw))
+                        nh = max(0.0, min(1.0, nh))
+                        
+                        lines.append(f"{yolo_cid} {nx:.6f} {ny:.6f} {nw:.6f} {nh:.6f}")
+            
+            out_mapping[stem] = lines
+            
+            # Write file
+            out_path = labels_dir / f"{stem}.txt"
+            with open(out_path, "w", encoding="utf-8") as f:
+                if lines:
+                    f.write("\n".join(lines) + "\n")
+                else:
+                    f.write("")
+                    
+        return out_mapping
+
+    def conversion_yolo_2_coco(
+        self,
+        images_dir: str | Path,
+        labels_dir: str | Path,
+        class_names_path: str | Path,
+        output_json_path: str | Path | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Convert YOLO annotations (txt) + Images to COCO JSON format.
+        Requires valid images to read dimensions.
+        """
+        if Image is None:
+            raise ValidationError("Pillow (PIL) is required for COCO conversion but not installed.")
+
+        img_dir = Path(images_dir).resolve()
+        lbl_dir = Path(labels_dir).resolve()
+        cls_file = Path(class_names_path).resolve()
+
+        if not img_dir.exists():
+            raise ValidationError(f"Images directory not found: {img_dir}")
+        if not lbl_dir.exists():
+            raise ValidationError(f"Labels directory not found: {lbl_dir}")
+
+        # 1. Read class names
+        class_names, _ = self._read_existing_class_names(cls_file)
+        # COCO category ids are typically 1-based. Using 1-based ids improves compatibility with
+        # downstream tooling (e.g. MMDetection, COCO evaluators).
+        categories = [{"id": i + 1, "name": name, "supercategory": "none"} for i, name in enumerate(class_names)]
+
+        # 2. Initialize COCO dict
+        coco_output: Dict[str, Any] = {
+            "info": {
+                "description": "Converted from YOLO format",
+                "year": datetime.now().year,
+                "date_created": datetime.now().isoformat(),
+            },
+            "licenses": [],
+            "images": [],
+            "annotations": [],
+            "categories": categories,
+        }
+
+        # 3. Iterate images
+        image_id_counter = 1
+        annotation_id_counter = 1
+
+        # Supported image extensions
+        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+        image_files = sorted([p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_exts])
+
+        for img_path in image_files:
+            # Read image dimensions
+            try:
+                with Image.open(img_path) as im:
+                    width, height = im.size
+            except Exception:
+                # If image is truncated or invalid, skip it?
+                # For conversion strictness, let's log or skip.
+                print(f"Warning: Failed to read image size for {img_path.name}")
+                continue
+
+            coco_image = {
+                "id": image_id_counter,
+                "file_name": img_path.name,
+                "width": width,
+                "height": height,
+                "date_captured": None,
+                "license": 0,
+            }
+            coco_output["images"].append(coco_image)
+
+            # Check for label file
+            label_file = lbl_dir / f"{img_path.stem}.txt"
+            if label_file.exists():
+                try:
+                    lines = label_file.read_text(encoding="utf-8").strip().splitlines()
+                    for line in lines:
+                        parts = line.strip().split()
+                        if len(parts) < 5:
+                            continue
+                        
+                        # YOLO: class x_center y_center w h (normalized)
+                        class_id = int(float(parts[0]))
+                        x_c_n = float(parts[1])
+                        y_c_n = float(parts[2])
+                        w_n = float(parts[3])
+                        h_n = float(parts[4])
+
+                        # Convert to COCO: x_min, y_min, w, h (absolute)
+                        # x_min = (x_c - w/2) * width
+                        # y_min = (y_c - h/2) * height
+                        # w_abs = w * width
+                        # h_abs = h * height
+                        
+                        w_abs = w_n * width
+                        h_abs = h_n * height
+                        x_min = (x_c_n * width) - (w_abs / 2)
+                        y_min = (y_c_n * height) - (h_abs / 2)
+
+                        # Clip to image boundaries (optional but recommended)
+                        x_min = max(0, x_min)
+                        y_min = max(0, y_min)
+                        # w_abs, h_abs should be positive, we don't strictly clip them here used for area
+
+                        poly = [
+                            [x_min, y_min],
+                            [x_min + w_abs, y_min],
+                            [x_min + w_abs, y_min + h_abs],
+                            [x_min, y_min + h_abs]
+                        ] # Simplified box polygon
+
+                        # Convert YOLO 0-based class_id -> COCO 1-based category_id.
+                        annt = {
+                            "id": annotation_id_counter,
+                            "image_id": int(image_id_counter),
+                            "category_id": int(class_id) + 1,
+                            "bbox": [round(x_min, 2), round(y_min, 2), round(w_abs, 2), round(h_abs, 2)],
+                            "area": round(w_abs * h_abs, 2),
+                            "segmentation": [], # BBox only, empty segmentation or box polygon
+                            "iscrowd": 0,
+                        }
+                        coco_output["annotations"].append(annt)
+                        annotation_id_counter += 1
+
+                except Exception as e:
+                    print(f"Warning: Error parsing label {label_file.name}: {e}")
+
+            image_id_counter += 1
+
+        if output_json_path:
+            out_p = Path(output_json_path)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_p, "w", encoding="utf-8") as f:
+                json.dump(coco_output, f, ensure_ascii=False, indent=2)
+
+        return coco_output
 
     def _unzip_2_tempdir(self, zip_path: Path) -> Path:
         """

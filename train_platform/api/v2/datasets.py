@@ -24,26 +24,38 @@ from train_platform.schemas.v2.datasets import (
     DatasetVersionOut,
 )
 from train_platform.services.dataset_service import DatasetService
-from train_platform.utils.exceptions import ValidationError
 
-
+# NOTE: v2's root router (train_platform.api.v2) is included under `/api/v2` in the
+# FastAPI app. Every sub-router must therefore have a non-empty prefix, otherwise
+# path operations like `@router.get("")` would have both an empty prefix and path,
+# which FastAPI rejects at startup.
 router = APIRouter(prefix="/datasets", tags=["datasets"])
-
-
-@router.get("", response_model=Page[DatasetOut])
-def list_datasets(page: int = 1, page_size: int = 50, db: Session = Depends(get_db)):
-    page = max(int(page), 1)
-    page_size = min(max(int(page_size), 1), 500)
-    skip = (page - 1) * page_size
-
-    total = db.query(Dataset).count()
-    items = DatasetService().list_datasets(db, skip=skip, limit=page_size)
-    return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
 @router.post("", response_model=DatasetOut, status_code=201)
 def create_dataset(payload: DatasetCreate, db: Session = Depends(get_db)):
     return DatasetService().create_dataset(db, obj=payload.model_dump())
+
+
+@router.get("", response_model=Page[DatasetOut])
+def list_datasets(
+    page: int = 1,
+    page_size: int = 50,
+    format: str | None = Query(None, description="Filter by format (yolo, coco)"),
+    db: Session = Depends(get_db),
+):
+    page = max(int(page), 1)
+    page_size = min(max(int(page_size), 1), 500)
+    skip = (page - 1) * page_size
+
+    # Count total
+    q = db.query(Dataset)
+    if format:
+        q = q.filter(Dataset.format == str(format))
+    total = q.count()
+
+    items = DatasetService().list_datasets(db, skip=skip, limit=page_size, format=format)
+    return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
 @router.get("/{dataset_id}", response_model=DatasetOut)

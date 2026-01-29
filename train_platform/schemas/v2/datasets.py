@@ -12,6 +12,7 @@ from train_platform.schemas.v2.common import PageMeta
 class DatasetCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     dataset_type: DatasetType
+    format: Optional[str] = Field("yolo", min_length=1, max_length=50)
     storage_path: Optional[str] = Field(
         None,
         min_length=1,
@@ -31,6 +32,7 @@ class DatasetOut(BaseModel):
     dataset_id: int
     name: str
     dataset_type: DatasetType
+    format: str = "yolo"
     storage_path: str
     description: Optional[str] = None
     active_version_id: Optional[int] = None

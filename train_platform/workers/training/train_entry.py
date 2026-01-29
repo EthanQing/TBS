@@ -170,13 +170,6 @@ def main(argv: list[str] | None = None) -> int:
             error_message = f"Dataset path does not exist: {dataset_path}"
             return exit_code
 
-        data_yaml = dataset_path / "data.yaml"
-        if not data_yaml.exists():
-            print(f"[train_entry] data.yaml not found: {data_yaml}", file=sys.stderr, flush=True)
-            exit_code = 2
-            error_message = f"data.yaml not found: {data_yaml}"
-            return exit_code
-
         if _cancel_requested(run_id):
             print(f"[train_entry] cancel requested before start run_id={run_id}", file=sys.stderr, flush=True)
             exit_code = 0

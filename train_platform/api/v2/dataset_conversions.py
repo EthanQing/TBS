@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, UploadFile, Query
 from fastapi.responses import FileResponse
 
 from train_platform.core.config import settings
@@ -105,12 +105,13 @@ def _zip_dir(src_dir: Path, out_zip: Path) -> None:
     tmp.replace(out_zip)
 
 
-def _run_zip_to_yolo(job_id: str) -> None:
+def _run_conversion_job(job_id: str) -> None:
     data = _read_status(job_id)
     data["status"] = "running"
     data["stage"] = "extracting"
     data["progress"] = 1
-    _append_log(data, "Extracting zip...")
+    target_format = data.get("target_format", "yolo")
+    _append_log(data, f"Extracting zip (target: {target_format})...")
     _write_status(job_id, data)
 
     job_root = _job_dir(job_id)
@@ -216,14 +217,41 @@ def _run_zip_to_yolo(job_id: str) -> None:
                     _append_log(st, f"[{i}/{total_images}] {name}")
                 _write_status(job_id, st)
 
-        # (5) Create data.yaml
-        data = _read_status(job_id)
-        data["stage"] = "writing_data_yaml"
-        data["progress"] = max(int(data.get("progress") or 0), 92)
-        _append_log(data, "Creating data.yaml...")
-        _write_status(job_id, data)
+        if target_format == "coco":
+            # (5) Convert YOLO -> COCO
+            data = _read_status(job_id)
+            data["stage"] = "converting_coco"
+            data["progress"] = max(int(data.get("progress") or 0), 92)
+            _append_log(data, "Converting to COCO JSON...")
+            _write_status(job_id, data)
 
-        FileService()._create_yolo_data_yaml(out_dir, out_dir / "data.yaml")
+            DatasetConversionService().conversion_yolo_2_coco(
+                images_dir=images_dir,
+                labels_dir=labels_dir,
+                class_names_path=out_dir / "class_names.txt",
+                output_json_path=out_dir / "annotations" / "instances_default.json",
+            )
+            
+            # Zip only images and annotations
+            # We need to filter what we zip. _zip_dir currently zips everything in src_dir.
+            # Ideally we only keep images and annotations folder.
+            # Let's clean up labels and auxiliary files from out_dir before zipping if COCO.
+            try:
+                shutil.rmtree(labels_dir, ignore_errors=True)
+                (out_dir / "class_names.txt").unlink(missing_ok=True)
+                (out_dir / "data.yaml").unlink(missing_ok=True) # in case it was created
+            except Exception:
+                pass
+
+        else:
+            # (5) Create data.yaml (YOLO)
+            data = _read_status(job_id)
+            data["stage"] = "writing_data_yaml"
+            data["progress"] = max(int(data.get("progress") or 0), 92)
+            _append_log(data, "Creating data.yaml...")
+            _write_status(job_id, data)
+
+            FileService()._create_yolo_data_yaml(out_dir, out_dir / "data.yaml")
 
         # Zip result
         data = _read_status(job_id)
@@ -239,7 +267,7 @@ def _run_zip_to_yolo(job_id: str) -> None:
         data["status"] = "completed"
         data["stage"] = "done"
         data["progress"] = 100
-        data["output_filename"] = "dataset_yolo.zip"
+        data["output_filename"] = f"dataset_{target_format}.zip"
         # Expose via static mount for temp
         data["output_url"] = f"/static/temp/dataset_conversions/{job_id}/output.zip"
         data["error_message"] = None
@@ -256,7 +284,10 @@ def _run_zip_to_yolo(job_id: str) -> None:
 
 
 @router.post("", response_model=DatasetConversionOut, status_code=201)
-async def create_dataset_conversion(file: UploadFile = File(...)):
+async def create_dataset_conversion(
+    file: UploadFile = File(...),
+    target_format: str = Query("yolo", pattern="^(yolo|coco)$"),
+):
     """
     Convert a zip containing images + json annotations into a YOLO-style dataset zip.
 
@@ -293,7 +324,8 @@ async def create_dataset_conversion(file: UploadFile = File(...)):
         "progress": 0,
         "processed": 0,
         "total": None,
-        "logs": [f"Received: {filename}"],
+        "target_format": target_format,
+        "logs": [f"Received: {filename}", f"Target format: {target_format}"],
         "output_url": None,
         "output_filename": None,
         "error_message": None,
@@ -303,7 +335,7 @@ async def create_dataset_conversion(file: UploadFile = File(...)):
     _write_status(job_id, status)
 
     # Run conversion in background (in-process).
-    t = threading.Thread(target=_run_zip_to_yolo, args=(job_id,), daemon=True)
+    t = threading.Thread(target=_run_conversion_job, args=(job_id,), daemon=True)
     t.start()
 
     return DatasetConversionOut.model_validate(status)

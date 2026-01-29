@@ -94,8 +94,11 @@ class DatasetService:
     # --------------------
     # datasets
     # --------------------
-    def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100) -> list[Dataset]:
-        return self.datasets.get_multi(db, skip=skip, limit=limit)
+    def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[Dataset]:
+        q = self.datasets.get_query(db)
+        if format:
+            q = q.filter(Dataset.format == str(format))
+        return q.offset(skip).limit(limit).all()
 
     def get_dataset(self, db: Session, dataset_id: int) -> Dataset:
         ds = self.datasets.get(db, int(dataset_id))
@@ -119,6 +122,7 @@ class DatasetService:
             obj_in={
                 "name": name,
                 "dataset_type": obj["dataset_type"],
+                "format": obj.get("format", "yolo"),
                 "storage_path": tmp_token,
                 "description": obj.get("description"),
             },
@@ -256,7 +260,12 @@ class DatasetService:
         if dataset_root == base or (base not in dataset_root.parents and dataset_root != base):
             raise ValidationError("Invalid dataset storage_path (must be under BASE_DATASETS_DIR)")
 
-        FileService().upload_dataset_into_existing(file, dataset_root, ds.dataset_type)
+        _path, info = FileService().upload_dataset_into_existing(file, dataset_root, ds.dataset_type)
+        
+        # Update dataset format if detected
+        detected_format = info.get("format")
+        if detected_format and detected_format != "yolo":
+            ds.format = detected_format
 
         ver = None
         if create_version:
@@ -315,7 +324,12 @@ class DatasetService:
         if dataset_root == base or (base not in dataset_root.parents and dataset_root != base):
             raise ValidationError("Invalid dataset storage_path (must be under BASE_DATASETS_DIR)")
 
-        await run_in_threadpool(FileService().upload_dataset_into_existing, file, dataset_root, ds.dataset_type)
+        _path, info = await run_in_threadpool(FileService().upload_dataset_into_existing, file, dataset_root, ds.dataset_type)
+
+        # Update dataset format if detected
+        detected_format = info.get("format")
+        if detected_format and detected_format != "yolo":
+            ds.format = detected_format
 
         ver = None
         if create_version:
