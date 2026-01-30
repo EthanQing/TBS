@@ -22,11 +22,21 @@ def mlflow_enabled() -> bool:
     return bool(os.getenv("MLFLOW_TRACKING_URI"))
 
 
+def to_file_uri(path: str | os.PathLike) -> str:
+    """Convert a file path to a file URI (file:///...) handling Windows paths correctly."""
+    try:
+        from pathlib import Path
+        return Path(path).resolve().as_uri()
+    except Exception:
+        return f"file:{str(path)}"
+
+
 def get_tracking_uri() -> str:
     uri = os.getenv("MLFLOW_TRACKING_URI")
     if uri:
         return uri
-    return f"file:{(settings.training_dir / 'mlruns').as_posix()}"
+    # Use proper file URI for Windows compatibility
+    return to_file_uri(settings.training_dir / "mlruns")
 
 
 def get_experiment_name() -> str:
@@ -146,6 +156,13 @@ def init_mlflow_logger(run: Any, *, dataset_path: Optional[str] = None, run_dir:
     client, tracking_uri = _get_mlflow_client()
     if client is None:
         return None
+
+    # Sync global MLflow state for external libraries (like Ultralytics)
+    try:
+        import mlflow
+        mlflow.set_tracking_uri(tracking_uri)
+    except Exception:
+        pass
 
     experiment_id = _get_or_create_experiment_id(client, tracking_uri)
 

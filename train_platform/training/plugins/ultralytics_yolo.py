@@ -184,6 +184,14 @@ class UltralyticsYOLOTrainer:
         try:
             model = YOLO(model_path)
 
+            # Disable Ultralytics' built-in MLflow integration to avoid URI conflicts
+            # We handle MLflow logging through our own MlflowRunLogger in train_entry.py
+            try:
+                from ultralytics import settings as ultralytics_settings
+                ultralytics_settings.update({"mlflow": False})
+            except Exception:
+                pass
+
             last_cancel_check = {"t": 0.0}
 
             def should_cancel() -> bool:
@@ -254,11 +262,18 @@ class UltralyticsYOLOTrainer:
                 "name": ctx.job_id,
                 "device": device_value,
                 "exist_ok": True,
+                "save_period": int(add.get("save_period", -1)),
             }
             if resume_training and resume_job_id:
                 train_args["resume"] = True
 
             model.train(**train_args)
+            
+            # Run validation after training to ensure final metrics are captured and available
+            try:
+                model.val()
+            except Exception:
+                pass
         finally:
             if cleanup_candidate is not None:
                 try:
