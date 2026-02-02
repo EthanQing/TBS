@@ -14,6 +14,7 @@ from fastapi import UploadFile
 
 from train_platform.core.config import settings
 from train_platform.models.enums import DatasetType
+from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ConflictError, ValidationError
 
 
@@ -311,10 +312,10 @@ class FileService:
         Returns dict with added_classes and total_classes.
         Raises ValidationError if classes are incompatible.
         """
-        # Read existing classes from data.yaml
+        # Read existing classes from an existing YOLO dataset yaml (prefer data.yaml).
         existing_classes = []
-        data_yaml_path = dataset_dir / "data.yaml"
-        if data_yaml_path.exists():
+        data_yaml_path = find_yolo_dataset_yaml(dataset_dir)
+        if data_yaml_path is not None and data_yaml_path.exists():
             try:
                 cfg = yaml.safe_load(data_yaml_path.read_text(encoding="utf-8", errors="ignore")) or {}
                 names = cfg.get("names", [])

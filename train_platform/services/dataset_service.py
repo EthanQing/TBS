@@ -25,6 +25,7 @@ from train_platform.repositories.dataset_repo import DatasetRepository
 from train_platform.repositories.dataset_version_repo import DatasetVersionRepository
 from train_platform.services.file_service import FileService
 from train_platform.services.project_service import ProjectService
+from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.path_utils import resolve_dataset_path
 
@@ -703,15 +704,18 @@ class DatasetService:
             if labels_dest_dir is None:
                 raise ValidationError("Internal error: labels_dest_dir is not set")
 
-            data_yaml_path = (dataset_root / "data.yaml").resolve(strict=False)
-            if not data_yaml_path.exists():
+            data_yaml_path = find_yolo_dataset_yaml(dataset_root, dataset_name=str(getattr(ds, "name", "") or "") or None)
+            if data_yaml_path is None or not data_yaml_path.exists():
                 # We need an existing schema (nc/names) to validate "no new classes".
-                try:
-                    from train_platform.services.file_service import FileService
+                # If the dataset doesn't ship with a yaml, create a minimal data.yaml.
+                data_yaml_path = (dataset_root / "data.yaml").resolve(strict=False)
+                if not data_yaml_path.exists():
+                    try:
+                        from train_platform.services.file_service import FileService
 
-                    FileService()._create_yolo_data_yaml(dataset_root, data_yaml_path)
-                except Exception:
-                    raise ValidationError("data.yaml not found; cannot validate labels/classes")
+                        FileService()._create_yolo_data_yaml(dataset_root, data_yaml_path)
+                    except Exception:
+                        raise ValidationError("Dataset YAML not found; cannot validate labels/classes")
 
             try:
                 cfg = yaml.safe_load(data_yaml_path.read_text(encoding="utf-8", errors="ignore")) or {}
@@ -723,7 +727,7 @@ class DatasetService:
             base_names = self._normalize_yolo_names(cfg.get("names"), cfg.get("nc"))
             nc_before = int(len(base_names))
             if nc_before <= 0:
-                raise ValidationError("data.yaml missing valid 'names'/'nc'; cannot validate labels/classes")
+                raise ValidationError("Dataset YAML missing valid 'names'/'nc'; cannot validate labels/classes")
 
             max_class_id = self._scan_yolo_label_max_class_id_from_uploads(labels)
             if max_class_id is not None and int(max_class_id) >= int(nc_before):
@@ -1075,8 +1079,8 @@ class DatasetService:
             if isinstance(stats, dict) and stats:
                 meta_obj["stats"] = stats
             if ds.dataset_type == DatasetType.DETECTION:
-                yolo_yaml = dataset_path / "data.yaml"
-                if yolo_yaml.exists() and yolo_yaml.is_file():
+                yolo_yaml = find_yolo_dataset_yaml(dataset_path, dataset_name=str(getattr(ds, "name", "") or "") or None)
+                if yolo_yaml is not None and yolo_yaml.exists() and yolo_yaml.is_file():
                     try:
                         cfg = yaml.safe_load(yolo_yaml.read_text(encoding="utf-8", errors="ignore")) or {}
                     except Exception:

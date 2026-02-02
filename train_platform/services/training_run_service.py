@@ -32,6 +32,7 @@ from train_platform.models.training_run_meta import TrainingRunMeta
 from train_platform.repositories.training_run_meta_repo import TrainingRunMetaRepository
 from train_platform.repositories.training_run_repo import TrainingRunRepository
 from train_platform.services.dataset_service import DatasetService
+from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.training_artifacts import index_completion_artifacts
 from train_platform.utils.path_utils import resolve_dataset_path
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
@@ -242,9 +243,9 @@ class TrainingRunService:
             if not dataset_root.exists() or not dataset_root.is_dir():
                 raise ConflictError("Dataset path does not exist; upload dataset files first")
 
-            data_yaml = dataset_root / "data.yaml"
+            data_yaml = find_yolo_dataset_yaml(dataset_root, dataset_name=str(getattr(dataset, "name", "") or "") or None)
             has_split = False
-            if data_yaml.exists():
+            if data_yaml and data_yaml.exists():
                 try:
                     cfg = yaml.safe_load(data_yaml.read_text(encoding="utf-8", errors="ignore")) or {}
                 except Exception:
@@ -256,6 +257,8 @@ class TrainingRunService:
                     def _path_ok(p):
                         if not p:
                             return False
+                        if isinstance(p, (list, tuple)):
+                            return all(_path_ok(x) for x in p) if p else False
                         s = str(p).strip()
                         if not s:
                             return False
@@ -353,6 +356,40 @@ class TrainingRunService:
         db.commit()
         db.refresh(run)
         return run
+
+    def resume_run(self, db: Session, run_id: str) -> TrainingRun:
+        run = self.get_run(db, run_id)
+
+        # 1. Validation: only allow resuming cancelled or failed runs (or stopped?)
+        if run.status not in (TrainingRunStatus.CANCELLED, TrainingRunStatus.FAILED, TrainingRunStatus.COMPLETED):
+            raise ConflictError(f"Run status is {run.status}; must be CANCELLED, FAILED, or COMPLETED to resume")
+
+        # 2. Check for weights
+        weights_path = settings.training_dir / str(run_id) / "weights" / "last.pt"
+        if not weights_path.exists():
+            raise ConflictError("Cannot resume: 'last.pt' weights not found in run directory")
+
+        # 3. Update parameters to enable resume
+        if run.parameters:
+            add = run.parameters.additional_params or {}
+            if isinstance(add, dict):
+                add["resume_training"] = True
+                add["resume_job_id"] = None # Clear this to force self-resume
+                run.parameters.additional_params = add
+                db.add(run.parameters)
+        
+        # 4. Reset status flags
+        run.cancel_requested_at = None
+        run.cancel_reason = None
+        run.error_message = None
+        run.finished_at = None
+        
+        db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="resumed", message="Run resume requested"))
+        db.commit()
+
+        # 5. Queue it
+        return self.queue_run(db, run_id)
+
 
     def request_cancel(self, db: Session, run_id: str, *, reason: Optional[str] = None) -> TrainingRun:
         run = self.get_run(db, run_id)

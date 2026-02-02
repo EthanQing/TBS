@@ -10,6 +10,7 @@ import yaml
 
 from train_platform.core.config import settings
 from train_platform.training.plugins.base import TrainContext
+from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
 
 
@@ -147,11 +148,27 @@ class UltralyticsYOLOTrainer:
 
         cleanup_candidate: Path | None = None
 
-        if resume_training and resume_job_id:
-            resume_weights_path = settings.training_dir / str(resume_job_id) / "weights" / "last.pt"
-            if not resume_weights_path.exists():
-                raise ValueError(f"resume weights not found: {resume_weights_path}")
-            model_path = str(resume_weights_path)
+        if resume_training:
+            # Case 1: Resume from another job (transfer learning / continue from checkpoint)
+            if resume_job_id and str(resume_job_id) != str(ctx.job_id):
+                resume_weights_path = settings.training_dir / str(resume_job_id) / "weights" / "last.pt"
+                if not resume_weights_path.exists():
+                    raise ValueError(f"resume weights not found: {resume_weights_path}")
+                model_path = str(resume_weights_path)
+            
+            # Case 2: Resume this same job (continue interrupted training)
+            else:
+                # For self-resume, we point to our own last.pt. 
+                # Ultralytics handles 'resume=True' automatically if we pass the weights file 
+                # or if we just set resume=True with the same project/name, but explicit path is safer.
+                my_weights = ctx.run_dir / "weights" / "last.pt"
+                if my_weights.exists():
+                    model_path = str(my_weights)
+                else:
+                    # Fallback: if no weights yet, just start fresh or use pretrained
+                    # This happens if user clicked 'Resume' on a job that failed before first save.
+                    resume_training = False 
+                    pass
         elif use_pretrained:
             resolved_pretrain = None
             if pretrained_model_path:
@@ -219,7 +236,15 @@ class UltralyticsYOLOTrainer:
             run_dir = ctx.run_dir
             run_dir.mkdir(parents=True, exist_ok=True)
 
-            data_yaml = ctx.dataset_path / "data.yaml"
+            dataset_name = None
+            try:
+                dataset_name = str(getattr(getattr(getattr(job, "project", None), "dataset", None), "name", None) or "") or None
+            except Exception:
+                dataset_name = None
+
+            data_yaml = find_yolo_dataset_yaml(ctx.dataset_path, dataset_name=dataset_name)
+            if data_yaml is None:
+                raise ValueError(f"Dataset YAML not found under: {ctx.dataset_path}")
             run_data_yaml = data_yaml
             try:
                 with open(data_yaml, "r", encoding="utf-8", errors="replace") as f:

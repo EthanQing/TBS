@@ -20,11 +20,16 @@ def _seed_architectures(db: Session) -> None:
     from train_platform.models.architecture import ModelArchitecture
     from train_platform.db.seed_data import DEFAULT_ARCHITECTURES
 
-    # Only seed when table is empty.
-    # If user already has rows (custom architectures), leave them untouched.
-    has_any = db.query(ModelArchitecture.architecture_id).limit(1).first()
-    if has_any:
-        return
+    # Fetch existing variants to avoid duplicates
+    existing_variants_and_families = {
+        (row[0], row[1]) for row in db.query(ModelArchitecture.variant, ModelArchitecture.family).all()
+    }
 
-    db.add_all([ModelArchitecture(**d) for d in DEFAULT_ARCHITECTURES])
-    db.commit()
+    to_add = []
+    for d in DEFAULT_ARCHITECTURES:
+        if (d["variant"], d["family"]) not in existing_variants_and_families:
+            to_add.append(ModelArchitecture(**d))
+
+    if to_add:
+        db.add_all(to_add)
+        db.commit()

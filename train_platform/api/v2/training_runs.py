@@ -143,6 +143,11 @@ def queue_training_run(run_id: str, db: Session = Depends(get_db)):
     return TrainingRunService().queue_run(db, run_id)
 
 
+@router.post("/{run_id}/resume", response_model=TrainingRunOut)
+def resume_training_run(run_id: str, db: Session = Depends(get_db)):
+    return TrainingRunService().resume_run(db, run_id)
+
+
 @router.post("/{run_id}/cancel", response_model=TrainingRunOut)
 def cancel_training_run(run_id: str, reason: str | None = Body(None), db: Session = Depends(get_db)):
     return TrainingRunService().request_cancel(db, run_id, reason=reason)

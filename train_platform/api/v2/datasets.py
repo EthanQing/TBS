@@ -24,6 +24,7 @@ from train_platform.schemas.v2.datasets import (
     DatasetVersionOut,
 )
 from train_platform.services.dataset_service import DatasetService
+from train_platform.utils.exceptions import ValidationError
 
 # NOTE: v2's root router (train_platform.api.v2) is included under `/api/v2` in the
 # FastAPI app. Every sub-router must therefore have a non-empty prefix, otherwise

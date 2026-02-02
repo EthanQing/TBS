@@ -62,9 +62,26 @@ def yolov8_segmentation_variants(*, engine: str = "ultralytics-yolo") -> list[di
     ]
 
 
+def rtmdet_detection_variants(*, engine: str = "mmdet") -> list[dict]:
+    """
+    RTMDet detection architectures (MMDetection).
+    """
+    variants = ["rtmdet_s", "rtmdet_m", "rtmdet_l"]
+    return [
+        {
+            "family": "mmdet",
+            "variant": v,
+            "task_type": TaskType.DETECTION,
+            "engine": engine,
+        }
+        for v in variants
+    ]
+
+
 DEFAULT_ARCHITECTURES: list[dict] = [
     *yolov8_detection_variants(),
     # *yolov8_classification_variants(),
-    *yolov8_segmentation_variants(),
+    # *yolov8_segmentation_variants(),
+    *rtmdet_detection_variants(),
 ]
 

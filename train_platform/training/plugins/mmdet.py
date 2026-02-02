@@ -10,6 +10,7 @@ import yaml
 
 from train_platform.core.config import settings
 from train_platform.training.plugins.base import TrainContext
+from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
 
@@ -336,7 +337,7 @@ class MMDetTrainer:
 
     def can_handle(self, model_family: str) -> bool:
         mf = (model_family or "").strip().lower()
-        return mf in ("mmdet", "mmdetection") or "mmdet" in mf or "mmdetection" in mf
+        return any(x in mf for x in ("mmdet", "mmdetection", "rtmdet"))
 
     def run(self, ctx: TrainContext) -> None:
         # Import lazily so the backend can run without MMDetection installed.
@@ -381,10 +382,10 @@ class MMDetTrainer:
         if not cfg_path.exists():
             raise ValidationError(f"MMDet config not found: {cfg_path}")
 
-        # Dataset: read names + train/val lists from data.yaml (created by FileService/split_dataset).
-        data_yaml = ctx.dataset_path / "data.yaml"
-        if not data_yaml.exists():
-            raise ValidationError("data.yaml not found in dataset; cannot derive train/val and class names")
+        # Dataset: read names + train/val from a YOLO dataset yaml.
+        data_yaml = find_yolo_dataset_yaml(ctx.dataset_path)
+        if data_yaml is None or not data_yaml.exists():
+            raise ValidationError("Dataset YAML not found in dataset; cannot derive train/val and class names")
         data_cfg = _load_yaml(data_yaml)
 
         class_names = _normalize_yolo_names(data_cfg.get("names"), data_cfg.get("nc"))
@@ -394,7 +395,7 @@ class MMDetTrainer:
         train_spec = str(data_cfg.get("train") or "").strip()
         val_spec = str(data_cfg.get("val") or "").strip()
         if not train_spec or not val_spec:
-            raise ValidationError("data.yaml missing train/val; please split dataset first")
+            raise ValidationError("Dataset YAML missing train/val; please split dataset first")
 
         train_images = _read_image_list(ctx.dataset_path, train_spec)
         val_images = _read_image_list(ctx.dataset_path, val_spec)
