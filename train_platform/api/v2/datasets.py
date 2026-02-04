@@ -130,6 +130,13 @@ async def upload_dataset_archive(
     created_by: str | None = Form(None),
     create_version: bool = Form(True),
     activate: bool = Form(True),
+    split_enabled: bool = Form(False),
+    split_train_ratio: float | None = Form(None),
+    split_val_ratio: float | None = Form(None),
+    split_test_ratio: float | None = Form(None),
+    split_seed: int | None = Form(None),
+    split_shuffle: bool | None = Form(None),
+    split_overwrite: bool | None = Form(None),
     db: Session = Depends(get_db),
 ):
     ds, _ver = await DatasetService().upload_dataset_archive_async(
@@ -140,6 +147,13 @@ async def upload_dataset_archive(
         created_by=created_by,
         create_version=bool(create_version),
         activate=bool(activate),
+        split_enabled=bool(split_enabled),
+        split_train_ratio=split_train_ratio,
+        split_val_ratio=split_val_ratio,
+        split_test_ratio=split_test_ratio,
+        split_seed=split_seed,
+        split_shuffle=split_shuffle,
+        split_overwrite=split_overwrite,
     )
     return ds
 
@@ -151,6 +165,13 @@ async def import_dataset(
     dataset_id: int | None = Form(None),
     message: str | None = Form(None),
     created_by: str | None = Form(None),
+    split_enabled: bool = Form(False),
+    split_train_ratio: float | None = Form(None),
+    split_val_ratio: float | None = Form(None),
+    split_test_ratio: float | None = Form(None),
+    split_seed: int | None = Form(None),
+    split_shuffle: bool | None = Form(None),
+    split_overwrite: bool | None = Form(None),
     db: Session = Depends(get_db),
 ):
     if dataset_id is None:
@@ -164,6 +185,13 @@ async def import_dataset(
         created_by=created_by,
         create_version=True,
         activate=True,
+        split_enabled=bool(split_enabled),
+        split_train_ratio=split_train_ratio,
+        split_val_ratio=split_val_ratio,
+        split_test_ratio=split_test_ratio,
+        split_seed=split_seed,
+        split_shuffle=split_shuffle,
+        split_overwrite=split_overwrite,
     )
     return ds
 
@@ -206,6 +234,13 @@ def convert_illegal_dataset(
         label_strategy=data.get("label_strategy"),
         label_level=data.get("label_level"),
         label_separator=data.get("label_separator"),
+        split_enabled=data.get("split_enabled"),
+        split_train_ratio=data.get("split_train_ratio"),
+        split_val_ratio=data.get("split_val_ratio"),
+        split_test_ratio=data.get("split_test_ratio"),
+        split_seed=data.get("split_seed"),
+        split_shuffle=data.get("split_shuffle"),
+        split_overwrite=data.get("split_overwrite"),
     )
 
 

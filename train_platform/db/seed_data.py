@@ -82,6 +82,6 @@ DEFAULT_ARCHITECTURES: list[dict] = [
     *yolov8_detection_variants(),
     # *yolov8_classification_variants(),
     # *yolov8_segmentation_variants(),
-    *rtmdet_detection_variants(),
+    # *rtmdet_detection_variants(),
 ]
 

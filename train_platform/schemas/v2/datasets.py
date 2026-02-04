@@ -159,8 +159,9 @@ class DatasetImageOut(BaseModel):
 
 class DatasetSplitRequest(BaseModel):
     version_id: Optional[int] = None
-    train_ratio: float = Field(0.8, gt=0, lt=1)
+    train_ratio: float = Field(0.9, gt=0, lt=1)
     val_ratio: Optional[float] = Field(None, gt=0, lt=1)
+    test_ratio: Optional[float] = Field(None, gt=0, lt=1)
     seed: Optional[int] = None
     shuffle: bool = True
     overwrite: bool = True
@@ -173,8 +174,10 @@ class DatasetSplitSummary(BaseModel):
     total_images: int
     train_count: int
     val_count: int
+    test_count: int
     train_ratio: float
     val_ratio: float
+    test_ratio: float
     seed: Optional[int] = None
     shuffle: Optional[bool] = None
 
@@ -246,6 +249,13 @@ class DatasetIllegalConvertRequest(BaseModel):
     label_strategy: str = Field(..., description="full | leaf | root | level")
     label_level: Optional[int] = Field(None, ge=1)
     label_separator: str = Field("%", min_length=1, max_length=10)
+    split_enabled: Optional[bool] = Field(False)
+    split_train_ratio: Optional[float] = Field(None, gt=0, lt=1)
+    split_val_ratio: Optional[float] = Field(None, gt=0, lt=1)
+    split_test_ratio: Optional[float] = Field(None, gt=0, lt=1)
+    split_seed: Optional[int] = None
+    split_shuffle: Optional[bool] = None
+    split_overwrite: Optional[bool] = None
 
     @model_validator(mode="after")
     def _check_level(self):

@@ -31,7 +31,6 @@ from train_platform.models.training_run import (
 from train_platform.models.training_run_meta import TrainingRunMeta
 from train_platform.repositories.training_run_meta_repo import TrainingRunMetaRepository
 from train_platform.repositories.training_run_repo import TrainingRunRepository
-from train_platform.services.dataset_service import DatasetService
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.training_artifacts import index_completion_artifacts
 from train_platform.utils.path_utils import resolve_dataset_path
@@ -237,14 +236,14 @@ class TrainingRunService:
         if arch.task_type != project.task_type:
             raise ValidationError("Architecture task_type does not match project task_type")
 
-        # Ensure dataset has train/val split before training.
+        # Check dataset train/val split before training (no auto-split).
+        has_split = False
         try:
             dataset_root = resolve_dataset_path(ver.snapshot_path or dataset.storage_path)
             if not dataset_root.exists() or not dataset_root.is_dir():
                 raise ConflictError("Dataset path does not exist; upload dataset files first")
 
             data_yaml = find_yolo_dataset_yaml(dataset_root, dataset_name=str(getattr(dataset, "name", "") or "") or None)
-            has_split = False
             if data_yaml and data_yaml.exists():
                 try:
                     cfg = yaml.safe_load(data_yaml.read_text(encoding="utf-8", errors="ignore")) or {}
@@ -269,23 +268,12 @@ class TrainingRunService:
 
                     if _path_ok(train_p) and _path_ok(val_p):
                         has_split = True
-
-            if not has_split:
-                DatasetService().split_dataset(
-                    db,
-                    int(dataset.dataset_id),
-                    version_id=int(ver.version_id),
-                    train_ratio=0.8,
-                    val_ratio=None,
-                    shuffle=True,
-                    overwrite=False,
-                )
         except ValidationError:
             raise
         except ConflictError:
             raise
         except Exception:
-            raise ValidationError("Failed to prepare dataset split for training")
+            raise ValidationError("Failed to validate dataset split for training")
 
         run_id = str(uuid.uuid4())
         name = str(obj.get("name") or "").strip() or f"{arch.variant}-{run_id[:8]}"
@@ -325,6 +313,15 @@ class TrainingRunService:
         )
 
         db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="created", message="Run created"))
+        if not has_split:
+            db.add(
+                TrainingRunEvent(
+                    run_id=run_id,
+                    level=LogLevel.WARNING,
+                    event_type="dataset_split_missing",
+                    message="Dataset has no valid train/val split; proceeding without enforced split",
+                )
+            )
         db.commit()
 
         return self.get_run(db, run_id)

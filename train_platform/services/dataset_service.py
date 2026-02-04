@@ -320,6 +320,13 @@ class DatasetService:
         created_by: Optional[str] = None,
         create_version: bool = True,
         activate: bool = True,
+        split_enabled: bool = False,
+        split_train_ratio: float | None = None,
+        split_val_ratio: float | None = None,
+        split_test_ratio: float | None = None,
+        split_seed: int | None = None,
+        split_shuffle: bool | None = None,
+        split_overwrite: bool | None = None,
     ):
         ds = self.get_dataset(db, dataset_id)
 
@@ -376,6 +383,45 @@ class DatasetService:
         db.refresh(ds)
         if ver is not None:
             db.refresh(ver)
+        if split_enabled:
+            if not create_version:
+                raise ValidationError("split_enabled requires create_version=true")
+            if ds.dataset_type != DatasetType.DETECTION:
+                raise ValidationError("Split is only supported for detection datasets")
+            if str(getattr(ds, "format", "") or "") == "illegal":
+                raise ValidationError("Cannot split illegal dataset; convert it first")
+            if ver is None:
+                raise ValidationError("Dataset version not created")
+            try:
+                self.split_dataset(
+                    db,
+                    int(ds.dataset_id),
+                    version_id=int(ver.version_id),
+                    train_ratio=float(split_train_ratio) if split_train_ratio is not None else 0.9,
+                    val_ratio=split_val_ratio,
+                    test_ratio=split_test_ratio,
+                    seed=split_seed,
+                    shuffle=bool(split_shuffle) if split_shuffle is not None else True,
+                    overwrite=bool(split_overwrite) if split_overwrite is not None else True,
+                    trigger="upload",
+                )
+            except Exception as e:
+                try:
+                    db.add(
+                        DatasetEvent(
+                            dataset_id=int(ds.dataset_id),
+                            version_id=int(ver.version_id),
+                            event_type="split_failed",
+                            message="Dataset split failed",
+                            data={"trigger": "upload", "error": str(e)},
+                        )
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                if isinstance(e, ValidationError):
+                    raise
+                raise ValidationError("Failed to split dataset") from e
         return ds, ver
 
     async def upload_dataset_archive_async(
@@ -388,6 +434,13 @@ class DatasetService:
         created_by: Optional[str] = None,
         create_version: bool = True,
         activate: bool = True,
+        split_enabled: bool = False,
+        split_train_ratio: float | None = None,
+        split_val_ratio: float | None = None,
+        split_test_ratio: float | None = None,
+        split_seed: int | None = None,
+        split_shuffle: bool | None = None,
+        split_overwrite: bool | None = None,
     ):
         """
         Async wrapper for large uploads.
@@ -451,6 +504,45 @@ class DatasetService:
         db.refresh(ds)
         if ver is not None:
             db.refresh(ver)
+        if split_enabled:
+            if not create_version:
+                raise ValidationError("split_enabled requires create_version=true")
+            if ds.dataset_type != DatasetType.DETECTION:
+                raise ValidationError("Split is only supported for detection datasets")
+            if str(getattr(ds, "format", "") or "") == "illegal":
+                raise ValidationError("Cannot split illegal dataset; convert it first")
+            if ver is None:
+                raise ValidationError("Dataset version not created")
+            try:
+                self.split_dataset(
+                    db,
+                    int(ds.dataset_id),
+                    version_id=int(ver.version_id),
+                    train_ratio=float(split_train_ratio) if split_train_ratio is not None else 0.9,
+                    val_ratio=split_val_ratio,
+                    test_ratio=split_test_ratio,
+                    seed=split_seed,
+                    shuffle=bool(split_shuffle) if split_shuffle is not None else True,
+                    overwrite=bool(split_overwrite) if split_overwrite is not None else True,
+                    trigger="upload",
+                )
+            except Exception as e:
+                try:
+                    db.add(
+                        DatasetEvent(
+                            dataset_id=int(ds.dataset_id),
+                            version_id=int(ver.version_id),
+                            event_type="split_failed",
+                            message="Dataset split failed",
+                            data={"trigger": "upload", "error": str(e)},
+                        )
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                if isinstance(e, ValidationError):
+                    raise
+                raise ValidationError("Failed to split dataset") from e
         return ds, ver
 
     def append_dataset_archive(
@@ -582,6 +674,13 @@ class DatasetService:
         label_strategy: str,
         label_level: Optional[int],
         label_separator: Optional[str],
+        split_enabled: bool | None = None,
+        split_train_ratio: float | None = None,
+        split_val_ratio: float | None = None,
+        split_test_ratio: float | None = None,
+        split_seed: int | None = None,
+        split_shuffle: bool | None = None,
+        split_overwrite: bool | None = None,
     ) -> dict:
         ds = self.get_dataset(db, dataset_id)
         if ds.dataset_type != DatasetType.DETECTION:
@@ -625,6 +724,15 @@ class DatasetService:
                 "label_separator": label_separator or "%",
             }
         )
+        conv["split"] = {
+            "enabled": bool(split_enabled),
+            "train_ratio": float(split_train_ratio) if split_train_ratio is not None else None,
+            "val_ratio": float(split_val_ratio) if split_val_ratio is not None else None,
+            "test_ratio": float(split_test_ratio) if split_test_ratio is not None else None,
+            "seed": int(split_seed) if split_seed is not None else None,
+            "shuffle": bool(split_shuffle) if split_shuffle is not None else None,
+            "overwrite": bool(split_overwrite) if split_overwrite is not None else None,
+        }
         meta["conversion"] = conv
         ver.meta = meta
         db.commit()
@@ -720,6 +828,42 @@ class DatasetService:
                 create_snapshot=False,
             )
             ds.active_version_id = new_ver.version_id
+
+            try:
+                conv_split = conv.get("split") if isinstance(conv, dict) else None
+                if isinstance(conv_split, dict) and conv_split.get("enabled"):
+                    self.split_dataset(
+                        db,
+                        int(ds.dataset_id),
+                        version_id=int(new_ver.version_id),
+                        train_ratio=float(conv_split.get("train_ratio") or 0.9),
+                        val_ratio=conv_split.get("val_ratio"),
+                        test_ratio=conv_split.get("test_ratio"),
+                        seed=conv_split.get("seed"),
+                        shuffle=conv_split.get("shuffle") if conv_split.get("shuffle") is not None else True,
+                        overwrite=conv_split.get("overwrite") if conv_split.get("overwrite") is not None else True,
+                        trigger="illegal_conversion",
+                    )
+                    conv_split["status"] = "completed"
+                elif isinstance(conv_split, dict):
+                    conv_split["status"] = "skipped"
+            except Exception as e:
+                if isinstance(conv_split, dict):
+                    conv_split["status"] = "failed"
+                    conv_split["error_message"] = str(e)
+                try:
+                    db.add(
+                        DatasetEvent(
+                            dataset_id=int(ds.dataset_id),
+                            version_id=int(new_ver.version_id),
+                            event_type="split_failed",
+                            message="Dataset split failed",
+                            data={"trigger": "illegal_conversion", "error": str(e)},
+                        )
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
 
             conv.update({"status": "completed", "output_version_id": int(new_ver.version_id)})
             meta["conversion"] = conv
@@ -2141,30 +2285,79 @@ class DatasetService:
 
         return int(inserted)
 
+    def _normalize_split_ratios(
+        self,
+        train_ratio: float,
+        val_ratio: float | None,
+        test_ratio: float | None,
+    ) -> tuple[float, float, float]:
+        try:
+            tr = float(train_ratio)
+        except Exception:
+            raise ValidationError("train_ratio must be a number")
+        if tr <= 0 or tr >= 1:
+            raise ValidationError("train_ratio must be between 0 and 1")
+
+        vr = val_ratio
+        ter = test_ratio
+        if vr is None and ter is None:
+            remainder = 1.0 - tr
+            if remainder <= 0:
+                raise ValidationError("train_ratio must be less than 1 to compute val/test ratios")
+            vr = remainder * 0.7
+            ter = remainder * 0.3
+        elif vr is None:
+            try:
+                ter = float(ter)
+            except Exception:
+                raise ValidationError("test_ratio must be a number")
+            vr = 1.0 - tr - float(ter)
+        elif ter is None:
+            try:
+                vr = float(vr)
+            except Exception:
+                raise ValidationError("val_ratio must be a number")
+            ter = 1.0 - tr - float(vr)
+        else:
+            try:
+                vr = float(vr)
+            except Exception:
+                raise ValidationError("val_ratio must be a number")
+            try:
+                ter = float(ter)
+            except Exception:
+                raise ValidationError("test_ratio must be a number")
+
+        if vr <= 0 or vr >= 1:
+            raise ValidationError("val_ratio must be between 0 and 1")
+        if ter <= 0 or ter >= 1:
+            raise ValidationError("test_ratio must be between 0 and 1")
+        if abs((tr + vr + ter) - 1.0) > 1e-6:
+            raise ValidationError("train_ratio + val_ratio + test_ratio must equal 1")
+
+        return float(tr), float(vr), float(ter)
+
     def split_dataset(
         self,
         db: Session,
         dataset_id: int,
         *,
         version_id: int | None = None,
-        train_ratio: float = 0.8,
+        train_ratio: float = 0.9,
         val_ratio: float | None = None,
+        test_ratio: float | None = None,
         seed: int | None = None,
         shuffle: bool = True,
         overwrite: bool = True,
+        trigger: str | None = None,
     ) -> dict:
         ds = self.get_dataset(db, dataset_id)
+        if ds.dataset_type != DatasetType.DETECTION:
+            raise ValidationError("split_dataset is only supported for detection datasets")
         ver = self._resolve_dataset_version(db, ds, version_id)
         self._ensure_images_indexed(db, ds, ver)
 
-        if train_ratio <= 0 or train_ratio >= 1:
-            raise ValidationError("train_ratio must be between 0 and 1")
-        if val_ratio is None:
-            val_ratio = 1.0 - float(train_ratio)
-        if val_ratio <= 0 or val_ratio >= 1:
-            raise ValidationError("val_ratio must be between 0 and 1")
-        if abs((float(train_ratio) + float(val_ratio)) - 1.0) > 1e-6:
-            raise ValidationError("train_ratio + val_ratio must equal 1")
+        train_ratio, val_ratio, test_ratio = self._normalize_split_ratios(train_ratio, val_ratio, test_ratio)
 
         q = db.query(DatasetImage.image_id).filter(
             DatasetImage.dataset_id == int(ds.dataset_id),
@@ -2183,11 +2376,24 @@ class DatasetService:
             rng.shuffle(ids)
 
         train_count = int(total * float(train_ratio))
-        train_count = max(0, min(train_count, total))
-        val_count = total - train_count
+        val_count = int(total * float(val_ratio))
+        test_count = total - train_count - val_count
+        if test_count < 0:
+            # Best-effort correction if rounding makes us overshoot.
+            deficit = -int(test_count)
+            if val_count >= deficit:
+                val_count -= deficit
+                test_count = 0
+            elif train_count >= (deficit - val_count):
+                train_count -= (deficit - val_count)
+                val_count = 0
+                test_count = 0
+            else:
+                raise ValidationError("Invalid split ratios for dataset size")
 
         train_ids = ids[:train_count]
-        val_ids = ids[train_count:]
+        val_ids = ids[train_count : train_count + val_count]
+        test_ids = ids[train_count + val_count :]
 
         def _chunked(seq: list[int], size: int = 1000):
             for i in range(0, len(seq), size):
@@ -2201,6 +2407,11 @@ class DatasetService:
         for chunk in _chunked(val_ids):
             db.query(DatasetImage).filter(DatasetImage.image_id.in_(chunk)).update(
                 {DatasetImage.split: DatasetSplit.VAL, DatasetImage.updated_at: func.now()},
+                synchronize_session=False,
+            )
+        for chunk in _chunked(test_ids):
+            db.query(DatasetImage).filter(DatasetImage.image_id.in_(chunk)).update(
+                {DatasetImage.split: DatasetSplit.TEST, DatasetImage.updated_at: func.now()},
                 synchronize_session=False,
             )
 
@@ -2229,6 +2440,15 @@ class DatasetService:
             )
             .count()
         )
+        test_total = int(
+            db.query(DatasetImage.image_id)
+            .filter(
+                DatasetImage.dataset_id == int(ds.dataset_id),
+                DatasetImage.dataset_version_id == int(ver.version_id),
+                DatasetImage.split == DatasetSplit.TEST,
+            )
+            .count()
+        )
 
         # Best-effort event log.
         db.add(
@@ -2240,15 +2460,19 @@ class DatasetService:
                 data={
                     "train_ratio": float(train_ratio),
                     "val_ratio": float(val_ratio),
+                    "test_ratio": float(test_ratio),
                     "seed": int(seed) if seed is not None else None,
                     "shuffle": bool(shuffle),
                     "overwrite": bool(overwrite),
                     "total_images": int(total_images),
                     "train_count": int(train_total),
                     "val_count": int(val_total),
+                    "test_count": int(test_total),
                     "train_file": export_meta.get("train_file"),
                     "val_file": export_meta.get("val_file"),
+                    "test_file": export_meta.get("test_file"),
                     "yaml_updated": bool(export_meta.get("yaml_updated")),
+                    "trigger": str(trigger) if trigger else None,
                 },
             )
         )
@@ -2261,8 +2485,10 @@ class DatasetService:
             "total_images": int(total_images),
             "train_count": int(train_total),
             "val_count": int(val_total),
+            "test_count": int(test_total),
             "train_ratio": round((train_total / total_images), 6) if total_images else 0.0,
             "val_ratio": round((val_total / total_images), 6) if total_images else 0.0,
+            "test_ratio": round((test_total / total_images), 6) if total_images else 0.0,
             "seed": int(seed) if seed is not None else None,
             "shuffle": bool(shuffle),
         }
@@ -2274,8 +2500,10 @@ class DatasetService:
 
         train_file = "train.txt"
         val_file = "val.txt"
+        test_file = "test.txt"
         train_path = (dataset_root / train_file).resolve(strict=False)
         val_path = (dataset_root / val_file).resolve(strict=False)
+        test_path = (dataset_root / test_file).resolve(strict=False)
 
         def _write_list(out_path: Path, split_value: DatasetSplit) -> int:
             tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
@@ -2317,6 +2545,7 @@ class DatasetService:
 
         train_count = _write_list(train_path, DatasetSplit.TRAIN)
         val_count = _write_list(val_path, DatasetSplit.VAL)
+        test_count = _write_list(test_path, DatasetSplit.TEST)
 
         yaml_updated = False
         data_yaml = dataset_root / "data.yaml"
@@ -2336,6 +2565,7 @@ class DatasetService:
                 cfg = {}
             cfg["train"] = train_file
             cfg["val"] = val_file
+            cfg["test"] = test_file
             with open(data_yaml, "w", encoding="utf-8") as f:
                 yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
             yaml_updated = True
@@ -2343,8 +2573,10 @@ class DatasetService:
         return {
             "train_file": train_file,
             "val_file": val_file,
+            "test_file": test_file,
             "train_count": int(train_count),
             "val_count": int(val_count),
+            "test_count": int(test_count),
             "yaml_updated": bool(yaml_updated),
         }
 
@@ -2370,6 +2602,7 @@ class DatasetService:
         total_images = int(base_q.count())
         train_count = int(base_q.filter(DatasetImage.split == DatasetSplit.TRAIN).count())
         val_count = int(base_q.filter(DatasetImage.split == DatasetSplit.VAL).count())
+        test_count = int(base_q.filter(DatasetImage.split == DatasetSplit.TEST).count())
 
         split_norm = (split or "").strip().lower()
         if split_norm:
@@ -2377,10 +2610,12 @@ class DatasetService:
                 base_q = base_q.filter(DatasetImage.split == DatasetSplit.TRAIN)
             elif split_norm == "val":
                 base_q = base_q.filter(DatasetImage.split == DatasetSplit.VAL)
+            elif split_norm == "test":
+                base_q = base_q.filter(DatasetImage.split == DatasetSplit.TEST)
             elif split_norm in ("none", "null", "unassigned", "unsplit"):
                 base_q = base_q.filter(DatasetImage.split.is_(None))
             else:
-                raise ValidationError("split must be one of: train, val, unassigned")
+                raise ValidationError("split must be one of: train, val, test, unassigned")
 
         total = int(base_q.count())
         items = (
@@ -2397,8 +2632,10 @@ class DatasetService:
             "total_images": int(total_images),
             "train_count": int(train_count),
             "val_count": int(val_count),
+            "test_count": int(test_count),
             "train_ratio": round((train_count / total_images), 6) if total_images else 0.0,
             "val_ratio": round((val_count / total_images), 6) if total_images else 0.0,
+            "test_ratio": round((test_count / total_images), 6) if total_images else 0.0,
         }
 
         return items, summary, int(total)
