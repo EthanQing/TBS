@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import concurrent.futures
 import shutil
 import stat
@@ -15,6 +16,7 @@ from fastapi import UploadFile
 from train_platform.core.config import settings
 from train_platform.models.enums import DatasetType
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
+from train_platform.utils.image_exts import IMAGE_EXTS
 from train_platform.utils.exceptions import ConflictError, ValidationError
 
 
@@ -66,46 +68,47 @@ class FileService:
 
             source_root = extracted_root
             detected_format = "yolo"
-            
+            illegal_reason: str | None = None
+
             if dataset_type == DatasetType.DETECTION:
-                # 1. Check for COCO
-                coco_json = self._find_coco_annotation_file(extracted_root)
-                if coco_json:
+                info = self._detect_dataset_format(extracted_root, dataset_type)
+                fmt = info.get("format")
+                if fmt == "no_images":
+                    raise ValidationError("No image files found in dataset directory")
+                if fmt == "images_only":
+                    raise ValidationError("No label files found")
+
+                if fmt == "yolo":
+                    yolo_root = info.get("yolo_root")
+                    if yolo_root is not None:
+                        source_root = yolo_root
+                elif fmt == "coco":
                     from train_platform.services.dataset_conversion_service import DatasetConversionService
-                    
-                    # Convert to YOLO in place (or in a subfolder)
-                    # We'll use source_root as the base for images
-                    # And generate labels into source_root/labels
-                    # class_names.txt into source_root/class_names.txt
+
                     detected_format = "coco"
-                    
-                    # If conversion service needs images dir, we assume they are relative to json or in common folders
-                    # But _find_coco_annotation_file returns the json path.
-                    # Images might be in 'images', 'train2017', or same dir.
-                    # For simplicty, let's assume they are under coco_json.parent or coco_json.parent/images
-                    
-                    # Try to find images dir
+                    coco_json = info.get("coco_json")
+                    if coco_json is None:
+                        raise ValidationError("COCO json not found")
+
                     images_dir = coco_json.parent
                     if (coco_json.parent / "images").exists():
                         images_dir = coco_json.parent / "images"
                     elif (coco_json.parent / "train2017").exists():
                         images_dir = coco_json.parent / "train2017"
-                        
+
                     DatasetConversionService().conversion_coco_2_yolo(
                         coco_json_path=coco_json,
                         output_labels_dir=images_dir.parent / "labels" if images_dir.name == "images" else coco_json.parent / "labels",
-                        output_class_names_path=images_dir.parent / "class_names.txt" if images_dir.name == "images" else coco_json.parent / "class_names.txt"
+                        output_class_names_path=images_dir.parent / "class_names.txt" if images_dir.name == "images" else coco_json.parent / "class_names.txt",
                     )
-                    
-                    # After conversion, we treat it as YOLO. 
-                    # Set source_root to where we generated stuff.
+
                     source_root = images_dir.parent if images_dir.name == "images" else coco_json.parent
-                    
-                else:
-                    # 2. Check for YOLO
-                    yolo_root = self._find_yolo_export_root(extracted_root)
-                    if yolo_root is not None:
-                        source_root = yolo_root
+                elif fmt == "labelme":
+                    detected_format = "labelme"
+                    illegal_reason = "labelme_json"
+                elif fmt == "unknown_json":
+                    detected_format = "unknown_json"
+                    illegal_reason = "unsupported_json"
 
             # "Paste" to datasets/<dataset_name>.
             # Use move for speed; fall back to copy if needed.
@@ -114,10 +117,11 @@ class FileService:
             except Exception:
                 shutil.copytree(source_root, dataset_dir)
 
-            self._validate_dataset_structure(dataset_dir, dataset_type)
+            if detected_format not in ("labelme", "unknown_json"):
+                self._validate_dataset_structure(dataset_dir, dataset_type)
 
             self._safe_cleanup(temp_extract_dir, temp_file)
-            return dataset_dir, {"format": detected_format}
+            return dataset_dir, {"format": detected_format, "illegal_reason": illegal_reason}
         except Exception:
             self._safe_cleanup(dataset_dir, temp_extract_dir, temp_file)
             raise
@@ -177,32 +181,46 @@ class FileService:
 
             source_root = extracted_root
             detected_format = "yolo"
+            illegal_reason: str | None = None
 
             if dataset_type == DatasetType.DETECTION:
-                # 1. Check for COCO
-                coco_json = self._find_coco_annotation_file(extracted_root)
-                if coco_json:
+                info = self._detect_dataset_format(extracted_root, dataset_type)
+                fmt = info.get("format")
+                if fmt == "no_images":
+                    raise ValidationError("No image files found in dataset directory")
+                if fmt == "images_only":
+                    raise ValidationError("No label files found")
+
+                if fmt == "yolo":
+                    yolo_root = info.get("yolo_root")
+                    if yolo_root is not None:
+                        source_root = yolo_root
+                elif fmt == "coco":
                     from train_platform.services.dataset_conversion_service import DatasetConversionService
-                    
+
                     detected_format = "coco"
+                    coco_json = info.get("coco_json")
+                    if coco_json is None:
+                        raise ValidationError("COCO json not found")
+
                     images_dir = coco_json.parent
                     if (coco_json.parent / "images").exists():
                         images_dir = coco_json.parent / "images"
                     elif (coco_json.parent / "train2017").exists():
                         images_dir = coco_json.parent / "train2017"
-                        
+
                     DatasetConversionService().conversion_coco_2_yolo(
                         coco_json_path=coco_json,
                         output_labels_dir=images_dir.parent / "labels" if images_dir.name == "images" else coco_json.parent / "labels",
-                        output_class_names_path=images_dir.parent / "class_names.txt" if images_dir.name == "images" else coco_json.parent / "class_names.txt"
+                        output_class_names_path=images_dir.parent / "class_names.txt" if images_dir.name == "images" else coco_json.parent / "class_names.txt",
                     )
                     source_root = images_dir.parent if images_dir.name == "images" else coco_json.parent
-
-                else:
-                    # 2. Check for YOLO
-                    yolo_root = self._find_yolo_export_root(extracted_root)
-                    if yolo_root is not None:
-                        source_root = yolo_root
+                elif fmt == "labelme":
+                    detected_format = "labelme"
+                    illegal_reason = "labelme_json"
+                elif fmt == "unknown_json":
+                    detected_format = "unknown_json"
+                    illegal_reason = "unsupported_json"
 
             # Move into datasets/<dataset_name>.
             try:
@@ -210,18 +228,14 @@ class FileService:
             except Exception:
                 shutil.copytree(source_root, dataset_dir)
 
-            self._validate_dataset_structure(dataset_dir, dataset_type)
+            if detected_format not in ("labelme", "unknown_json"):
+                self._validate_dataset_structure(dataset_dir, dataset_type)
 
             self._safe_cleanup(temp_extract_dir, temp_file)
-            return dataset_dir, {"format": detected_format}
+            return dataset_dir, {"format": detected_format, "illegal_reason": illegal_reason}
         except Exception:
-            # Best-effort cleanup; keep an empty dir so dataset record remains usable.
-            self._safe_cleanup(temp_extract_dir, temp_file)
-            try:
-                if not dataset_dir.exists():
-                    dataset_dir.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
+            # Best-effort cleanup; strict rollback for any files written.
+            self._safe_cleanup(dataset_dir, temp_extract_dir, temp_file)
             raise
 
     def append_dataset_archive(self, file: UploadFile, dataset_dir: Path, dataset_type: DatasetType) -> tuple[Path, dict]:
@@ -590,18 +604,155 @@ class FileService:
             except Exception:
                 pass
 
+    def _classify_json(self, path: Path) -> str:
+        """
+        Classify a json annotation file.
+        Returns: "coco", "labelme", or "unknown".
+        """
+        try:
+            if not path.exists() or not path.is_file():
+                return "unknown"
+            size = 0
+            try:
+                size = int(path.stat().st_size or 0)
+            except Exception:
+                size = 0
+
+            # For large files, use a lightweight key scan.
+            if size > 20 * 1024 * 1024:
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        head = f.read(256 * 1024)
+                    head_l = head.lower()
+                    if '"images"' in head_l and '"annotations"' in head_l and '"categories"' in head_l:
+                        return "coco"
+                    if '"shapes"' in head_l and (
+                        '"imagewidth"' in head_l or '"imageheight"' in head_l or '"imagepath"' in head_l
+                    ):
+                        return "labelme"
+                except Exception:
+                    return "unknown"
+                return "unknown"
+
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return "unknown"
+
+            if "images" in data and "annotations" in data and "categories" in data:
+                return "coco"
+            if "shapes" in data and (
+                "imageWidth" in data
+                or "imageHeight" in data
+                or "imagePath" in data
+                or "imagewidth" in data
+                or "imageheight" in data
+            ):
+                return "labelme"
+        except Exception:
+            return "unknown"
+        return "unknown"
+
+    def _detect_dataset_format(self, root: Path, dataset_type: DatasetType) -> dict:
+        """
+        Detect dataset format for detection datasets.
+        """
+        result = {
+            "format": "no_images",
+            "yolo_root": None,
+            "coco_json": None,
+            "labelme_json": None,
+        }
+        if dataset_type != DatasetType.DETECTION:
+            result["format"] = "yolo"
+            return result
+        if not root.exists() or not root.is_dir():
+            return result
+
+        # 1) YOLO (images + labels txt)
+        yolo_root = self._find_yolo_export_root(root)
+        if yolo_root is not None:
+            result["format"] = "yolo"
+            result["yolo_root"] = yolo_root
+            return result
+
+        # Scan for images + json files
+        image_exts = IMAGE_EXTS
+        has_images = False
+        json_paths: list[Path] = []
+        skip_dirs = {".versions", ".thumbnails", "__macosx"}
+        max_depth = 4
+
+        for cur, dirnames, filenames in os.walk(root):
+            cur_p = Path(cur)
+            rel = cur_p.relative_to(root)
+            if len(rel.parts) > max_depth:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d.lower() not in skip_dirs]
+            for fname in filenames:
+                p = cur_p / fname
+                ext = p.suffix.lower()
+                if ext in image_exts:
+                    has_images = True
+                elif ext == ".json":
+                    json_paths.append(p)
+
+        if not has_images:
+            result["format"] = "no_images"
+            return result
+
+        if json_paths:
+            labelme_json: Path | None = None
+            unknown_json = False
+            for p in json_paths:
+                kind = self._classify_json(p)
+                if kind == "coco":
+                    result["format"] = "coco"
+                    result["coco_json"] = p
+                    return result
+                if kind == "labelme" and labelme_json is None:
+                    labelme_json = p
+                elif kind == "unknown":
+                    unknown_json = True
+
+            if labelme_json is not None:
+                result["format"] = "labelme"
+                result["labelme_json"] = labelme_json
+                return result
+
+            if unknown_json:
+                result["format"] = "unknown_json"
+                return result
+
+        result["format"] = "images_only"
+        return result
+
     def _validate_dataset_structure(self, dataset_dir: Path, dataset_type: DatasetType) -> None:
         if dataset_type != DatasetType.DETECTION:
             return
 
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+        image_exts = IMAGE_EXTS
         has_images = False
+        has_labels = False
+        has_json = False
         for root, _, files in os.walk(dataset_dir):
-            if any(Path(f).suffix.lower() in image_exts for f in files):
-                has_images = True
+            root_p = Path(root)
+            for f in files:
+                ext = Path(f).suffix.lower()
+                if ext in image_exts:
+                    has_images = True
+                elif ext == ".txt":
+                    if "labels" in {p.lower() for p in root_p.parts}:
+                        has_labels = True
+                elif ext == ".json":
+                    has_json = True
+            if has_images and (has_labels or has_json):
                 break
         if not has_images:
             raise ValidationError("No image files found in dataset directory")
+        if not (has_labels or has_json):
+            raise ValidationError("No label files found")
 
         # Find or create YOLO data.yaml (do not write absolute 'path' field).
         yaml_files = list(dataset_dir.glob("*.yaml")) + list(dataset_dir.glob("*.yml"))
@@ -618,7 +769,7 @@ class FileService:
         if not root.exists() or not root.is_dir():
             return None
 
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+        image_exts = IMAGE_EXTS
 
         best: tuple[int, int, Path] | None = None  # (image_count, depth, path)
 
@@ -637,6 +788,24 @@ class FileService:
 
             images_dir = cur_p / names_l["images"]
             if not images_dir.exists() or not images_dir.is_dir():
+                continue
+            labels_dir = cur_p / names_l["labels"]
+            if not labels_dir.exists() or not labels_dir.is_dir():
+                continue
+
+            label_count = 0
+            try:
+                for _r, _d, files in os.walk(labels_dir):
+                    for fn in files:
+                        if Path(fn).suffix.lower() == ".txt":
+                            label_count += 1
+                            break
+                    if label_count > 0:
+                        break
+            except Exception:
+                continue
+
+            if label_count <= 0:
                 continue
 
             image_count = 0
@@ -716,6 +885,38 @@ class FileService:
                 except Exception:
                     continue
                     
+        return None
+
+    def _find_labelme_json_file(self, root: Path) -> Optional[Path]:
+        """
+        Scan for LabelMe-style JSON annotations (shapes + imageWidth/imageHeight).
+        """
+        if not root.exists():
+            return None
+
+        for cur, dirnames, filenames in os.walk(root):
+            cur_p = Path(cur)
+            if len(cur_p.relative_to(root).parts) > 4:
+                dirnames[:] = []
+                continue
+
+            for fname in filenames:
+                if not fname.lower().endswith(".json"):
+                    continue
+                p = cur_p / fname
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        head = f.read(2048)
+                    if '"shapes"' in head and (
+                        '"imageWidth"' in head
+                        or '"imageHeight"' in head
+                        or '"imagewidth"' in head
+                        or '"imageheight"' in head
+                    ):
+                        return p
+                except Exception:
+                    continue
+
         return None
 
     def _read_class_names_txt(self, dataset_dir: Path) -> list[str]:

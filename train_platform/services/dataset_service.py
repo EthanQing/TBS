@@ -5,6 +5,8 @@ import os
 import random
 import shutil
 import uuid
+import threading
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -15,6 +17,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.db.session import SessionLocal
 from train_platform.models.dataset import Dataset, DatasetVersion
 from train_platform.models.dataset_event import DatasetEvent
 from train_platform.models.dataset_image import DatasetImage
@@ -25,9 +28,14 @@ from train_platform.repositories.dataset_repo import DatasetRepository
 from train_platform.repositories.dataset_version_repo import DatasetVersionRepository
 from train_platform.services.file_service import FileService
 from train_platform.services.project_service import ProjectService
+from train_platform.services.thumbnail_service import ThumbnailService
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
+from train_platform.utils.image_exts import IMAGE_EXTS
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.path_utils import resolve_dataset_path
+
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -100,6 +108,65 @@ class DatasetService:
         if format:
             q = q.filter(Dataset.format == str(format))
         return q.offset(skip).limit(limit).all()
+
+    def list_datasets_with_stats(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[dict]:
+        """
+        List datasets with embedded statistics for the list view.
+        Returns dataset objects with statistics dict containing num_images, num_classes, size_mb.
+        """
+        datasets = self.list_datasets(db, skip=skip, limit=limit, format=format)
+        results = []
+        
+        for ds in datasets:
+            # Build base dict from dataset
+            item = {
+                "dataset_id": ds.dataset_id,
+                "name": ds.name,
+                "dataset_type": ds.dataset_type,
+                "format": ds.format or "yolo",
+                "storage_path": ds.storage_path,
+                "description": ds.description,
+                "active_version_id": ds.active_version_id,
+                "created_at": ds.created_at,
+                "updated_at": ds.updated_at,
+                "statistics": None,
+            }
+            
+            # Try to get statistics from active version
+            if ds.active_version_id is not None:
+                ver = (
+                    db.query(DatasetVersion)
+                    .filter(DatasetVersion.version_id == ds.active_version_id, DatasetVersion.dataset_id == ds.dataset_id)
+                    .first()
+                )
+                if ver:
+                    num_images = 0
+                    num_classes = 0
+                    size_mb = 0.0
+                    
+                    # Get size
+                    size_bytes = int(ver.size_bytes or 0)
+                    size_mb = round(size_bytes / (1024 * 1024), 2) if size_bytes else 0.0
+                    
+                    # Get stats from meta
+                    if isinstance(ver.meta, dict):
+                        stats = ver.meta.get("stats")
+                        if isinstance(stats, dict):
+                            num_images = int(stats.get("total_images") or 0)
+                        
+                        yolo = ver.meta.get("yolo")
+                        if isinstance(yolo, dict):
+                            num_classes = int(yolo.get("nc") or 0)
+                    
+                    item["statistics"] = {
+                        "num_images": num_images,
+                        "num_classes": num_classes,
+                        "size_mb": size_mb,
+                    }
+            
+            results.append(item)
+        
+        return results
 
     def get_dataset(self, db: Session, dataset_id: int) -> Dataset:
         ds = self.datasets.get(db, int(dataset_id))
@@ -263,22 +330,33 @@ class DatasetService:
 
         _path, info = FileService().upload_dataset_into_existing(file, dataset_root, ds.dataset_type)
         
-        # Update dataset format if detected
         detected_format = info.get("format")
-        if detected_format and detected_format != "yolo":
-            ds.format = detected_format
-
-        ver = None
-        if create_version:
-            ver = self._create_version_row(
+        if detected_format in ("labelme", "unknown_json"):
+            ds.format = "illegal"
+            illegal_reason = info.get("illegal_reason") or "non_yolo_json"
+            ver = self._create_illegal_version_row(
                 db,
                 ds,
-                message=message or "upload",
+                message=message or "illegal_upload",
                 created_by=created_by,
-                create_snapshot=False,
+                illegal_reason=illegal_reason,
             )
-            if activate:
-                ds.active_version_id = ver.version_id
+        else:
+            # Update dataset format if detected
+            if detected_format and detected_format != "yolo":
+                ds.format = detected_format
+
+            ver = None
+            if create_version:
+                ver = self._create_version_row(
+                    db,
+                    ds,
+                    message=message or "upload",
+                    created_by=created_by,
+                    create_snapshot=False,
+                )
+                if activate:
+                    ds.active_version_id = ver.version_id
 
         try:
             db.add(
@@ -327,22 +405,33 @@ class DatasetService:
 
         _path, info = await run_in_threadpool(FileService().upload_dataset_into_existing, file, dataset_root, ds.dataset_type)
 
-        # Update dataset format if detected
         detected_format = info.get("format")
-        if detected_format and detected_format != "yolo":
-            ds.format = detected_format
-
-        ver = None
-        if create_version:
-            ver = self._create_version_row(
+        if detected_format in ("labelme", "unknown_json"):
+            ds.format = "illegal"
+            illegal_reason = info.get("illegal_reason") or "non_yolo_json"
+            ver = self._create_illegal_version_row(
                 db,
                 ds,
-                message=message or "upload",
+                message=message or "illegal_upload",
                 created_by=created_by,
-                create_snapshot=False,
+                illegal_reason=illegal_reason,
             )
-            if activate:
-                ds.active_version_id = ver.version_id
+        else:
+            # Update dataset format if detected
+            if detected_format and detected_format != "yolo":
+                ds.format = detected_format
+
+            ver = None
+            if create_version:
+                ver = self._create_version_row(
+                    db,
+                    ds,
+                    message=message or "upload",
+                    created_by=created_by,
+                    create_snapshot=False,
+                )
+                if activate:
+                    ds.active_version_id = ver.version_id
 
         try:
             db.add(
@@ -485,6 +574,207 @@ class DatasetService:
             db.refresh(ver)
         return ds, ver
 
+    def convert_illegal_dataset(
+        self,
+        db: Session,
+        dataset_id: int,
+        *,
+        label_strategy: str,
+        label_level: Optional[int],
+        label_separator: Optional[str],
+    ) -> dict:
+        ds = self.get_dataset(db, dataset_id)
+        if ds.dataset_type != DatasetType.DETECTION:
+            raise ValidationError("Only detection datasets can be converted")
+
+        ver: DatasetVersion | None = None
+        if ds.active_version_id is not None:
+            ver = (
+                db.query(DatasetVersion)
+                .filter(DatasetVersion.version_id == int(ds.active_version_id), DatasetVersion.dataset_id == int(ds.dataset_id))
+                .first()
+            )
+        if not ver:
+            raise ValidationError("Active version not found")
+
+        meta = ver.meta if isinstance(ver.meta, dict) else {}
+        if not meta.get("illegal"):
+            raise ValidationError("Dataset is not marked as illegal")
+        illegal_reason = str(meta.get("illegal_reason") or "")
+        if illegal_reason != "labelme_json":
+            raise ValidationError("Unsupported illegal format")
+
+        strategy = str(label_strategy or "").strip().lower()
+        if strategy not in ("full", "leaf", "root", "level"):
+            raise ValidationError("label_strategy must be one of: full, leaf, root, level")
+        level = int(label_level) if label_level is not None else None
+        if strategy == "level" and (level is None or level < 1):
+            raise ValidationError("label_level is required when label_strategy=level")
+
+        conv = dict(meta.get("conversion") or {})
+        if str(conv.get("status")) in ("queued", "running"):
+            raise ConflictError("Conversion is already in progress")
+
+        job_id = uuid.uuid4().hex
+        conv.update(
+            {
+                "status": "queued",
+                "job_id": job_id,
+                "label_strategy": strategy,
+                "label_level": level,
+                "label_separator": label_separator or "%",
+            }
+        )
+        meta["conversion"] = conv
+        ver.meta = meta
+        db.commit()
+
+        try:
+            db.add(
+                DatasetEvent(
+                    dataset_id=int(ds.dataset_id),
+                    version_id=int(ver.version_id),
+                    event_type="conversion_queued",
+                    message="Illegal dataset conversion queued",
+                    data={"job_id": job_id},
+                )
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        t = threading.Thread(
+            target=self._run_illegal_conversion_job,
+            args=(int(ds.dataset_id), int(ver.version_id), job_id, strategy, level, label_separator or "%"),
+            daemon=True,
+        )
+        t.start()
+
+        return {"job_id": job_id, "status": "queued"}
+
+    def _run_illegal_conversion_job(
+        self,
+        dataset_id: int,
+        version_id: int,
+        job_id: str,
+        label_strategy: str,
+        label_level: Optional[int],
+        label_separator: str,
+    ) -> None:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[Conversion] Starting illegal conversion job {job_id} for dataset {dataset_id}")
+        
+        db = SessionLocal()
+        try:
+            ds = self.get_dataset(db, dataset_id)
+            ver = (
+                db.query(DatasetVersion)
+                .filter(DatasetVersion.version_id == int(version_id), DatasetVersion.dataset_id == int(ds.dataset_id))
+                .first()
+            )
+            if not ver:
+                raise ValidationError("Illegal version not found")
+
+            meta = ver.meta if isinstance(ver.meta, dict) else {}
+            conv = dict(meta.get("conversion") or {})
+            conv.update({"status": "running", "job_id": job_id})
+            meta["conversion"] = conv
+            ver.meta = meta
+            db.commit()
+            
+            logger.info(f"[Conversion] Job {job_id} status set to 'running'")
+
+            try:
+                db.add(
+                    DatasetEvent(
+                        dataset_id=int(ds.dataset_id),
+                        version_id=int(ver.version_id),
+                        event_type="conversion_running",
+                        message="Illegal dataset conversion running",
+                        data={"job_id": job_id},
+                    )
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+
+            dataset_root = resolve_dataset_path(ds.storage_path)
+
+            from train_platform.services.dataset_illegal_convert_service import DatasetIllegalConvertService
+
+            svc = DatasetIllegalConvertService()
+            svc.convert_dataset(
+                dataset_root,
+                label_strategy=label_strategy,
+                label_level=label_level,
+                label_separator=label_separator,
+            )
+
+            ds.format = "yolo"
+            new_ver = self._create_version_row(
+                db,
+                ds,
+                message="conversion",
+                created_by=None,
+                create_snapshot=False,
+            )
+            ds.active_version_id = new_ver.version_id
+
+            conv.update({"status": "completed", "output_version_id": int(new_ver.version_id)})
+            meta["conversion"] = conv
+            ver.meta = meta
+            db.commit()
+            db.refresh(ds)
+
+            try:
+                db.add(
+                    DatasetEvent(
+                        dataset_id=int(ds.dataset_id),
+                        version_id=int(new_ver.version_id),
+                        event_type="conversion_completed",
+                        message="Illegal dataset conversion completed",
+                        data={"job_id": job_id},
+                    )
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Illegal dataset conversion failed for dataset {dataset_id}: {e}", exc_info=True)
+            try:
+                ver = (
+                    db.query(DatasetVersion)
+                    .filter(DatasetVersion.version_id == int(version_id), DatasetVersion.dataset_id == int(dataset_id))
+                    .first()
+                )
+                if ver:
+                    meta = ver.meta if isinstance(ver.meta, dict) else {}
+                    conv = dict(meta.get("conversion") or {})
+                    conv.update({"status": "failed", "error_message": str(e)})
+                    meta["conversion"] = conv
+                    ver.meta = meta
+                    db.commit()
+                try:
+                    db.add(
+                        DatasetEvent(
+                            dataset_id=int(dataset_id),
+                            version_id=int(version_id),
+                            event_type="conversion_failed",
+                            message="Illegal dataset conversion failed",
+                            data={"job_id": job_id, "error": str(e)},
+                        )
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            except Exception:
+                db.rollback()
+        finally:
+            db.close()
+
     # --------------------
     # dataset uploads / events
     # --------------------
@@ -585,7 +875,7 @@ class DatasetService:
             if labels:
                 raise ValidationError("labels upload is only supported for DETECTION datasets")
 
-        allowed_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+        allowed_exts = IMAGE_EXTS
 
         # Pre-validate all filenames/extensions to avoid partial uploads.
         planned_image_names: list[str] = []
@@ -1022,6 +1312,169 @@ class DatasetService:
             "events": events,
         }
 
+    def get_view(
+        self,
+        db: Session,
+        dataset_id: int,
+        *,
+        version_id: int | None = None,
+        class_id: int | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict:
+        """
+        Get dataset view with category statistics and paginated image list.
+        
+        Parses YOLO labels to build class-to-image mapping and returns
+        category counts for sidebar and filtered image list for grid.
+        """
+        import math
+        
+        ds = self.get_dataset(db, dataset_id)
+        
+        # Get version
+        ver: DatasetVersion | None = None
+        if version_id is not None:
+            ver = (
+                db.query(DatasetVersion)
+                .filter(DatasetVersion.version_id == int(version_id), DatasetVersion.dataset_id == ds.dataset_id)
+                .first()
+            )
+        else:
+            if ds.active_version_id is not None:
+                ver = (
+                    db.query(DatasetVersion)
+                    .filter(DatasetVersion.version_id == ds.active_version_id, DatasetVersion.dataset_id == ds.dataset_id)
+                    .first()
+                )
+        
+        if not ver:
+            raise NotFoundError("Dataset version not found (no active version?)")
+        
+        # Get class names from version metadata
+        class_names: list[str] = []
+        if isinstance(ver.meta, dict):
+            yolo = ver.meta.get("yolo")
+            if isinstance(yolo, dict):
+                names = yolo.get("names")
+                class_names = self._normalize_yolo_names(names, yolo.get("nc"))
+        
+        # Resolve dataset path
+        dataset_path = resolve_dataset_path(ds.storage_path).resolve(strict=False)
+        
+        # Parse labels to build image -> classes mapping
+        image_classes: dict[str, set[int]] = {}  # image_stem -> set of class_ids
+        labels_dir = dataset_path / "labels"
+        
+        if labels_dir.exists() and labels_dir.is_dir():
+            for label_path in labels_dir.rglob("*.txt"):
+                stem = label_path.stem
+                try:
+                    with label_path.open("r", encoding="utf-8", errors="ignore") as f:
+                        class_ids = set()
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            parts = line.split()
+                            if parts:
+                                try:
+                                    cid = int(parts[0])
+                                    if cid >= 0:
+                                        class_ids.add(cid)
+                                except ValueError:
+                                    pass
+                        if class_ids:
+                            image_classes[stem] = class_ids
+                except Exception:
+                    pass
+        
+        # Build category counts
+        class_image_count: dict[int, int] = {}
+        for stem, class_ids in image_classes.items():
+            for cid in class_ids:
+                class_image_count[cid] = class_image_count.get(cid, 0) + 1
+        
+        # Build categories list for sidebar
+        categories = []
+        for cid, count in sorted(class_image_count.items()):
+            name = class_names[cid] if 0 <= cid < len(class_names) else f"class_{cid}"
+            categories.append({
+                "class_id": cid,
+                "name": name,
+                "count": count,
+            })
+        
+        # Get all images from manifest
+        image_exts = IMAGE_EXTS
+        all_images: list[tuple[str, str]] = []  # (relative_path, stem)
+        
+        if ver.manifest_path:
+            for rel, size_bytes, mtime in self._iter_manifest_entries(ver.manifest_path):
+                rel = str(rel or "").strip().replace("\\", "/")
+                if not rel:
+                    continue
+                ext = Path(rel).suffix.lower()
+                if ext not in image_exts:
+                    continue
+                stem = Path(rel).stem
+                all_images.append((rel, stem))
+        
+        # Filter by class_id if specified
+        if class_id is not None:
+            filtered_images = []
+            for rel, stem in all_images:
+                class_ids = image_classes.get(stem, set())
+                if class_id in class_ids:
+                    filtered_images.append((rel, stem))
+            all_images = filtered_images
+        
+        # Pagination
+        total_items = len(all_images)
+        total_pages = max(1, math.ceil(total_items / page_size))
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_images = all_images[start:end]
+        
+        # Build image items
+        root_token = str(ver.snapshot_path or ds.storage_path)
+        url_prefix = self._dataset_static_prefix(root_token)
+        
+        items = []
+        for idx, (rel, stem) in enumerate(page_images):
+            # Build URLs
+            url = f"{url_prefix}/{rel.lstrip('/')}"
+            # Use static path for pre-generated thumbnails (much faster)
+            rel_webp = str(Path(rel).with_suffix(".webp"))
+            thumbnail_url = f"/static/thumbnails/{ds.dataset_id}/{rel_webp}"
+            
+            # Get class ids for this image
+            class_ids = list(image_classes.get(stem, set()))
+            
+            items.append({
+                "id": start + idx + 1,  # Simple sequential ID for this page
+                "name": rel,
+                "url": url,
+                "thumbnail_url": thumbnail_url,
+                "width": None,
+                "height": None,
+                "classes": sorted(class_ids),
+            })
+        
+        return {
+            "dataset_id": ds.dataset_id,
+            "version_id": ver.version_id,
+            "categories": categories,
+            "items": items,
+            "meta": {
+                "page": page,
+                "page_size": page_size,
+                "total_items": total_items,
+                "total_pages": total_pages,
+            },
+        }
+
     def create_version(
         self,
         db: Session,
@@ -1115,6 +1568,67 @@ class DatasetService:
 
         # Index images for this version so every image has a stable ID.
         self._ensure_images_indexed(db, ds, row)
+
+        # Pre-generate thumbnails in background thread for instant loading
+        self._trigger_thumbnail_pregeneration(ds.dataset_id, dataset_path)
+
+        return row
+
+    def _create_illegal_version_row(
+        self,
+        db: Session,
+        ds: Dataset,
+        *,
+        message: Optional[str],
+        created_by: Optional[str],
+        illegal_reason: str,
+    ) -> DatasetVersion:
+        latest = self.versions.get_latest(db, ds.dataset_id)
+        next_version = int(getattr(latest, "version", 0) or 0) + 1
+        parent_version_id = getattr(latest, "version_id", None) if latest else None
+
+        dataset_path = resolve_dataset_path(ds.storage_path)
+        if not dataset_path.exists() or not dataset_path.is_dir():
+            raise ValidationError(f"Dataset path does not exist: {dataset_path}")
+
+        manifest_rel, file_count, size_bytes, stats = self._write_manifest(
+            dataset_token=_versions_token(ds),
+            dataset_id=int(ds.dataset_id),
+            dataset_name=str(ds.name),
+            dataset_path=dataset_path,
+            version=next_version,
+            dataset_type=ds.dataset_type,
+        )
+
+        reason = str(illegal_reason or "non_yolo_json")
+        meta: dict = {
+            "stats": stats,
+            "illegal": True,
+            "illegal_reason": reason,
+            "conversion": {"status": "pending", "supported": reason == "labelme_json"},
+        }
+
+        row = DatasetVersion(
+            dataset_id=ds.dataset_id,
+            version=next_version,
+            parent_version_id=parent_version_id,
+            status=DatasetVersionStatus.FAILED,
+            message=message,
+            manifest_path=manifest_rel,
+            snapshot_path=None,
+            file_count=file_count,
+            size_bytes=size_bytes,
+            created_by=created_by,
+            meta=meta,
+        )
+        db.add(row)
+        db.flush()
+
+        ds.active_version_id = row.version_id
+
+        # Index images for preview
+        self._ensure_images_indexed(db, ds, row)
+        self._trigger_thumbnail_pregeneration(ds.dataset_id, dataset_path)
 
         return row
 
@@ -1303,7 +1817,7 @@ class DatasetService:
             }
             f.write(json.dumps({"_header": header}, ensure_ascii=False) + "\n")
 
-            image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+            image_exts = IMAGE_EXTS
             for root, _, files in os.walk(dataset_path):
                 for fn in files:
                     p = Path(root) / fn
@@ -1369,7 +1883,7 @@ class DatasetService:
         if not manifest_rel:
             return {"total_images": 0, "annotations_count": None}
 
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+        image_exts = IMAGE_EXTS
         images = 0
 
         base = settings.datasets_dir.resolve()
@@ -1482,7 +1996,7 @@ class DatasetService:
         prefix_norm = (prefix or "").strip().replace("\\", "/").lstrip("/")
         q_norm = (q or "").strip().lower()
 
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+        image_exts = IMAGE_EXTS
 
         def _match(rel: str) -> bool:
             if prefix_norm and not rel.startswith(prefix_norm):
@@ -1594,7 +2108,7 @@ class DatasetService:
                 .all()
             }
 
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+        image_exts = IMAGE_EXTS
         inserted = 0
         batch: list[DatasetImage] = []
 
@@ -1929,4 +2443,27 @@ class DatasetService:
                     continue
                 yield obj.get("path"), obj.get("size_bytes"), obj.get("mtime")
 
-    
+    def _trigger_thumbnail_pregeneration(self, dataset_id: int, dataset_path: Path) -> None:
+        """
+        Start thumbnail pre-generation in a background thread.
+        
+        This allows the main request to return quickly while thumbnails are
+        generated asynchronously. The frontend will use static file paths
+        and gracefully handle missing thumbnails via onerror fallback.
+        """
+        def _generate():
+            try:
+                svc = ThumbnailService()
+                result = svc.pregenerate_for_dataset(
+                    dataset_id=dataset_id,
+                    dataset_root=dataset_path,
+                    size=200,
+                    max_workers=4,
+                )
+                logger.info(f"Thumbnail pre-generation complete for dataset {dataset_id}: {result}")
+            except Exception as e:
+                logger.error(f"Thumbnail pre-generation failed for dataset {dataset_id}: {e}")
+        
+        thread = threading.Thread(target=_generate, daemon=True)
+        thread.start()
+

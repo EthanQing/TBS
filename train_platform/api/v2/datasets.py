@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
+from train_platform.core.config import settings
 from train_platform.models.dataset_event import DatasetEvent
 from train_platform.models.dataset import Dataset, DatasetVersion
 from train_platform.schemas.v2.common import DeleteResponse, Page, PageMeta
@@ -13,7 +14,10 @@ from train_platform.schemas.v2.datasets import (
     DatasetEventOut,
     DatasetFileOut,
     DatasetImageUploadOut,
+    DatasetListOut,
     DatasetOut,
+    DatasetIllegalConvertRequest,
+    DatasetIllegalConvertOut,
     DatasetSplitRequest,
     DatasetSplitResultOut,
     DatasetSplitSummary,
@@ -22,6 +26,7 @@ from train_platform.schemas.v2.datasets import (
     DatasetVersionCreate,
     DatasetVersionDiffOut,
     DatasetVersionOut,
+    DatasetViewOut,
 )
 from train_platform.services.dataset_service import DatasetService
 from train_platform.utils.exceptions import ValidationError
@@ -38,7 +43,7 @@ def create_dataset(payload: DatasetCreate, db: Session = Depends(get_db)):
     return DatasetService().create_dataset(db, obj=payload.model_dump())
 
 
-@router.get("", response_model=Page[DatasetOut])
+@router.get("", response_model=Page[DatasetListOut])
 def list_datasets(
     page: int = 1,
     page_size: int = 50,
@@ -55,7 +60,7 @@ def list_datasets(
         q = q.filter(Dataset.format == str(format))
     total = q.count()
 
-    items = DatasetService().list_datasets(db, skip=skip, limit=page_size, format=format)
+    items = DatasetService().list_datasets_with_stats(db, skip=skip, limit=page_size, format=format)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
@@ -74,6 +79,31 @@ def get_dataset_detail(
     versions_limit = max(0, min(int(versions_limit), 200))
     events_limit = max(0, min(int(events_limit), 200))
     return DatasetService().get_detail(db, int(dataset_id), versions_limit=versions_limit, events_limit=events_limit)
+
+
+@router.get("/{dataset_id}/view", response_model=DatasetViewOut)
+def get_dataset_view(
+    dataset_id: int,
+    version_id: int | None = Query(None, description="Version ID (default: active version)"),
+    class_id: int | None = Query(None, description="Filter images by class ID"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """
+    Get dataset view with category statistics and paginated image list.
+    
+    This endpoint returns category information with image counts for the sidebar,
+    and a paginated list of images for the main grid. Supports filtering by class_id.
+    """
+    return DatasetService().get_view(
+        db,
+        int(dataset_id),
+        version_id=version_id,
+        class_id=class_id,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.patch("/{dataset_id}", response_model=DatasetOut)
@@ -149,6 +179,8 @@ async def append_dataset_archive(
     db: Session = Depends(get_db),
 ):
     """Append ZIP archive contents to an existing (possibly non-empty) dataset."""
+    if settings.disable_append_upload:
+        raise ValidationError("Append upload disabled")
     ds, _ver = await DatasetService().append_dataset_archive_async(
         db,
         int(dataset_id),
@@ -159,6 +191,22 @@ async def append_dataset_archive(
         activate=bool(activate),
     )
     return ds
+
+
+@router.post("/{dataset_id}/convert", response_model=DatasetIllegalConvertOut, status_code=202)
+def convert_illegal_dataset(
+    dataset_id: int,
+    payload: DatasetIllegalConvertRequest,
+    db: Session = Depends(get_db),
+):
+    data = payload.model_dump()
+    return DatasetService().convert_illegal_dataset(
+        db,
+        int(dataset_id),
+        label_strategy=data.get("label_strategy"),
+        label_level=data.get("label_level"),
+        label_separator=data.get("label_separator"),
+    )
 
 
 @router.post("/{dataset_id}/uploads/images", response_model=DatasetImageUploadOut, status_code=201)
@@ -178,6 +226,8 @@ async def upload_dataset_images(
     activate: bool = Form(True),
     db: Session = Depends(get_db),
 ):
+    if settings.disable_append_upload:
+        raise ValidationError("Append upload disabled")
     def _as_upload_list(value: list[UploadFile] | UploadFile | None) -> list[UploadFile]:
         if value is None:
             return []
@@ -335,3 +385,8 @@ def get_dataset_split(
     )
 
     return {"summary": summary, "items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
+
+# this router will return dataset YAML data
+# @router.get("/{dataset_id}/yaml", response_model=DatasetDataYAMLOut)
+# def get_dataset_data_yaml(dataset_id: int, db: Session = Depends(get_db)):
+#     return DatasetService().get_dataset_data_yaml(db, dataset_id)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from train_platform.models.enums import DatasetSplit, DatasetType, DatasetVersionStatus
 from train_platform.schemas.v2.common import PageMeta
@@ -191,3 +191,72 @@ class DatasetDetailOut(BaseModel):
     active_version: Optional[DatasetVersionOut] = None
     versions: list[DatasetVersionOut] = []
     events: list[DatasetEventOut] = []
+
+
+# --- New schemas for enhanced list and view endpoints ---
+
+class DatasetListStatistics(BaseModel):
+    """Embedded statistics for dataset list items."""
+    num_images: int = 0
+    num_classes: int = 0
+    size_mb: float = 0.0
+
+
+class DatasetListOut(DatasetOut):
+    """Extended dataset output with embedded statistics for list view."""
+    statistics: Optional[DatasetListStatistics] = None
+
+
+class CategoryInfo(BaseModel):
+    """Category information for the view endpoint sidebar."""
+    class_id: int
+    name: str
+    count: int  # Number of images containing this class
+
+
+class ViewImageItem(BaseModel):
+    """Image item for the view endpoint grid."""
+    id: int
+    name: str
+    url: str
+    thumbnail_url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+    classes: list[int] = Field(default_factory=list)  # Class IDs present in this image
+
+
+class ViewMeta(BaseModel):
+    """Pagination metadata for the view endpoint."""
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+
+
+class DatasetViewOut(BaseModel):
+    """Response model for the dataset view endpoint."""
+    dataset_id: int
+    version_id: int
+    categories: list[CategoryInfo]
+    items: list[ViewImageItem]
+    meta: ViewMeta
+
+
+class DatasetIllegalConvertRequest(BaseModel):
+    label_strategy: str = Field(..., description="full | leaf | root | level")
+    label_level: Optional[int] = Field(None, ge=1)
+    label_separator: str = Field("%", min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def _check_level(self):
+        strategy = str(self.label_strategy or "").strip().lower()
+        if strategy == "level":
+            if self.label_level is None or int(self.label_level) < 1:
+                raise ValueError("label_level is required when label_strategy=level")
+        return self
+
+
+class DatasetIllegalConvertOut(BaseModel):
+    job_id: str
+    status: str
+
