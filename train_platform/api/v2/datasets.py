@@ -18,6 +18,8 @@ from train_platform.schemas.v2.datasets import (
     DatasetOut,
     DatasetIllegalConvertRequest,
     DatasetIllegalConvertOut,
+    DatasetIllegalLabelsOut,
+    DatasetIllegalLabelsUpdate,
     DatasetSplitRequest,
     DatasetSplitResultOut,
     DatasetSplitSummary,
@@ -234,6 +236,7 @@ def convert_illegal_dataset(
         label_strategy=data.get("label_strategy"),
         label_level=data.get("label_level"),
         label_separator=data.get("label_separator"),
+        label_mapping=data.get("label_mapping"),
         split_enabled=data.get("split_enabled"),
         split_train_ratio=data.get("split_train_ratio"),
         split_val_ratio=data.get("split_val_ratio"),
@@ -242,6 +245,19 @@ def convert_illegal_dataset(
         split_shuffle=data.get("split_shuffle"),
         split_overwrite=data.get("split_overwrite"),
     )
+
+
+@router.get("/{dataset_id}/illegal-labels", response_model=DatasetIllegalLabelsOut)
+def get_illegal_dataset_labels(dataset_id: int, db: Session = Depends(get_db)):
+    labels = DatasetService().get_illegal_labels(db, dataset_id)
+    return {"labels": labels}
+
+
+@router.put("/{dataset_id}/illegal-labels", response_model=DatasetOut)
+def update_illegal_dataset_labels(
+    dataset_id: int, payload: DatasetIllegalLabelsUpdate, db: Session = Depends(get_db)
+):
+    return DatasetService().update_illegal_labels(db, dataset_id, payload.label_mapping)
 
 
 @router.post("/{dataset_id}/uploads/images", response_model=DatasetImageUploadOut, status_code=201)

@@ -246,9 +246,13 @@ class DatasetViewOut(BaseModel):
 
 
 class DatasetIllegalConvertRequest(BaseModel):
-    label_strategy: str = Field(..., description="full | leaf | root | level")
+    label_strategy: str = Field(..., description="full | leaf | root | level | mapping")
     label_level: Optional[int] = Field(None, ge=1)
     label_separator: str = Field("%", min_length=1, max_length=10)
+    label_mapping: Optional[Dict[str, str]] = Field(
+        None,
+        description="Optional mapping from raw label to target label (used when label_strategy=mapping)",
+    )
     split_enabled: Optional[bool] = Field(False)
     split_train_ratio: Optional[float] = Field(None, gt=0, lt=1)
     split_val_ratio: Optional[float] = Field(None, gt=0, lt=1)
@@ -270,3 +274,8 @@ class DatasetIllegalConvertOut(BaseModel):
     job_id: str
     status: str
 
+class DatasetIllegalLabelsOut(BaseModel):
+    labels: list[str] = Field(default_factory=list, description="List of unique raw labels found in the dataset")
+
+class DatasetIllegalLabelsUpdate(BaseModel):
+    label_mapping: Dict[str, str] = Field(..., description="Mapping from old raw label to new absolute label")

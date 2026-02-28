@@ -68,9 +68,9 @@ def points_to_bbox(points: list, label: str) -> BBox:
 def extract_label(raw_label: str, strategy, separator: str = "%") -> str:
     parts = [p.strip() for p in raw_label.split(separator) if p.strip()]
     if not parts:
-        return raw_label
+        return ""
     if strategy == "full":
-        return raw_label
+        return separator.join(parts)  # rejoin stripped parts to normalise whitespace
     if strategy == "leaf":
         return parts[-1]
     if strategy == "root":
@@ -78,6 +78,22 @@ def extract_label(raw_label: str, strategy, separator: str = "%") -> str:
     if isinstance(strategy, int):
         return separator.join(parts[:strategy])
     return raw_label
+
+
+def _normalize_label_key(value: Any) -> str:
+    """
+    Normalize labels for stable mapping:
+    - trim whitespace
+    - normalize full-width percent
+    - strip zero-width characters
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    s = s.replace("\uFF05", "%").replace("\u3000", " ")
+    for ch in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        s = s.replace(ch, "")
+    return s.strip()
 
 
 def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
@@ -88,9 +104,27 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
     min_prob = cfg["min_probability"]
     skip_hidden = cfg["skip_hidden"]
     skip_outside = cfg["skip_outside"]
+    label_strategy_norm = str(label_strategy or "").strip().lower()
 
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    raw_mapping = cfg.get("label_mapping")
+    label_mapping: Optional[Dict[str, str]] = None
+    label_mapping_norm: Optional[Dict[str, str]] = None
+    if isinstance(raw_mapping, dict) and raw_mapping:
+        label_mapping = {str(k): v for k, v in raw_mapping.items()}
+        label_mapping_norm = {}
+        for k, v in label_mapping.items():
+            nk = _normalize_label_key(k)
+            if nk in label_mapping_norm and label_mapping_norm[nk] != v:
+                raise ValidationError(f"Conflicting label mappings for normalized key: {nk}")
+            label_mapping_norm[nk] = v
+    missing_labels: set[str] = set()
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        with open(json_path, "r", encoding="gbk", errors="ignore") as f:
+            data = json.load(f)
 
     bboxes: List[BBox] = []
     auto_map: Dict[str, int] = label_map.copy() if label_map else {}
@@ -120,8 +154,33 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
         if not pts or len(pts) < 2:
             continue
 
-        raw_label = shape.get("label", "unknown")
-        label_name = extract_label(raw_label, label_strategy, label_sep)
+        raw_label = str(shape.get("label", "unknown"))
+        raw_label_stripped = raw_label.strip()
+
+        # Skip annotations with empty / whitespace-only labels
+        if not raw_label_stripped:
+            continue
+
+        if label_mapping is not None:
+            mapped_label = None
+            if raw_label_stripped in label_mapping:
+                mapped_label = label_mapping.get(raw_label_stripped)
+            elif label_mapping_norm is not None:
+                norm_key = _normalize_label_key(raw_label_stripped)
+                if norm_key in label_mapping_norm:
+                    mapped_label = label_mapping_norm.get(norm_key)
+
+            if mapped_label == "__DISCARD__" or mapped_label == "":
+                continue
+            if mapped_label is not None:
+                raw_label_stripped = str(mapped_label).strip()
+            elif label_strategy_norm == "mapping":
+                missing_labels.add(raw_label_stripped)
+                continue
+
+        label_name = extract_label(raw_label_stripped, label_strategy, label_sep).strip()
+        if not label_name:
+            continue
         stype = shape.get("shape_type", "polygon").lower()
 
         if stype == "rectangle" and len(pts) == 2:
@@ -143,6 +202,12 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
 
         bbox.class_id = get_cid(label_name)
         bboxes.append(bbox)
+
+    if missing_labels:
+        sample = ", ".join(list(missing_labels)[:10])
+        raise ValidationError(
+            f"Missing label mappings for {len(missing_labels)} labels in {json_path}: {sample}"
+        )
 
     return bboxes, auto_map
 
@@ -201,7 +266,7 @@ def plan_slices(
         inactive = list(all_cells - active_cells)
         n_neg = max(1, int(n_positive * negative_ratio))
         if inactive:
-            rng = np.random.default_rng(42)
+            rng = np.random.default_rng()
             chosen = rng.choice(len(inactive), size=min(n_neg, len(inactive)), replace=False)
             for ci in chosen:
                 r, c = inactive[ci]
@@ -309,7 +374,16 @@ def bbox_to_yolo(bbox: BBox, img_w: int, img_h: int) -> str:
     return f"{bbox.class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}"
 
 
-def read_window_rgb(dataset, x: int, y: int, w: int, h: int) -> np.ndarray:
+# Global percentile range cache: keyed by dataset path to ensure consistent
+# stretching across all slices of the same source image.
+_global_stretch_cache: Dict[str, Tuple[float, float]] = {}
+
+
+def read_window_rgb(
+    dataset, x: int, y: int, w: int, h: int,
+    global_p2: Optional[float] = None,
+    global_p98: Optional[float] = None,
+) -> np.ndarray:
     window = Window(col_off=x, row_off=y, width=w, height=h)
     n = dataset.count
     if n >= 3:
@@ -320,11 +394,12 @@ def read_window_rgb(dataset, x: int, y: int, w: int, h: int) -> np.ndarray:
     data = np.moveaxis(data, 0, -1)
     if data.dtype != np.uint8:
         d = data.astype(np.float64)
-        p2, p98 = np.percentile(d, 2), np.percentile(d, 98)
+        p2 = global_p2 if global_p2 is not None else float(np.percentile(d, 2))
+        p98 = global_p98 if global_p98 is not None else float(np.percentile(d, 98))
         if p98 > p2:
             d = (d - p2) / (p98 - p2) * 255.0
         else:
-            d = d / (d.max() + 1e-8) * 255.0
+            d = np.full_like(d, 127.0)
         data = np.clip(d, 0, 255).astype(np.uint8)
     return data
 
@@ -404,6 +479,7 @@ class DatasetIllegalConvertService:
         label_strategy: str,
         label_level: Optional[int],
         label_separator: str,
+        label_mapping: Optional[dict] = None,
     ) -> dict:
         root = Path(dataset_root).expanduser().resolve(strict=False)
         if not root.exists() or not root.is_dir():
@@ -415,13 +491,18 @@ class DatasetIllegalConvertService:
 
         global_label_map: Dict[str, int] = {}
         processed = 0
+        skipped_files: List[str] = []
+        processed_pairs: List[Tuple[Path, Path]] = []
 
         for image_path, json_path in pairs:
             cfg = dict(self.DEFAULT_CONFIG)
             cfg["image_path"] = str(image_path)
             cfg["annotation_path"] = str(json_path)
             cfg["output_dir"] = str(root)
-            cfg["prefix"] = f"{image_path.stem}_slice"
+            # Use relative path (with _ replacing separators) to avoid collisions
+            # when multiple subdirectories contain images with the same stem.
+            rel_stem = str(image_path.relative_to(root).with_suffix("")).replace(os.sep, "_").replace("/", "_")
+            cfg["prefix"] = f"{rel_stem}_slice"
             cfg["label_separator"] = label_separator or cfg["label_separator"]
             if label_strategy == "level":
                 lvl = int(label_level or 0)
@@ -430,16 +511,32 @@ class DatasetIllegalConvertService:
                 cfg["label_strategy"] = int(lvl)
             else:
                 cfg["label_strategy"] = str(label_strategy or cfg["label_strategy"])
-            cfg["label_map"] = global_label_map or None
+            cfg["label_map"] = global_label_map if global_label_map else {}
+            cfg["label_mapping"] = label_mapping
 
-            stats, global_label_map, slicing_meta = self._run_single(cfg)
+            try:
+                stats, global_label_map, slicing_meta = self._run_single(cfg)
+            except ValidationError as e:
+                # Skip files with no valid annotations instead of aborting
+                skipped_files.append(f"{json_path.name}: {e}")
+                warnings.append(f"Skipped {json_path.name}: {e}")
+                continue
+
             info_path = root / f"slicing_info_{image_path.stem}.json"
             with open(info_path, "w", encoding="utf-8") as f:
                 json.dump(slicing_meta, f, ensure_ascii=False, indent=2)
             processed += 1
+            processed_pairs.append((image_path, json_path))
 
-        # Delete original images and JSON files after successful conversion
-        for image_path, json_path in pairs:
+        if processed == 0:
+            skipped_summary = "; ".join(skipped_files[:5])
+            raise ValidationError(
+                f"All {len(pairs)} image/json pairs failed conversion. "
+                f"Details: {skipped_summary}"
+            )
+
+        # Delete original images and JSON files only for successfully processed pairs
+        for image_path, json_path in processed_pairs:
             try:
                 if image_path.exists():
                     image_path.unlink()
@@ -451,9 +548,15 @@ class DatasetIllegalConvertService:
             except Exception:
                 pass
 
+        # Filter out empty / whitespace-only class names and re-index
+        sorted_classes = [
+            name for name, _cid
+            in sorted(global_label_map.items(), key=lambda x: x[1])
+            if name and name.strip()
+        ]
         classes_path = root / "classes.txt"
         with open(classes_path, "w", encoding="utf-8") as f:
-            for name, _cid in sorted(global_label_map.items(), key=lambda x: x[1]):
+            for name in sorted_classes:
                 f.write(name + "\n")
 
         FileService()._create_yolo_data_yaml(root, root / "data.yaml")
@@ -461,13 +564,194 @@ class DatasetIllegalConvertService:
         return {
             "pairs_total": len(pairs),
             "pairs_processed": processed,
+            "pairs_skipped": len(skipped_files),
+            "skipped_details": skipped_files,
             "warnings": warnings,
         }
 
+    def extract_dataset_labels(self, root: Path) -> list[str]:
+        labels = set()
+        for cur, dirnames, filenames in os.walk(root):
+            cur_p = Path(cur)
+            for fname in filenames:
+                if fname.lower().endswith(".json"):
+                    try:
+                        with open(cur_p / fname, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        shapes = []
+                        if isinstance(data, dict) and "shapes" in data:
+                            shapes = data["shapes"]
+                        elif isinstance(data, list):
+                            shapes = data
+                        for shape in shapes:
+                            if isinstance(shape, dict) and "label" in shape:
+                                labels.add(str(shape["label"]).strip())
+                    except Exception:
+                        pass
+        return sorted(list(labels))
+
+    def apply_label_mapping(
+        self,
+        root: Path,
+        label_mapping: dict,
+        *,
+        strict: bool = True,
+        dry_run: bool = False,
+    ) -> dict:
+        """
+        Apply label mapping directly into LabelMe JSON files.
+
+        - "__DISCARD__" or empty target removes the shape.
+        - If strict=True, any label without a mapping raises ValidationError.
+        """
+        root = Path(root).expanduser().resolve(strict=False)
+        if not root.exists() or not root.is_dir():
+            raise ValidationError("Dataset root not found for label mapping")
+        if not isinstance(label_mapping, dict) or not label_mapping:
+            raise ValidationError("label_mapping is required")
+
+        # Normalize mapping keys for stable matching.
+        label_mapping_norm: Dict[str, str] = {}
+        for k, v in label_mapping.items():
+            nk = _normalize_label_key(k)
+            if not nk:
+                continue
+            if nk in label_mapping_norm and label_mapping_norm[nk] != v:
+                raise ValidationError(f"Conflicting label mappings for normalized key: {nk}")
+            label_mapping_norm[nk] = v
+
+        def _iter_json_files():
+            for cur, dirnames, filenames in os.walk(root):
+                cur_p = Path(cur)
+                rel = cur_p.relative_to(root)
+                if rel.parts and rel.parts[0].lower() in self._skip_dirs:
+                    dirnames[:] = []
+                    continue
+                dirnames[:] = [d for d in dirnames if d.lower() not in self._skip_dirs]
+                for fname in filenames:
+                    if fname.lower().endswith(".json"):
+                        yield cur_p / fname
+
+        missing_labels: set[str] = set()
+
+        # Materialize file list once to avoid TOCTOU between validation and update passes.
+        json_files: list[Path] = list(_iter_json_files())
+
+        # First pass: detect missing mappings (avoid partial updates).
+        for json_path in json_files:
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+
+            shapes = None
+            if isinstance(data, dict) and isinstance(data.get("shapes"), list):
+                shapes = data.get("shapes")
+            elif isinstance(data, list):
+                shapes = data
+            if not shapes:
+                continue
+
+            for shape in shapes:
+                if not isinstance(shape, dict) or "label" not in shape:
+                    continue
+                raw_label = str(shape.get("label", ""))
+                raw_label_stripped = raw_label.strip()
+                if not raw_label_stripped:
+                    continue
+
+                mapped_label = None
+                if raw_label_stripped in label_mapping:
+                    mapped_label = label_mapping.get(raw_label_stripped)
+                else:
+                    norm_key = _normalize_label_key(raw_label_stripped)
+                    if norm_key in label_mapping_norm:
+                        mapped_label = label_mapping_norm.get(norm_key)
+
+                if mapped_label is None and strict:
+                    missing_labels.add(raw_label_stripped)
+
+        if missing_labels:
+            sample = ", ".join(list(missing_labels)[:10])
+            raise ValidationError(f"Missing label mappings for {len(missing_labels)} labels: {sample}")
+
+        if dry_run:
+            return {"files_scanned": 0, "updated_files": 0, "updated_labels": 0, "discarded": 0}
+
+        stats = {"files_scanned": 0, "updated_files": 0, "updated_labels": 0, "discarded": 0}
+
+        for json_path in json_files:
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+
+            shapes = None
+            is_list = False
+            if isinstance(data, dict) and isinstance(data.get("shapes"), list):
+                shapes = data.get("shapes")
+            elif isinstance(data, list):
+                shapes = data
+                is_list = True
+            if shapes is None:
+                continue
+
+            stats["files_scanned"] += 1
+            new_shapes = []
+            changed = False
+
+            for shape in shapes:
+                if not isinstance(shape, dict) or "label" not in shape:
+                    new_shapes.append(shape)
+                    continue
+
+                raw_label = str(shape.get("label", ""))
+                raw_label_stripped = raw_label.strip()
+                if not raw_label_stripped:
+                    new_shapes.append(shape)
+                    continue
+
+                mapped_label = None
+                if raw_label_stripped in label_mapping:
+                    mapped_label = label_mapping.get(raw_label_stripped)
+                else:
+                    norm_key = _normalize_label_key(raw_label_stripped)
+                    if norm_key in label_mapping_norm:
+                        mapped_label = label_mapping_norm.get(norm_key)
+
+                if mapped_label == "__DISCARD__" or mapped_label == "":
+                    stats["discarded"] += 1
+                    changed = True
+                    continue
+
+                if mapped_label is not None:
+                    new_label = str(mapped_label).strip()
+                    if new_label != raw_label:
+                        shape["label"] = new_label
+                        stats["updated_labels"] += 1
+                        changed = True
+                new_shapes.append(shape)
+
+            if changed:
+                if is_list:
+                    data = new_shapes
+                else:
+                    data["shapes"] = new_shapes
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                stats["updated_files"] += 1
+
+        return stats
+
     def _collect_pairs(self, root: Path) -> tuple[list[tuple[Path, Path]], list[str]]:
+        """Collect image/json pairs by relative path (without extension) to avoid
+        cross-directory stem collisions.  E.g. sub1/img.tif and sub2/img.tif
+        are treated as separate pairs."""
         image_exts = [".tif", ".tiff", ".png", ".jpg", ".jpeg"]
-        image_by_stem: Dict[str, Path] = {}
-        json_by_stem: Dict[str, Path] = {}
+        image_by_relkey: Dict[str, Path] = {}
+        json_by_relkey: Dict[str, Path] = {}
 
         for cur, dirnames, filenames in os.walk(root):
             cur_p = Path(cur)
@@ -480,22 +764,22 @@ class DatasetIllegalConvertService:
             for fname in filenames:
                 p = cur_p / fname
                 ext = p.suffix.lower()
+                # Use relative path without extension as unique key
+                rel_key = str(p.relative_to(root).with_suffix(""))
                 if ext in image_exts:
-                    stem = p.stem
-                    prev = image_by_stem.get(stem)
+                    prev = image_by_relkey.get(rel_key)
                     if prev is None or image_exts.index(ext) < image_exts.index(prev.suffix.lower()):
-                        image_by_stem[stem] = p
+                        image_by_relkey[rel_key] = p
                 elif ext == ".json":
-                    stem = p.stem
-                    if stem not in json_by_stem:
-                        json_by_stem[stem] = p
+                    if rel_key not in json_by_relkey:
+                        json_by_relkey[rel_key] = p
 
-        common = sorted(set(image_by_stem.keys()) & set(json_by_stem.keys()))
-        pairs = [(image_by_stem[s], json_by_stem[s]) for s in common]
+        common = sorted(set(image_by_relkey.keys()) & set(json_by_relkey.keys()))
+        pairs = [(image_by_relkey[s], json_by_relkey[s]) for s in common]
 
         warnings: list[str] = []
-        extra_imgs = sorted(set(image_by_stem.keys()) - set(json_by_stem.keys()))
-        extra_json = sorted(set(json_by_stem.keys()) - set(image_by_stem.keys()))
+        extra_imgs = sorted(set(image_by_relkey.keys()) - set(json_by_relkey.keys()))
+        extra_json = sorted(set(json_by_relkey.keys()) - set(image_by_relkey.keys()))
         if extra_imgs:
             warnings.append(f"Unmatched images: {len(extra_imgs)}")
         if extra_json:

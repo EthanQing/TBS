@@ -4,6 +4,8 @@ import json
 import os
 import random
 import shutil
+import stat
+import time
 import uuid
 import threading
 import logging
@@ -267,6 +269,10 @@ class DatasetService:
 
     def delete_dataset(self, db: Session, dataset_id: int, *, delete_files: bool = False, force: bool = False) -> None:
         ds = self.get_dataset(db, dataset_id)
+        ds_id = int(ds.dataset_id)
+        ds_name = str(ds.name or "").strip()
+        ds_storage_path = str(ds.storage_path or "").strip()
+        versions_token = _versions_token(ds)
 
         projects = db.query(Project).filter(Project.dataset_id == ds.dataset_id).all()
         if projects and not force:
@@ -278,6 +284,10 @@ class DatasetService:
                 svc.delete_project(db, int(p.project_id), force=True)
             # Refresh dataset after project deletions/commits.
             ds = self.get_dataset(db, dataset_id)
+            ds_id = int(ds.dataset_id)
+            ds_name = str(ds.name or "").strip()
+            ds_storage_path = str(ds.storage_path or "").strip()
+            versions_token = _versions_token(ds)
 
         # Remove DB rows first.
         db.delete(ds)
@@ -287,26 +297,81 @@ class DatasetService:
             return
 
         base = settings.datasets_dir.resolve()
-        abs_path = resolve_dataset_path(ds.storage_path).resolve(strict=False)
-        if base != abs_path and base not in abs_path.parents:
-            raise ConflictError("Refusing to delete dataset outside BASE_DATASETS_DIR")
+        thumb_base = settings.thumbnails_dir.resolve()
+        versions_base = (base / ".versions").resolve(strict=False)
 
-        try:
-            if abs_path.exists():
-                if abs_path.is_dir():
-                    shutil.rmtree(abs_path, ignore_errors=True)
-                else:
-                    abs_path.unlink(missing_ok=True)
-        except Exception:
-            # Best-effort.
-            pass
+        def _under(parent: Path, child: Path) -> bool:
+            try:
+                c = child.resolve(strict=False)
+            except Exception:
+                return False
+            return c == parent or parent in c.parents
+
+        def _remove_path(path: Path, *, check_parent: Path) -> bool:
+            p = Path(path).resolve(strict=False)
+            if not _under(check_parent, p):
+                return False
+
+            def _onerror(func, path_str, _exc_info):
+                try:
+                    os.chmod(path_str, stat.S_IWRITE)
+                    func(path_str)
+                except Exception:
+                    pass
+
+            for attempt in range(6):
+                try:
+                    if not p.exists():
+                        return True
+                    if p.is_dir():
+                        shutil.rmtree(p, onerror=_onerror)
+                    else:
+                        p.unlink(missing_ok=True)
+                    if not p.exists():
+                        return True
+                except Exception:
+                    pass
+                time.sleep(0.2 * (attempt + 1))
+            return not p.exists()
+
+        # Try multiple candidates for compatibility with legacy storage_path layouts.
+        dataset_candidates: list[Path] = []
+        for cand in (
+            resolve_dataset_path(ds_storage_path),
+            (base / str(ds_id)),
+            (base / ds_name) if ds_name else None,
+        ):
+            if cand is None:
+                continue
+            c = Path(cand).resolve(strict=False)
+            if not _under(base, c) or c == base:
+                continue
+            if c not in dataset_candidates:
+                dataset_candidates.append(c)
+        # Delete deeper paths first.
+        dataset_candidates.sort(key=lambda p: len(p.parts), reverse=True)
+        for p in dataset_candidates:
+            _remove_path(p, check_parent=base)
 
         # Also remove version snapshots/manifests for this dataset.
         try:
-            versions_dir = (base / ".versions" / _versions_token(ds)).resolve(strict=False)
-            if base == versions_dir or base in versions_dir.parents:
-                if versions_dir.exists() and versions_dir.is_dir():
-                    shutil.rmtree(versions_dir, ignore_errors=True)
+            version_candidates: list[Path] = []
+            for token in (versions_token, str(ds_id), ds_name):
+                t = str(token or "").strip()
+                if not t:
+                    continue
+                p = (versions_base / t).resolve(strict=False)
+                if p not in version_candidates and _under(versions_base, p) and p != versions_base:
+                    version_candidates.append(p)
+            for p in version_candidates:
+                _remove_path(p, check_parent=versions_base)
+        except Exception:
+            pass
+
+        # Remove thumbnail cache for this dataset.
+        try:
+            thumb_dir = (thumb_base / str(ds_id)).resolve(strict=False)
+            _remove_path(thumb_dir, check_parent=thumb_base)
         except Exception:
             pass
 
@@ -666,6 +731,65 @@ class DatasetService:
             db.refresh(ver)
         return ds, ver
 
+    def get_illegal_labels(self, db: Session, dataset_id: int) -> list[str]:
+        ds = self.get_dataset(db, dataset_id)
+        if ds.dataset_type != DatasetType.DETECTION:
+            raise ValidationError("Only detection datasets can have illegal labels extracted")
+
+        ver = None
+        if ds.active_version_id is not None:
+            ver = self.versions.get(db, int(ds.active_version_id))
+        if not ver:
+            raise ValidationError("Active version not found")
+
+        meta = ver.meta if isinstance(ver.meta, dict) else {}
+        if not meta.get("illegal"):
+            raise ValidationError("Dataset is not marked as illegal")
+
+        from train_platform.services.dataset_illegal_convert_service import DatasetIllegalConvertService
+
+        dataset_root = resolve_dataset_path(ds.storage_path)
+        return DatasetIllegalConvertService().extract_dataset_labels(dataset_root)
+
+    def update_illegal_labels(self, db: Session, dataset_id: int, label_mapping: dict) -> Dataset:
+        ds = self.get_dataset(db, dataset_id)
+        ver = None
+        if ds.active_version_id is not None:
+            ver = self.versions.get(db, int(ds.active_version_id))
+        if not ver:
+            raise ValidationError("Active version not found")
+
+        meta = ver.meta if isinstance(ver.meta, dict) else {}
+        if not meta.get("illegal"):
+            raise ValidationError("Dataset is not marked as illegal")
+
+        if not isinstance(label_mapping, dict) or not label_mapping:
+            raise ValidationError("label_mapping is required")
+
+        # Expand mapping to include identity entries for mapped targets.
+        expanded_mapping: dict = {}
+        for k, v in label_mapping.items():
+            key = str(k).strip()
+            if not key:
+                continue
+            expanded_mapping[key] = v
+        for _k, v in list(expanded_mapping.items()):
+            if v is None:
+                continue
+            v_str = str(v).strip()
+            if v_str and v_str != "__DISCARD__":
+                expanded_mapping.setdefault(v_str, v_str)
+
+        from train_platform.services.dataset_illegal_convert_service import DatasetIllegalConvertService
+
+        dataset_root = resolve_dataset_path(ds.storage_path)
+        DatasetIllegalConvertService().apply_label_mapping(dataset_root, expanded_mapping)
+
+        meta["illegal_label_mapping"] = expanded_mapping
+        ver.meta = meta
+        db.commit()
+        return ds
+
     def convert_illegal_dataset(
         self,
         db: Session,
@@ -674,6 +798,7 @@ class DatasetService:
         label_strategy: str,
         label_level: Optional[int],
         label_separator: Optional[str],
+        label_mapping: Optional[dict] = None,
         split_enabled: bool | None = None,
         split_train_ratio: float | None = None,
         split_val_ratio: float | None = None,
@@ -704,11 +829,22 @@ class DatasetService:
             raise ValidationError("Unsupported illegal format")
 
         strategy = str(label_strategy or "").strip().lower()
-        if strategy not in ("full", "leaf", "root", "level"):
-            raise ValidationError("label_strategy must be one of: full, leaf, root, level")
+        if strategy not in ("full", "leaf", "root", "level", "mapping"):
+            raise ValidationError("label_strategy must be one of: full, leaf, root, level, mapping")
         level = int(label_level) if label_level is not None else None
         if strategy == "level" and (level is None or level < 1):
             raise ValidationError("label_level is required when label_strategy=level")
+        # Always persist incoming label_mapping so it is available to the
+        # background thread (which reads from meta) regardless of strategy.
+        incoming_mapping = label_mapping if isinstance(label_mapping, dict) and label_mapping else None
+        if incoming_mapping is not None:
+            meta["illegal_label_mapping"] = incoming_mapping
+
+        if strategy == "mapping":
+            stored_mapping = meta.get("illegal_label_mapping")
+            mapping_to_use = incoming_mapping or stored_mapping
+            if not isinstance(mapping_to_use, dict) or not mapping_to_use:
+                raise ValidationError("label_mapping is required when label_strategy=mapping (save mapping first or pass label_mapping)")
 
         conv = dict(meta.get("conversion") or {})
         if str(conv.get("status")) in ("queued", "running"):
@@ -811,12 +947,15 @@ class DatasetService:
 
             from train_platform.services.dataset_illegal_convert_service import DatasetIllegalConvertService
 
+            label_mapping = meta.get("illegal_label_mapping")
+
             svc = DatasetIllegalConvertService()
             svc.convert_dataset(
                 dataset_root,
                 label_strategy=label_strategy,
                 label_level=label_level,
                 label_separator=label_separator,
+                label_mapping=label_mapping,
             )
 
             ds.format = "yolo"
@@ -827,6 +966,12 @@ class DatasetService:
                 created_by=None,
                 create_snapshot=False,
             )
+            # Clear the illegal flag on the newly created version so downstream
+            # workflows (training, export, etc.) treat it as a normal YOLO dataset.
+            new_meta = new_ver.meta if isinstance(new_ver.meta, dict) else {}
+            new_meta.pop("illegal", None)
+            new_meta.pop("illegal_reason", None)
+            new_ver.meta = new_meta
             ds.active_version_id = new_ver.version_id
 
             try:
