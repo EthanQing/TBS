@@ -1065,6 +1065,134 @@ class DatasetService:
             db.close()
 
     # --------------------
+    # rename class labels (YOLO dataset)
+    # --------------------
+    def rename_classes(
+        self,
+        db: Session,
+        dataset_id: int,
+        rename_map: Dict[str, str],
+    ) -> dict:
+        """Rename class names in classes.txt & data.yaml of a converted YOLO dataset.
+
+        Only the display names are updated; class_id (line index in classes.txt /
+        numeric id in label .txt files) stays unchanged.
+
+        Args:
+            rename_map: ``{old_name: new_name}`` — only classes that need
+                renaming should be listed.
+
+        Returns:
+            dict with ``renamed``, ``total_classes``, ``class_names``.
+        """
+        if not isinstance(rename_map, dict) or not rename_map:
+            raise ValidationError("rename_map must be a non-empty dict")
+
+        ds = self.get_dataset(db, dataset_id)
+        fmt = str(getattr(ds, "format", "") or "").lower()
+        if fmt not in ("yolo",):
+            raise ValidationError("Only YOLO-format datasets support class renaming")
+
+        dataset_root = resolve_dataset_path(ds.storage_path)
+        if not dataset_root.exists() or not dataset_root.is_dir():
+            raise ValidationError("Dataset directory not found on disk")
+
+        # --- locate classes.txt ---
+        classes_path = dataset_root / "classes.txt"
+        if not classes_path.exists():
+            # Try alternative names
+            for alt in ("class_names.txt", "obj.names", "names.txt"):
+                alt_p = dataset_root / alt
+                if alt_p.exists():
+                    classes_path = alt_p
+                    break
+        if not classes_path.exists():
+            raise ValidationError("classes.txt not found in dataset directory")
+
+        # Read current class list (one name per line, preserve order = class_id)
+        lines = classes_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        class_names: list[str] = []
+        for line in lines:
+            s = line.strip()
+            if s and not s.startswith("#"):
+                class_names.append(s)
+
+        if not class_names:
+            raise ValidationError("classes.txt is empty")
+
+        # Validate rename_map keys exist in current class list
+        current_set = set(class_names)
+        unknown = [k for k in rename_map if k not in current_set]
+        if unknown:
+            sample = ", ".join(unknown[:10])
+            raise ValidationError(f"Unknown class names (not in classes.txt): {sample}")
+
+        # Check for duplicate target names
+        new_names = list(class_names)  # copy
+        renamed_count = 0
+        for i, name in enumerate(class_names):
+            if name in rename_map:
+                target = str(rename_map[name]).strip()
+                if not target:
+                    raise ValidationError(f"New name for '{name}' must not be empty")
+                new_names[i] = target
+                renamed_count += 1
+
+        # Check uniqueness after rename
+        seen: set[str] = set()
+        for n in new_names:
+            if n in seen:
+                raise ValidationError(f"Duplicate class name after rename: '{n}'")
+            seen.add(n)
+
+        if renamed_count == 0:
+            return {
+                "renamed": 0,
+                "total_classes": len(new_names),
+                "class_names": new_names,
+            }
+
+        # --- write classes.txt ---
+        with open(classes_path, "w", encoding="utf-8") as f:
+            for n in new_names:
+                f.write(n + "\n")
+
+        # --- update data.yaml ---
+        yaml_path = dataset_root / "data.yaml"
+        if yaml_path.exists():
+            try:
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                cfg["names"] = new_names
+                cfg["nc"] = len(new_names)
+                with open(yaml_path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+            except Exception:
+                # If data.yaml is corrupt, regenerate from scratch
+                FileService()._create_yolo_data_yaml(dataset_root, yaml_path)
+
+        # --- record event ---
+        try:
+            db.add(
+                DatasetEvent(
+                    dataset_id=int(ds.dataset_id),
+                    version_id=int(ds.active_version_id) if ds.active_version_id is not None else None,
+                    event_type="rename_classes",
+                    message=f"Renamed {renamed_count} class(es)",
+                    data={"rename_map": rename_map, "class_names": new_names},
+                )
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        return {
+            "renamed": renamed_count,
+            "total_classes": len(new_names),
+            "class_names": new_names,
+        }
+
+    # --------------------
     # dataset uploads / events
     # --------------------
     def list_events(

@@ -20,6 +20,8 @@ from train_platform.schemas.v2.datasets import (
     DatasetIllegalConvertOut,
     DatasetIllegalLabelsOut,
     DatasetIllegalLabelsUpdate,
+    DatasetRenameClassesRequest,
+    DatasetRenameClassesOut,
     DatasetSplitRequest,
     DatasetSplitResultOut,
     DatasetSplitSummary,
@@ -359,6 +361,20 @@ def create_dataset_version(dataset_id: int, payload: DatasetVersionCreate, db: S
 @router.post("/{dataset_id}/versions/{version_id}/activate", response_model=DatasetOut)
 def activate_dataset_version(dataset_id: int, version_id: int, db: Session = Depends(get_db)):
     return DatasetService().activate_version(db, dataset_id, version_id)
+
+
+@router.put("/{dataset_id}/classes", response_model=DatasetRenameClassesOut)
+def rename_dataset_classes(
+    dataset_id: int,
+    payload: DatasetRenameClassesRequest,
+    db: Session = Depends(get_db),
+):
+    """Rename class labels in a converted YOLO dataset.
+
+    Only updates classes.txt and data.yaml; label files are unchanged
+    because class_id (line index) stays the same.
+    """
+    return DatasetService().rename_classes(db, int(dataset_id), payload.rename_map)
 
 
 @router.get("/{dataset_id}/statistics", response_model=DatasetStatisticsOut)

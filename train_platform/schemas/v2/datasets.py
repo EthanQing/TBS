@@ -279,3 +279,23 @@ class DatasetIllegalLabelsOut(BaseModel):
 
 class DatasetIllegalLabelsUpdate(BaseModel):
     label_mapping: Dict[str, str] = Field(..., description="Mapping from old raw label to new absolute label")
+
+
+class DatasetRenameClassesRequest(BaseModel):
+    """Rename class labels in a converted YOLO dataset.
+
+    Keys are the current class names, values are the new names.
+    Only classes that need renaming should be included.
+    class_id (index) is preserved — only the display name changes.
+    """
+    rename_map: Dict[str, str] = Field(
+        ...,
+        description="Mapping from current class name to new class name",
+        min_length=1,
+    )
+
+
+class DatasetRenameClassesOut(BaseModel):
+    renamed: int = Field(..., description="Number of classes actually renamed")
+    total_classes: int = Field(..., description="Total number of classes after rename")
+    class_names: list[str] = Field(..., description="Updated class name list (ordered by class_id)")
