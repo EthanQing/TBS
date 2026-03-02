@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import List
 
 from train_platform.training.plugins.base import TrainerPlugin
-from train_platform.training.plugins.mmdet import MMDetTrainer
+from train_platform.training.plugins.paddle_det import PaddleDetTrainer
 from train_platform.training.plugins.stubs import NotImplementedTrainer
 from train_platform.training.plugins.ultralytics_yolo import UltralyticsYOLOTrainer
 
@@ -12,7 +12,7 @@ def get_trainer(*, model_family: str) -> TrainerPlugin:
     mf = (model_family or "").strip()
     plugins: List[TrainerPlugin] = [
         UltralyticsYOLOTrainer(),
-        MMDetTrainer(),
+        PaddleDetTrainer(),
         NotImplementedTrainer(name="detr", model_family="detr"),
         NotImplementedTrainer(name="detr", model_family="dert"),
     ]

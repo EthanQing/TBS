@@ -1,0 +1,2 @@
+-r worker.common.txt
+# Paddle is provided by the official paddle runtime image.

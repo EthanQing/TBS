@@ -1,2 +1,2 @@
-"""Trainer plugins (YOLO/MMDet/DETR...)."""
+"""Trainer plugins (YOLO/PaddleDet/DETR...)."""
 

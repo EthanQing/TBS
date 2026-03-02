@@ -16,8 +16,8 @@ class ModelArchitecture(Base):
 
     architecture_id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    family: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # e.g. YOLOv8/MMDet/DETR
-    variant: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # e.g. yolov8n / rtmdet_tiny
+    family: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # e.g. YOLOv8/PaddleDetection/DETR
+    variant: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # e.g. yolov8n / ppyoloe_s
     task_type: Mapped[TaskType] = mapped_column(
         Enum(TaskType, values_callable=lambda x: [e.value for e in x]),
         nullable=False,

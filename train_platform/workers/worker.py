@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
+from train_platform.models.architecture import ModelArchitecture
 from train_platform.models.enums import DeploymentStatus, LogLevel, TrainingRunStatus
 from train_platform.models.training_run import TrainingRun, TrainingRunEvent
 from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
@@ -97,6 +98,21 @@ def _file_tail_contains(path: Path, needle: str, *, max_bytes: int = 65536) -> b
         return False
 
 
+def _parse_worker_engines(raw: Optional[str]) -> Optional[set[str]]:
+    """
+    Parse WORKER_ENGINES env var.
+
+    Examples:
+      - "ultralytics-yolo,paddle-det"
+      - "all" / "*" (or empty) => no filtering.
+    """
+    value = (raw or "").strip()
+    if not value or value in {"*", "all", "ALL", "All"}:
+        return None
+    engines = {x.strip().lower() for x in value.split(",") if x.strip()}
+    return engines or None
+
+
 
 @dataclass
 class RunningJob:
@@ -114,12 +130,14 @@ class DbQueueWorker:
         self.poll_interval = float(os.getenv("WORKER_POLL_INTERVAL", "2"))
         self.heartbeat_interval = float(os.getenv("WORKER_HEARTBEAT_INTERVAL", "5"))
         self.stale_after = int(os.getenv("WORKER_STALE_AFTER_SECONDS", "120"))
+        self.allowed_engines = _parse_worker_engines(os.getenv("WORKER_ENGINES"))
 
         self._running: Optional[RunningJob] = None
         self._last_heartbeat_at: Optional[datetime] = None
 
     def run_forever(self) -> None:
-        print(f"[worker] starting worker_id={self.worker_id}", flush=True)
+        engines_text = ",".join(sorted(self.allowed_engines)) if self.allowed_engines else "*"
+        print(f"[worker] starting worker_id={self.worker_id} engines={engines_text}", flush=True)
         settings.ensure_dirs()
         while True:
             try:
@@ -227,12 +245,15 @@ class DbQueueWorker:
             now = _utcnow()
             q = (
                 db.query(TrainingRun)
+                .join(ModelArchitecture, TrainingRun.architecture_id == ModelArchitecture.architecture_id)
                 .filter(TrainingRun.status == TrainingRunStatus.QUEUED)
                 .filter(TrainingRun.queued_at.isnot(None))
                 .filter(TrainingRun.claimed_at.is_(None))
                 .filter(TrainingRun.hidden == False)  # noqa: E712
                 .order_by(TrainingRun.queued_at.asc())
             )
+            if self.allowed_engines:
+                q = q.filter(ModelArchitecture.engine.in_(sorted(self.allowed_engines)))
 
             # Best-effort row locking for multi-worker.
             try:

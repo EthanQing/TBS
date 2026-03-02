@@ -62,26 +62,49 @@ def yolov8_segmentation_variants(*, engine: str = "ultralytics-yolo") -> list[di
     ]
 
 
-def rtmdet_detection_variants(*, engine: str = "mmdet") -> list[dict]:
+def paddle_det_detection_variants(*, engine: str = "paddle-det") -> list[dict]:
     """
-    RTMDet detection architectures (MMDetection).
+    PaddleDetection detection architectures.
+
+    PP-YOLOE+ (s/m/l/x) and PicoDet (s/l), split into separate families for
+    cleaner UI grouping.
     """
-    variants = ["rtmdet_s", "rtmdet_m", "rtmdet_l"]
-    return [
-        {
-            "family": "mmdet",
-            "variant": v,
+    ppyoloe = [
+        ("ppyoloe_s", "PP-YOLOE+ Small", "configs/ppyoloe/ppyoloe_plus_crn_s_80e_coco.yml"),
+        ("ppyoloe_m", "PP-YOLOE+ Medium", "configs/ppyoloe/ppyoloe_plus_crn_m_80e_coco.yml"),
+        ("ppyoloe_l", "PP-YOLOE+ Large", "configs/ppyoloe/ppyoloe_plus_crn_l_80e_coco.yml"),
+        ("ppyoloe_x", "PP-YOLOE+ XLarge", "configs/ppyoloe/ppyoloe_plus_crn_x_80e_coco.yml"),
+    ]
+    picodet = [
+        ("picodet_s", "PicoDet Small (轻量级)", "configs/picodet/picodet_s_320_coco_lcnet.yml"),
+        ("picodet_l", "PicoDet Large", "configs/picodet/picodet_l_640_coco_lcnet.yml"),
+    ]
+    results = []
+    for v in ppyoloe:
+        results.append({
+            "family": "PP-YOLOE",
+            "variant": v[0],
             "task_type": TaskType.DETECTION,
             "engine": engine,
-        }
-        for v in variants
-    ]
+            "description": v[1],
+            "default_params": {"config_path": v[2]},
+        })
+    for v in picodet:
+        results.append({
+            "family": "PicoDet",
+            "variant": v[0],
+            "task_type": TaskType.DETECTION,
+            "engine": engine,
+            "description": v[1],
+            "default_params": {"config_path": v[2]},
+        })
+    return results
 
 
 DEFAULT_ARCHITECTURES: list[dict] = [
     *yolov8_detection_variants(),
+    *paddle_det_detection_variants(),
     # *yolov8_classification_variants(),
     # *yolov8_segmentation_variants(),
-    # *rtmdet_detection_variants(),
 ]
 
