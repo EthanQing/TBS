@@ -480,6 +480,7 @@ class DatasetIllegalConvertService:
         label_level: Optional[int],
         label_separator: str,
         label_mapping: Optional[dict] = None,
+        slice_config: Optional[dict] = None,
     ) -> dict:
         root = Path(dataset_root).expanduser().resolve(strict=False)
         if not root.exists() or not root.is_dir():
@@ -496,6 +497,13 @@ class DatasetIllegalConvertService:
 
         for image_path, json_path in pairs:
             cfg = dict(self.DEFAULT_CONFIG)
+            # Apply user-specified slice/crop overrides
+            if isinstance(slice_config, dict):
+                for key in ("slice_size", "overlap", "padding", "min_area_ratio",
+                             "min_visibility", "min_pixel_size", "negative_ratio",
+                             "empty_positive_action"):
+                    if key in slice_config and slice_config[key] is not None:
+                        cfg[key] = slice_config[key]
             cfg["image_path"] = str(image_path)
             cfg["annotation_path"] = str(json_path)
             cfg["output_dir"] = str(root)

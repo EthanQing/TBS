@@ -799,6 +799,16 @@ class DatasetService:
         label_level: Optional[int],
         label_separator: Optional[str],
         label_mapping: Optional[dict] = None,
+        # Slice / crop parameters
+        slice_size: int | None = None,
+        overlap: float | None = None,
+        padding: int | None = None,
+        min_area_ratio: float | None = None,
+        min_visibility: float | None = None,
+        min_pixel_size: int | None = None,
+        negative_ratio: float | None = None,
+        empty_positive_action: str | None = None,
+        # Split parameters
         split_enabled: bool | None = None,
         split_train_ratio: float | None = None,
         split_val_ratio: float | None = None,
@@ -869,6 +879,26 @@ class DatasetService:
             "shuffle": bool(split_shuffle) if split_shuffle is not None else None,
             "overwrite": bool(split_overwrite) if split_overwrite is not None else None,
         }
+        # Store slice/crop overrides for the background thread
+        slice_config = {}
+        if slice_size is not None:
+            slice_config["slice_size"] = int(slice_size)
+        if overlap is not None:
+            slice_config["overlap"] = float(overlap)
+        if padding is not None:
+            slice_config["padding"] = int(padding)
+        if min_area_ratio is not None:
+            slice_config["min_area_ratio"] = float(min_area_ratio)
+        if min_visibility is not None:
+            slice_config["min_visibility"] = float(min_visibility)
+        if min_pixel_size is not None:
+            slice_config["min_pixel_size"] = int(min_pixel_size)
+        if negative_ratio is not None:
+            slice_config["negative_ratio"] = float(negative_ratio)
+        if empty_positive_action is not None:
+            slice_config["empty_positive_action"] = str(empty_positive_action)
+        if slice_config:
+            conv["slice_config"] = slice_config
         meta["conversion"] = conv
         ver.meta = meta
         db.commit()
@@ -948,6 +978,7 @@ class DatasetService:
             from train_platform.services.dataset_illegal_convert_service import DatasetIllegalConvertService
 
             label_mapping = meta.get("illegal_label_mapping")
+            slice_config = conv.get("slice_config") if isinstance(conv, dict) else None
 
             svc = DatasetIllegalConvertService()
             svc.convert_dataset(
@@ -956,6 +987,7 @@ class DatasetService:
                 label_level=label_level,
                 label_separator=label_separator,
                 label_mapping=label_mapping,
+                slice_config=slice_config,
             )
 
             ds.format = "yolo"

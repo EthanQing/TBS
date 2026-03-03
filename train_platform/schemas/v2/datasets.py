@@ -253,6 +253,16 @@ class DatasetIllegalConvertRequest(BaseModel):
         None,
         description="Optional mapping from raw label to target label (used when label_strategy=mapping)",
     )
+    # Slice / crop parameters (override service defaults when provided)
+    slice_size: Optional[int] = Field(None, ge=64, le=8192, description="Slice width/height in pixels")
+    overlap: Optional[float] = Field(None, ge=0, lt=1, description="Overlap ratio between adjacent slices")
+    padding: Optional[int] = Field(None, ge=0, le=1024, description="Extra padding around annotation bboxes")
+    min_area_ratio: Optional[float] = Field(None, ge=0, le=1, description="Min bbox area ratio inside slice")
+    min_visibility: Optional[float] = Field(None, ge=0, le=1, description="Min bbox width/height visibility")
+    min_pixel_size: Optional[int] = Field(None, ge=1, le=1000, description="Min bbox pixel size in slice")
+    negative_ratio: Optional[float] = Field(None, ge=0, le=1, description="Ratio of negative to positive slices")
+    empty_positive_action: Optional[str] = Field(None, description="Action for empty positive slices: discard | negative")
+    # Split parameters
     split_enabled: Optional[bool] = Field(False)
     split_train_ratio: Optional[float] = Field(None, gt=0, lt=1)
     split_val_ratio: Optional[float] = Field(None, gt=0, lt=1)
