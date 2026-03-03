@@ -125,12 +125,21 @@ class RunningJob:
 
 
 class DbQueueWorker:
-    def __init__(self) -> None:
-        self.worker_id = os.getenv("WORKER_ID") or uuid.uuid4().hex
+    def __init__(
+        self,
+        *,
+        worker_id: Optional[str] = None,
+        allowed_engines: Optional[set[str]] = None,
+    ) -> None:
+        self.worker_id = worker_id or os.getenv("WORKER_ID") or uuid.uuid4().hex
         self.poll_interval = float(os.getenv("WORKER_POLL_INTERVAL", "2"))
         self.heartbeat_interval = float(os.getenv("WORKER_HEARTBEAT_INTERVAL", "5"))
         self.stale_after = int(os.getenv("WORKER_STALE_AFTER_SECONDS", "120"))
-        self.allowed_engines = _parse_worker_engines(os.getenv("WORKER_ENGINES"))
+        self.allowed_engines = (
+            allowed_engines
+            if allowed_engines is not None
+            else _parse_worker_engines(os.getenv("WORKER_ENGINES"))
+        )
 
         self._running: Optional[RunningJob] = None
         self._last_heartbeat_at: Optional[datetime] = None

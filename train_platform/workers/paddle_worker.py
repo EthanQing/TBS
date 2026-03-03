@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import os
-
 from train_platform.workers.worker import DbQueueWorker
 
 
 def main() -> None:
     # Dedicated entrypoint for PaddleDetection training jobs.
-    os.environ.setdefault("WORKER_ID", "worker-paddle")
-    os.environ.setdefault("WORKER_ENGINES", "paddle-det")
-    DbQueueWorker().run_forever()
+    DbQueueWorker(worker_id="worker-paddle", allowed_engines={"paddle-det"}).run_forever()
 
 
 if __name__ == "__main__":

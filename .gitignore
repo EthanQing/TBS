@@ -24,6 +24,7 @@ datasets/
 training_runs/
 temp/
 *.log
+*.json
 
 # --- IDE 配置 (个人配置不应提交) ---
 .vscode/

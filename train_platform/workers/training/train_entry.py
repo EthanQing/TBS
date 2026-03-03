@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
+import time
 import traceback
 from datetime import datetime, timezone
 from typing import Dict
@@ -17,6 +19,7 @@ from train_platform.training.registry import get_trainer
 from train_platform.utils.path_utils import resolve_dataset_path
 from train_platform.utils.mlflow_utils import init_mlflow_logger
 from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
+from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
 
 def _utcnow() -> datetime:
@@ -114,6 +117,36 @@ def _cancel_requested(run_id: str) -> bool:
         db.close()
 
 
+def _heartbeat_tick(run_id: str) -> None:
+    db = SessionLocal()
+    try:
+        run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
+        if not run:
+            return
+        _touch_run_liveness(db, run)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _heartbeat_loop(run_id: str, stop_event: threading.Event, *, interval_sec: float = 5.0) -> None:
+    while not stop_event.wait(max(1.0, float(interval_sec))):
+        _heartbeat_tick(run_id)
+
+
+def _merge_metrics_payload(existing: Dict[str, float] | dict | None, incoming: Dict[str, float] | dict | None) -> Dict[str, float]:
+    merged: Dict[str, float] = {}
+    if isinstance(existing, dict):
+        for k, v in existing.items():
+            merged[str(k)] = v
+    if isinstance(incoming, dict):
+        for k, v in incoming.items():
+            merged[str(k)] = v
+    return merged
+
+
 def _upsert_epoch_metrics(run_id: str, epoch: int, metrics: Dict[str, float]) -> None:
     db = SessionLocal()
     try:
@@ -122,10 +155,11 @@ def _upsert_epoch_metrics(run_id: str, epoch: int, metrics: Dict[str, float]) ->
             .filter(TrainingRunEpochMetric.run_id == run_id, TrainingRunEpochMetric.epoch == int(epoch))
             .first()
         )
+        payload = _merge_metrics_payload({}, metrics)
         if row:
-            row.metrics = metrics
+            row.metrics = _merge_metrics_payload(row.metrics, payload)
         else:
-            db.add(TrainingRunEpochMetric(run_id=run_id, epoch=int(epoch), metrics=metrics))
+            db.add(TrainingRunEpochMetric(run_id=run_id, epoch=int(epoch), metrics=payload))
 
         run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
         if run:
@@ -153,6 +187,9 @@ def main(argv: list[str] | None = None) -> int:
     mlflow_status = None
     exit_code = 1
     error_message: str | None = None
+    heartbeat_stop: threading.Event | None = None
+    heartbeat_thread: threading.Thread | None = None
+    vdl_bridge: VisualDLScalarBridge | None = None
     try:
         run = TrainingRunRepository().get(db, run_id)
         if not run or not run.parameters or not run.project or not run.project.dataset or not run.dataset_version or not run.architecture:
@@ -198,6 +235,28 @@ def main(argv: list[str] | None = None) -> int:
             upsert_epoch_metrics=upsert_epoch_metrics,
         )
 
+        # Keep heartbeat alive even if plugin callbacks fail to report metrics.
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat_loop,
+            args=(run_id, heartbeat_stop),
+            kwargs={"interval_sec": 5.0},
+            daemon=True,
+        )
+        heartbeat_thread.start()
+
+        # Optional phase-2 bridge: enrich Paddle metrics from VisualDL scalars.
+        additional_params = getattr(run.parameters, "additional_params", None) or {}
+        metrics_source = str(additional_params.get("metrics_source", "callback") or "callback").strip().lower()
+        if "paddle" in key.lower() and metrics_source == "hybrid":
+            vdl_bridge = VisualDLScalarBridge(
+                run_id=run_id,
+                run_dir=run_dir,
+                upsert_epoch_metrics=upsert_epoch_metrics,
+                poll_interval_sec=5.0,
+            )
+            vdl_bridge.start()
+
         print(f"[train_entry] start run_id={run_id} trainer={getattr(trainer, 'name', type(trainer).__name__)}", flush=True)
         trainer.run(ctx)
         mlflow_status = "FINISHED"
@@ -227,6 +286,12 @@ def main(argv: list[str] | None = None) -> int:
         error_message = f"{type(e).__name__}: {e}"
         return exit_code
     finally:
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=2.0)
+        if vdl_bridge is not None:
+            vdl_bridge.stop()
         # Best-effort: ensure DB status does not incorrectly remain FAILED due to worker heartbeat loss.
         try:
             _finalize_run_status(run_id, exit_code=exit_code, error_message=error_message)

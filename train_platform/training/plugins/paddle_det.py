@@ -15,6 +15,7 @@ that the rest of the platform works even when PaddlePaddle is not installed.
 import json
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable
@@ -60,6 +61,80 @@ def _safe_int(v: Any) -> int | None:
         return int(v) if v is not None else None
     except Exception:
         return None
+
+
+def _apply_metric_aliases(raw_metrics: Dict[str, Any] | None) -> Dict[str, float]:
+    """
+    Normalize metric keys across training engines while preserving originals.
+
+    PaddleDetection and Ultralytics often use different key names for the
+    same concepts; this helper adds stable aliases used by the frontend.
+    """
+    raw = raw_metrics if isinstance(raw_metrics, dict) else {}
+    out: Dict[str, float] = {}
+    for k, v in raw.items():
+        fv = _safe_float(v)
+        if fv is not None:
+            out[str(k)] = fv
+
+    def _alias(dst: str, *srcs: str) -> None:
+        if _safe_float(out.get(dst)) is not None:
+            return
+        for src in srcs:
+            fv = _safe_float(out.get(src))
+            if fv is not None:
+                out[dst] = fv
+                return
+
+    # Canonical detection metrics used by the unified frontend charts.
+    _alias("metrics/mAP50(B)", "AP50", "mAP50", "eval/bbox_AP50", "eval/bbox_ap50")
+    _alias("metrics/mAP50-95(B)", "mAP", "eval/bbox_mAP", "eval/bbox_map")
+    _alias("metrics/precision(B)", "precision", "eval/bbox_precision", "eval/precision")
+    _alias("metrics/recall(B)", "recall", "eval/bbox_recall", "eval/recall")
+
+    # Backward compatibility for old keys consumed by existing clients.
+    _alias("AP50", "metrics/mAP50(B)")
+    _alias("mAP50", "metrics/mAP50(B)")
+    _alias("mAP", "metrics/mAP50-95(B)")
+    _alias("precision", "metrics/precision(B)")
+    _alias("recall", "metrics/recall(B)")
+    return out
+
+
+def _ensure_local_ppdet_on_syspath() -> Path | None:
+    """
+    Best-effort: add a local PaddleDetection repo to sys.path.
+
+    This enables local development where PaddleDetection is cloned but not
+    installed as a wheel/package.
+    """
+    roots = []
+    raw = settings.paddle_det_dir
+    roots.append(raw)
+    # Allow pointing either to repo root or to its parent directory.
+    roots.append(raw / "PaddleDetection")
+
+    for candidate in roots:
+        try:
+            root = candidate.resolve(strict=False)
+        except Exception:
+            root = candidate
+        if not root.exists() or not root.is_dir():
+            continue
+
+        # Typical PaddleDetection repo root contains ./ppdet package directory.
+        if not (root / "ppdet").is_dir():
+            # Also allow PADDLE_DET_DIR directly pointing to ./ppdet.
+            if root.name.lower() == "ppdet" and root.parent.is_dir():
+                root = root.parent
+            else:
+                continue
+
+        s = str(root)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+        return root
+    return None
 
 
 def _set_cfg_by_path(root: Any, dotted_key: str, value: Any) -> bool:
@@ -121,6 +196,66 @@ def _load_yaml(path: Path) -> dict:
     except Exception:
         obj = {}
     return obj if isinstance(obj, dict) else {}
+
+
+def _apply_warmup_epochs_to_cfg(cfg: dict, warmup_epochs: int | None) -> bool:
+    """
+    Apply warmup epochs to PaddleDetection LearningRate schedulers safely.
+
+    Different configs represent schedulers differently (dicts vs objects),
+    so we avoid brittle dotted-path overrides and patch the warmup scheduler
+    directly.
+    """
+    if warmup_epochs is None:
+        return False
+
+    lr_cfg = cfg.get("LearningRate")
+    if not isinstance(lr_cfg, dict):
+        return False
+
+    schedulers = lr_cfg.get("schedulers")
+    if not isinstance(schedulers, list):
+        return False
+
+    target = None
+    for sch in schedulers:
+        if isinstance(sch, dict):
+            name = str(sch.get("name") or sch.get("type") or sch.get("_type_") or "").lower()
+            if "warmup" in name:
+                target = sch
+                break
+        else:
+            if "warmup" in type(sch).__name__.lower():
+                target = sch
+                break
+
+    if target is None:
+        return False
+
+    val = int(max(0, int(warmup_epochs)))
+    if isinstance(target, dict):
+        # Most configs use LinearWarmup with `epochs` or `steps`.
+        if "epochs" in target or "steps" not in target:
+            target["epochs"] = val
+        else:
+            target["steps"] = val
+        target.pop("warmup_steps", None)
+        return True
+
+    # Object-based config nodes (e.g., already materialized scheduler objects).
+    if hasattr(target, "epochs"):
+        try:
+            setattr(target, "epochs", val)
+            return True
+        except Exception:
+            pass
+    if hasattr(target, "steps"):
+        try:
+            setattr(target, "steps", val)
+            return True
+        except Exception:
+            pass
+    return False
 
 
 def _normalize_yolo_names(names_obj: Any, nc_obj: Any) -> list[str]:
@@ -335,22 +470,46 @@ class PaddleDetTrainer:
 
     def run(self, ctx: TrainContext) -> None:  # noqa: C901  (complexity is inherent)
         # ---- Lazy imports ----
+        paddle = None
         try:
             import paddle
         except Exception as e:
-            raise RuntimeError(
-                "PaddlePaddle is not installed.  "
-                "Install paddlepaddle-gpu (or paddlepaddle for CPU) to use PaddleDetection training."
-            ) from e
+            msg = str(e)
+            # Compatibility fallback for old paddle/protobuf combinations.
+            if "Descriptors cannot be created directly" in msg:
+                os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+                try:
+                    import paddle
+                except Exception:
+                    pass
+            if paddle is None:
+                hint = (
+                    "PaddlePaddle import failed. "
+                    "This is often caused by protobuf incompatibility "
+                    "(install `protobuf<=3.20.3`) or a broken paddle installation."
+                )
+                raise RuntimeError(
+                    f"{hint} Original error: {type(e).__name__}: {msg}"
+                ) from e
 
+        ppdet_module = None
         try:
+            import ppdet as ppdet_module  # type: ignore
             from ppdet.core.workspace import load_config
             from ppdet.engine import Trainer as PPTrainer
-        except Exception as e:
-            raise RuntimeError(
-                "PaddleDetection (ppdet) is not installed.  "
-                "Install paddledet to use PaddleDetection training."
-            ) from e
+        except Exception as first_error:
+            # Local-dev fallback: use source repo via PADDLE_DET_DIR without pip install.
+            _ensure_local_ppdet_on_syspath()
+            try:
+                import ppdet as ppdet_module  # type: ignore
+                from ppdet.core.workspace import load_config
+                from ppdet.engine import Trainer as PPTrainer
+            except Exception as second_error:
+                root_error = second_error or first_error
+                raise RuntimeError(
+                    "PaddleDetection (ppdet) is not available. "
+                    "Install paddledet, or set PADDLE_DET_DIR to a local PaddleDetection repo."
+                ) from root_error
 
         job = ctx.job
         add = getattr(getattr(job, "parameters", None), "additional_params", None) or {}
@@ -374,10 +533,24 @@ class PaddleDetTrainer:
         cfg_path = Path(str(config_path))
         if not cfg_path.is_absolute():
             # 1) Try PaddleDetection repo clone (settings.paddle_det_dir)
-            ppdet_repo = settings.paddle_det_dir
-            cand = (ppdet_repo / cfg_path).resolve(strict=False)
-            if cand.exists():
-                cfg_path = cand
+            repo_roots = [settings.paddle_det_dir, settings.paddle_det_dir / "PaddleDetection"]
+            if ppdet_module is not None:
+                try:
+                    pkg_init = Path(ppdet_module.__file__).resolve()
+                    repo_roots.extend([pkg_init.parent.parent, pkg_init.parent])
+                except Exception:
+                    pass
+
+            seen_roots: set[str] = set()
+            for root in repo_roots:
+                key = str(root)
+                if key in seen_roots:
+                    continue
+                seen_roots.add(key)
+                cand = (root / cfg_path).resolve(strict=False)
+                if cand.exists():
+                    cfg_path = cand
+                    break
             else:
                 # 2) Try temp / pretrain_models / cwd
                 for resolver in (resolve_temp_path, resolve_pretrain_path):
@@ -386,17 +559,7 @@ class PaddleDetTrainer:
                         cfg_path = cand
                         break
                 else:
-                    # 3) Try ppdet package installation directory
-                    try:
-                        import ppdet as _ppdet_pkg
-                        pkg_dir = Path(_ppdet_pkg.__file__).resolve().parent.parent
-                        cand = (pkg_dir / cfg_path).resolve(strict=False)
-                        if cand.exists():
-                            cfg_path = cand
-                    except Exception:
-                        pass
-                    if not cfg_path.is_absolute() or not cfg_path.exists():
-                        cfg_path = (Path.cwd() / cfg_path).resolve(strict=False)
+                    cfg_path = (Path.cwd() / cfg_path).resolve(strict=False)
 
         if not cfg_path.exists():
             raise ValidationError(f"PaddleDetection config not found: {cfg_path}")
@@ -535,10 +698,25 @@ class PaddleDetTrainer:
 
         # Warmup
         warmup_epochs = _safe_int(add.get("warmup_epochs"))
-        if warmup_epochs is not None:
-            overrides["LearningRate.schedulers.0.warmup_steps"] = warmup_epochs
+        eval_during_train = _coerce_bool(add.get("eval_during_train", True), True)
+        metrics_source = str(add.get("metrics_source", "callback") or "callback").strip().lower()
+        eval_interval = _safe_int(
+            add.get("eval_interval") or add.get("snapshot_epoch") or add.get("save_period")
+        )
+        # For local dev UX, default to eval every epoch so mAP curves appear early.
+        if eval_interval is None or eval_interval <= 0:
+            eval_interval = 1
 
         _apply_cfg_overrides(cfg, overrides)
+        _apply_warmup_epochs_to_cfg(cfg, warmup_epochs)
+        cfg["snapshot_epoch"] = int(max(1, eval_interval))
+        if metrics_source == "hybrid":
+            try:
+                import visualdl  # noqa: F401
+                cfg["use_vdl"] = True
+                cfg["vdl_log_dir"] = str(ctx.run_dir / "vdl_log_dir")
+            except Exception:
+                pass
 
         # Also directly set dataset paths on cfg dict (belt-and-suspenders).
         for ds_key in ("TrainDataset", "EvalDataset", "TestDataset"):
@@ -617,10 +795,11 @@ class PaddleDetTrainer:
             pass
 
         # ---- Build Trainer ----
-        trainer = PPTrainer(cfg, mode="train")
-
-        # Restore download functions now that Trainer is built with our dataset
-        _restore_download_patches()
+        try:
+            trainer = PPTrainer(cfg, mode="train")
+        finally:
+            # Always restore monkey-patched functions even when trainer init fails.
+            _restore_download_patches()
 
         # Load pretrained weights or resume
         if resume_checkpoint:
@@ -647,55 +826,202 @@ class PaddleDetTrainer:
             class _MetricsAndCancelCallback(Callback):
                 """Custom callback for epoch metrics reporting and cancellation."""
 
-                def __init__(self) -> None:
+                def __init__(self, pp_trainer: Any) -> None:
                     super().__init__(None)
+                    self._trainer = pp_trainer
+
+                @staticmethod
+                def _extract_metrics(status: dict) -> Dict[str, float]:
+                    metrics: Dict[str, float] = {}
+
+                    # 1) Direct scalar fields from status.
+                    direct_map = (
+                        ("loss", "loss"),
+                        ("loss_cls", "loss_cls"),
+                        ("loss_iou", "loss_iou"),
+                        ("loss_dfl", "loss_dfl"),
+                        ("loss_obj", "loss_obj"),
+                        ("learning_rate", "lr"),
+                        ("lr", "lr"),
+                        ("precision", "precision"),
+                        ("recall", "recall"),
+                        ("mAP", "mAP"),
+                        ("AP50", "AP50"),
+                        ("AP75", "AP75"),
+                    )
+                    for src, dst in direct_map:
+                        val = status.get(src)
+                        if val is None:
+                            continue
+                        fv = _safe_float(val)
+                        if fv is not None:
+                            metrics[dst] = fv
+
+                    # 2) Training stats object/dict from PaddleDetection.
+                    # NOTE: ppdet currently uses key "training_staus" (upstream typo).
+                    ts_obj = (
+                        status.get("training_staus")
+                        or status.get("training_statis")
+                        or status.get("training_stats")
+                    )
+                    ts_dict = None
+                    if isinstance(ts_obj, dict):
+                        ts_dict = ts_obj
+                    elif ts_obj is not None and hasattr(ts_obj, "get"):
+                        try:
+                            got = ts_obj.get()
+                            if isinstance(got, dict):
+                                ts_dict = got
+                        except Exception:
+                            ts_dict = None
+
+                    if isinstance(ts_dict, dict):
+                        for k, v in ts_dict.items():
+                            fv = _safe_float(v)
+                            if fv is not None:
+                                metrics[str(k)] = fv
+
+                    # 3) Fallback: raw SmoothedValue meters.
+                    if not metrics and ts_obj is not None and hasattr(ts_obj, "meters"):
+                        try:
+                            meters = getattr(ts_obj, "meters", None) or {}
+                            if isinstance(meters, dict):
+                                for k, meter in meters.items():
+                                    for attr in ("avg", "global_avg", "median", "value"):
+                                        if hasattr(meter, attr):
+                                            fv = _safe_float(getattr(meter, attr))
+                                            if fv is not None:
+                                                metrics[str(k)] = fv
+                                                break
+                        except Exception:
+                            pass
+
+                    return metrics
+
+                @staticmethod
+                def _extract_eval_metrics_from_trainer(pp_trainer: Any) -> Dict[str, float]:
+                    """
+                    Read evaluation metrics from ppdet metric objects.
+
+                    For COCO metrics, values are typically:
+                    [mAP(0.50:0.95), AP50, AP75, ...].
+                    """
+                    metrics: Dict[str, float] = {}
+
+                    def _set_metric(key: str, value: Any) -> None:
+                        fv = _safe_float(value)
+                        if fv is not None:
+                            metrics[str(key)] = fv
+
+                    metric_objs = getattr(pp_trainer, "_metrics", None)
+                    if not isinstance(metric_objs, (list, tuple)):
+                        return metrics
+
+                    for metric_obj in metric_objs:
+                        get_results = getattr(metric_obj, "get_results", None)
+                        if not callable(get_results):
+                            continue
+
+                        try:
+                            results = get_results() or {}
+                        except Exception:
+                            continue
+                        if not isinstance(results, dict):
+                            continue
+
+                        for group_key, value in results.items():
+                            group = str(group_key or "metric")
+
+                            # Dict-like result: emit flattened keys.
+                            if isinstance(value, dict):
+                                for k, v in value.items():
+                                    _set_metric(f"eval/{group}_{k}", v)
+                                continue
+
+                            seq: list[Any] | None = None
+                            if isinstance(value, (list, tuple)):
+                                seq = list(value)
+                            elif hasattr(value, "tolist"):
+                                try:
+                                    conv = value.tolist()
+                                except Exception:
+                                    conv = None
+                                if isinstance(conv, (list, tuple)):
+                                    seq = list(conv)
+
+                            # Scalar result fallback.
+                            if seq is None:
+                                _set_metric(f"eval/{group}", value)
+                                continue
+
+                            # Most detector metrics provide first 3 entries as mAP/AP50/AP75.
+                            if len(seq) >= 1:
+                                _set_metric(f"eval/{group}_mAP", seq[0])
+                                if group == "bbox":
+                                    _set_metric("mAP", seq[0])
+                                    _set_metric("metrics/mAP50-95(B)", seq[0])
+                            if len(seq) >= 2:
+                                _set_metric(f"eval/{group}_AP50", seq[1])
+                                if group == "bbox":
+                                    _set_metric("AP50", seq[1])
+                                    _set_metric("mAP50", seq[1])
+                                    _set_metric("metrics/mAP50(B)", seq[1])
+                            if len(seq) >= 3:
+                                _set_metric(f"eval/{group}_AP75", seq[2])
+                                if group == "bbox":
+                                    _set_metric("AP75", seq[2])
+
+                    return metrics
 
                 def on_epoch_end(self, status: dict) -> None:
                     epoch = int(status.get("epoch_id", 0))
-                    metrics: Dict[str, float] = {}
-
-                    # Extract available metrics from PaddleDetection's status dict
-                    for key in ("loss", "loss_cls", "loss_iou", "loss_dfl", "loss_obj",
-                                "lr", "mAP", "AP50", "AP75"):
-                        val = status.get(key)
-                        if val is not None:
-                            fv = _safe_float(val)
-                            if fv is not None:
-                                metrics[key] = fv
-
-                    # Also try to get from training_statis
-                    training_statis = status.get("training_statis", {})
-                    if isinstance(training_statis, dict):
-                        for k, v in training_statis.items():
-                            fv = _safe_float(v)
-                            if fv is not None and k not in metrics:
-                                metrics[k] = fv
-
-                    ctx.upsert_epoch_metrics(epoch, metrics)
+                    mode = str(status.get("mode", "") or "").lower()
+                    metrics = self._extract_metrics(status)
+                    if mode == "eval":
+                        metrics.update(self._extract_eval_metrics_from_trainer(self._trainer))
+                    metrics = _apply_metric_aliases(metrics)
+                    # Avoid overwriting existing epoch metrics with an empty payload.
+                    if metrics:
+                        ctx.upsert_epoch_metrics(epoch, metrics)
 
                     if _check_cancel():
                         raise SystemExit(0)
 
                 def on_step_end(self, status: dict) -> None:
+                    # Report once per epoch as soon as step 0 logs become available.
+                    mode = str(status.get("mode", "") or "").lower()
+                    epoch = int(status.get("epoch_id", 0))
+                    step = int(status.get("step_id", -1))
+                    if mode == "train" and step == 0:
+                        metrics = _apply_metric_aliases(self._extract_metrics(status))
+                        if metrics:
+                            ctx.upsert_epoch_metrics(epoch, metrics)
                     if _check_cancel():
                         raise SystemExit(0)
 
-            cancel_cb = _MetricsAndCancelCallback()
+            cancel_cb = _MetricsAndCancelCallback(trainer)
 
-            # Inject callback into Trainer's callback list.
-            # PaddleDetection Trainer stores callbacks in _callbacks list,
-            # and _compose_callback holds a reference to the same list.
+            # Inject callback into both callback containers.
+            # ComposeCallback copies the callback list at construction time,
+            # so appending only to trainer._callbacks is not enough.
+            injected = False
             if hasattr(trainer, "_callbacks") and isinstance(trainer._callbacks, list):
                 trainer._callbacks.append(cancel_cb)
-            elif hasattr(trainer, "_compose_callback") and hasattr(trainer._compose_callback, "_callbacks"):
-                trainer._compose_callback._callbacks.append(cancel_cb)
+                injected = True
+            if hasattr(trainer, "_compose_callback") and hasattr(trainer._compose_callback, "_callbacks"):
+                cb_list = getattr(trainer._compose_callback, "_callbacks")
+                if isinstance(cb_list, list):
+                    cb_list.append(cancel_cb)
+                    injected = True
+            if not injected:
+                raise RuntimeError("Paddle callback container not found")
         except Exception:
             # If callback injection fails, training still proceeds
             # but without epoch metrics and cancel support
             pass
 
         # ---- Train ----
-        trainer.train()
+        trainer.train(validate=bool(eval_during_train))
 
         # ---- Evaluate (best-effort) ----
         try:

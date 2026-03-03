@@ -37,3 +37,15 @@ python -m train_platform.workers.worker
 - `MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_DATABASE`
 - `TRAIN_PLATFORM_HOME`：数据根目录（默认：仓库 `backend_v2/`）
 - `BASE_DATASETS_DIR` / `BASE_TRAINING_DIR` / `BASE_TEMP_DIR`：覆盖默认路径
+
+### Paddle local development
+
+If you are developing Paddle training locally (without Docker), see:
+
+- `docs/paddle_local_dev.md`
+
+Recommended worker entrypoint for Paddle jobs:
+
+```bash
+python -m train_platform.workers.paddle_worker
+```

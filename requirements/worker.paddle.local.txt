@@ -1,0 +1,17 @@
+-r worker.common.txt
+
+# Local (non-Docker) helpers for Paddle worker development.
+# Install one Paddle runtime manually (CPU or GPU):
+#   pip install paddlepaddle==2.6.2
+#   pip install paddlepaddle-gpu==2.6.2
+#
+# Install PaddleDetection manually to avoid opencv dependency conflicts:
+#   pip install --no-deps paddledet==2.6.0
+
+pycocotools
+typeguard
+visualdl>=2.2.0
+lap
+terminaltables
+Cython
+protobuf<=3.20.3

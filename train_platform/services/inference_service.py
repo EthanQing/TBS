@@ -158,8 +158,15 @@ class InferenceService:
         return out_path, token
 
     def _run_ultralytics_yolo(self, weights_path: Path, image_path: Path, *, conf: float, iou: float) -> Dict[str, Any]:
-        worker_url = os.getenv("INFERENCE_WORKER_URL", "http://inference-worker:18002").rstrip("/")
+        worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
         timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "120"))
+        fallback_local = str(os.getenv("INFERENCE_FALLBACK_LOCAL", "1")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        )
         payload = {
             "weights_path": str(weights_path),
             "image_path": str(image_path),
@@ -167,25 +174,42 @@ class InferenceService:
             "iou": float(iou),
         }
 
+        worker_error: str | None = None
         try:
             resp = requests.post(f"{worker_url}/internal/inference/yolo", json=payload, timeout=timeout)
-        except Exception as e:
-            raise RuntimeError(f"Inference worker request failed: {e}") from e
+            if resp.status_code != 200:
+                raise RuntimeError(f"Inference worker error {resp.status_code}: {resp.text}")
 
-        if resp.status_code != 200:
-            raise RuntimeError(f"Inference worker error {resp.status_code}: {resp.text}")
+            try:
+                data = resp.json()
+            except Exception as e:
+                raise RuntimeError(f"Inference worker returned non-JSON response: {e}") from e
+
+            err = data.get("error")
+            if err:
+                raise RuntimeError(str(err))
+
+            output = data.get("output")
+            if output is None:
+                raise RuntimeError("Inference worker response missing output")
+
+            return output
+        except Exception as e:
+            worker_error = f"{type(e).__name__}: {e}"
+
+        if not fallback_local:
+            raise RuntimeError(worker_error or "Inference worker request failed")
 
         try:
-            data = resp.json()
+            from train_platform.workers.inference_worker import _run_ultralytics_yolo as _local_infer
+
+            return _local_infer(weights_path, image_path, conf=float(conf), iou=float(iou))
         except Exception as e:
-            raise RuntimeError(f"Inference worker returned non-JSON response: {e}") from e
+            fallback_error = f"{type(e).__name__}: {e}"
+            if worker_error:
+                raise RuntimeError(
+                    f"Inference worker failed ({worker_error}); local fallback failed ({fallback_error})"
+                ) from e
+            raise RuntimeError(f"Local inference fallback failed: {fallback_error}") from e
 
-        err = data.get("error")
-        if err:
-            raise RuntimeError(err)
-
-        output = data.get("output")
-        if output is None:
-            raise RuntimeError("Inference worker response missing output")
-
-        return output
+        raise RuntimeError(worker_error or "Inference failed")

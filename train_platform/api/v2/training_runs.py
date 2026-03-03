@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi import WebSocket, WebSocketDisconnect
 import requests
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
@@ -47,7 +48,7 @@ def _export_onnx_via_worker(
     opset: int | None,
     imgsz: int | None,
 ) -> None:
-    worker_url = os.getenv("INFERENCE_WORKER_URL", "http://inference-worker:18002").rstrip("/")
+    worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
     timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "1200"))
     payload = {
         "src_pt": str(src_pt),
@@ -177,7 +178,10 @@ def list_training_run_epoch_metrics(
     source_norm = str(source or "auto").strip().lower()
     if source_norm in ("auto", "mlflow"):
         rows = fetch_mlflow_epoch_metrics(db, run_id, limit=int(limit))
-        if rows is not None:
+        if source_norm == "mlflow":
+            return rows or []
+        # auto: fallback to DB when MLflow has no usable points yet
+        if rows:
             return rows
     return TrainingRunService().list_epoch_metrics(db, run_id, limit=limit)
 
@@ -495,11 +499,22 @@ async def stream_training_run_metrics(websocket: WebSocket, run_id: str):
     """
     await websocket.accept()
 
-    last_metric_id = 0
-    last_event_id = 0
+    def _parse_cursor(raw: str | None) -> int:
+        if raw is None:
+            return 0
+        try:
+            return max(int(raw), 0)
+        except Exception:
+            return 0
+
+    last_metric_id = _parse_cursor(websocket.query_params.get("from_metric_id"))
+    last_event_id = _parse_cursor(websocket.query_params.get("from_event_id"))
     last_status = None
     last_progress = None
     last_epoch = None
+    cursor_sent = False
+    loop = asyncio.get_running_loop()
+    next_ping_at = loop.time() + 15.0
 
     try:
         while True:
@@ -509,6 +524,32 @@ async def stream_training_run_metrics(websocket: WebSocket, run_id: str):
                     await websocket.send_json({"type": "error", "data": {"message": "run not found"}})
                     await websocket.close(code=1008)
                     return
+
+                if not cursor_sent:
+                    latest_metric_id = (
+                        db.query(func.max(TrainingRunEpochMetric.metric_id))
+                        .filter(TrainingRunEpochMetric.run_id == str(run_id))
+                        .scalar()
+                        or 0
+                    )
+                    latest_event_id = (
+                        db.query(func.max(TrainingRunEvent.event_id))
+                        .filter(TrainingRunEvent.run_id == str(run_id))
+                        .scalar()
+                        or 0
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "cursor",
+                            "data": {
+                                "last_metric_id": int(last_metric_id),
+                                "last_event_id": int(last_event_id),
+                                "latest_metric_id": int(latest_metric_id),
+                                "latest_event_id": int(latest_event_id),
+                            },
+                        }
+                    )
+                    cursor_sent = True
 
                 # Push status/progress changes.
                 if (
@@ -547,6 +588,7 @@ async def stream_training_run_metrics(websocket: WebSocket, run_id: str):
                         {
                             "type": "metric",
                             "data": {
+                                "metric_id": int(m.metric_id),
                                 "epoch": int(m.epoch),
                                 "metrics": m.metrics,
                                 "progress": int(getattr(run, "progress", 0) or 0),
@@ -600,6 +642,7 @@ async def stream_training_run_metrics(websocket: WebSocket, run_id: str):
                             {
                                 "type": "metric",
                                 "data": {
+                                    "metric_id": int(m.metric_id),
                                     "epoch": int(m.epoch),
                                     "metrics": m.metrics,
                                     "progress": int(getattr(run, "progress", 0) or 0),
@@ -634,6 +677,19 @@ async def stream_training_run_metrics(websocket: WebSocket, run_id: str):
                     await asyncio.sleep(0.5)
                     await websocket.close()
                     return
+
+            now = loop.time()
+            if now >= next_ping_at:
+                await websocket.send_json(
+                    {
+                        "type": "ping",
+                        "data": {
+                            "last_metric_id": int(last_metric_id),
+                            "last_event_id": int(last_event_id),
+                        },
+                    }
+                )
+                next_ping_at = now + 15.0
 
             await asyncio.sleep(1.0)
     except WebSocketDisconnect:
