@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -32,3 +32,50 @@ class InferenceRunOut(BaseModel):
 class InferenceUploadOut(BaseModel):
     token: str
     path: str
+
+
+# --- Batch Inference ---
+
+class BatchInferenceCreate(BaseModel):
+    model_version_id: int
+    input_tokens: List[str] = Field(..., min_length=1, description="已上传文件的 token 列表")
+    conf: float = Field(0.5, gt=0, le=1)
+    iou: float = Field(0.45, gt=0, le=1)
+
+
+class BatchInferenceResultItem(BaseModel):
+    filename: str = ""
+    token: str = ""
+    output: Optional[Dict[str, Any]] = None
+    error_message: Optional[str] = None
+    inference_time_ms: float = 0
+
+
+class BatchInferenceOut(BaseModel):
+    results: List[BatchInferenceResultItem]
+    total: int
+    success_count: int
+    total_time_ms: float
+
+
+# --- Video Inference ---
+
+class VideoInferenceCreate(BaseModel):
+    model_version_id: int
+    video_token: str = Field(..., min_length=1)
+    conf: float = Field(0.5, gt=0, le=1)
+    iou: float = Field(0.45, gt=0, le=1)
+    frame_interval: int = Field(1, ge=1, description="每隔 N 帧取一帧推理")
+
+
+class VideoFrameResult(BaseModel):
+    frame_index: int
+    output: Optional[Dict[str, Any]] = None
+    error_message: Optional[str] = None
+
+
+class VideoInferenceOut(BaseModel):
+    results: List[VideoFrameResult]
+    total_frames: int
+    processed_frames: int
+    total_time_ms: float

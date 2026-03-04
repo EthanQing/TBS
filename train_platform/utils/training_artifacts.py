@@ -24,6 +24,10 @@ def index_completion_artifacts(db: Session, run_id: str) -> None:
         ("weights", "last.pt", run_dir / "weights" / "last.pt"),
         ("weights", "best.pth", run_dir / "weights" / "best.pth"),
         ("weights", "last.pth", run_dir / "weights" / "last.pth"),
+        ("weights", "best.pdparams", run_dir / "weights" / "best.pdparams"),
+        ("weights", "last.pdparams", run_dir / "weights" / "last.pdparams"),
+        ("weights", "best.pdopt", run_dir / "weights" / "best.pdopt"),
+        ("weights", "last.pdopt", run_dir / "weights" / "last.pdopt"),
         # Common export outputs (generated on-demand via /training-runs/{id}/export)
         ("export", "best.onnx", run_dir / "weights" / "best.onnx"),
         ("export", "last.onnx", run_dir / "weights" / "last.onnx"),
@@ -84,9 +88,27 @@ def index_completion_artifacts(db: Session, run_id: str) -> None:
     last_pt = run_dir / "weights" / "last.pt"
     best_pth = run_dir / "weights" / "best.pth"
     last_pth = run_dir / "weights" / "last.pth"
+    best_pd = run_dir / "weights" / "best.pdparams"
+    last_pd = run_dir / "weights" / "last.pdparams"
 
-    best = best_pt if best_pt.exists() else best_pth if best_pth.exists() else None
-    last = last_pt if last_pt.exists() else last_pth if last_pth.exists() else None
+    best = (
+        best_pt
+        if best_pt.exists()
+        else best_pth
+        if best_pth.exists()
+        else best_pd
+        if best_pd.exists()
+        else None
+    )
+    last = (
+        last_pt
+        if last_pt.exists()
+        else last_pth
+        if last_pth.exists()
+        else last_pd
+        if last_pd.exists()
+        else None
+    )
 
     res.best_weights_path = best.relative_to(base).as_posix() if best else None
     res.last_weights_path = last.relative_to(base).as_posix() if last else None

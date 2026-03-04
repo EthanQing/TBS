@@ -1,7 +1,6 @@
 # Build-only dependencies for Cython compilation inside Docker build stages.
 #
-# Keep this file minimal; runtime images should install only backend.txt / worker.txt.
+# Keep this file minimal; runtime images should install only backend.txt / worker.yolo.txt / worker.paddle.txt.
 setuptools>=65
 wheel
 cython>=3.0
-

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import uuid
 import os
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -9,9 +10,11 @@ import requests
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.models.architecture import ModelArchitecture
 from train_platform.models.deployment import Deployment
 from train_platform.models.inference import InferenceRun
 from train_platform.models.model_registry import ModelVersion
+from train_platform.models.training_run import TrainingRun
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 from train_platform.utils.path_utils import resolve_temp_path, resolve_training_path
 
@@ -42,6 +45,95 @@ class InferenceService:
         db.refresh(row)
         return row
 
+    def resolve_model_context(self, db: Session, *, model_version_id: int) -> Dict[str, Any]:
+        mv = db.query(ModelVersion).filter(ModelVersion.model_version_id == int(model_version_id)).first()
+        if not mv:
+            raise NotFoundError("Model version not found")
+
+        weights = str(mv.weights_path or "").strip()
+        if not weights:
+            raise ValidationError("Model version has no weights_path; register from a completed training run first")
+
+        weights_path = resolve_training_path(weights)
+        if not weights_path.exists() or not weights_path.is_file():
+            raise NotFoundError(f"Weights file not found: {weights_path}")
+
+        run = None
+        if mv.run_id:
+            run = db.query(TrainingRun).filter(TrainingRun.run_id == str(mv.run_id)).first()
+
+        arch = None
+        if run:
+            arch = db.query(ModelArchitecture).filter(ModelArchitecture.architecture_id == int(run.architecture_id)).first()
+
+        engine = str(getattr(arch, "engine", "") or "ultralytics-yolo").strip().lower()
+        family = str(getattr(arch, "family", "") or "").strip() or None
+        variant = str(getattr(arch, "variant", "") or "").strip() or None
+
+        config_path = None
+        if engine == "paddle-det":
+            config_path = self._resolve_paddle_config_path(arch)
+            if not config_path:
+                raise ValidationError("Paddle model missing valid config_path in architecture.default_params")
+
+        return {
+            "model_version_id": int(mv.model_version_id),
+            "run_id": str(mv.run_id or ""),
+            "project_id": int(mv.project_id),
+            "engine": engine,
+            "family": family,
+            "variant": variant,
+            "weights_path": str(weights_path),
+            "config_path": str(config_path) if config_path else None,
+        }
+
+    def run_inference_output(
+        self,
+        db: Session,
+        *,
+        model_version_id: int,
+        input_path: Optional[str] = None,
+        image_url: Optional[str] = None,
+        conf: float = 0.5,
+        iou: float = 0.45,
+    ) -> Dict[str, Any]:
+        if not input_path and not image_url:
+            raise ValidationError("Either input_path or image_url is required")
+        if input_path and image_url:
+            raise ValidationError("Provide only one of input_path and image_url")
+
+        local_path, stored_token, derived_meta = self._materialize_input(input_path=input_path, image_url=image_url)
+        ctx = self.resolve_model_context(db, model_version_id=int(model_version_id))
+
+        t0 = time.perf_counter()
+        output = None
+        err_msg = None
+        try:
+            output = self._run_by_engine(
+                engine=str(ctx.get("engine") or "ultralytics-yolo"),
+                weights_path=Path(str(ctx["weights_path"])),
+                image_path=local_path,
+                conf=float(conf),
+                iou=float(iou),
+                config_path=Path(str(ctx["config_path"])) if ctx.get("config_path") else None,
+            )
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}"
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
+        return {
+            "model_version_id": int(model_version_id),
+            "input_path": stored_token,
+            "input_meta": {**(derived_meta or {}), "conf": float(conf), "iou": float(iou)},
+            "output": output,
+            "error_message": err_msg,
+            "inference_time_ms": elapsed_ms,
+            "engine": ctx.get("engine"),
+            "family": ctx.get("family"),
+            "variant": ctx.get("variant"),
+            "run_id": ctx.get("run_id"),
+        }
+
     def run_inference(
         self,
         db: Session,
@@ -65,43 +157,51 @@ class InferenceService:
             if not dep:
                 raise NotFoundError("Deployment not found")
 
-        if not input_path and not image_url:
-            raise ValidationError("Either input_path or image_url is required")
-        if input_path and image_url:
-            raise ValidationError("Provide only one of input_path and image_url")
-
-        local_path, stored_token, derived_meta = self._materialize_input(input_path=input_path, image_url=image_url)
-
-        weights = mv.weights_path
-        if not weights:
-            raise ValidationError("Model version has no weights_path; register from a completed training run first")
-
-        weights_path = resolve_training_path(weights)
-        if not weights_path.exists():
-            raise NotFoundError(f"Weights file not found: {weights_path}")
+        result = self.run_inference_output(
+            db,
+            model_version_id=int(model_version_id),
+            input_path=input_path,
+            image_url=image_url,
+            conf=float(conf),
+            iou=float(iou),
+        )
 
         row = InferenceRun(
             model_version_id=int(mv.model_version_id),
             deployment_id=dep_id,
-            input_path=stored_token,
-            input_meta={**(input_meta or {}), **(derived_meta or {}), "conf": float(conf), "iou": float(iou)},
-            output=None,
-            error_message=None,
+            input_path=str(result.get("input_path") or ""),
+            input_meta={**(input_meta or {}), **(result.get("input_meta") or {})},
+            output=result.get("output"),
+            error_message=result.get("error_message"),
         )
         db.add(row)
-        db.flush()
-
-        try:
-            output = self._run_ultralytics_yolo(weights_path, local_path, conf=float(conf), iou=float(iou))
-            row.output = output
-            row.error_message = None
-        except Exception as e:
-            row.output = None
-            row.error_message = f"{type(e).__name__}: {e}"
-
         db.commit()
         db.refresh(row)
         return row
+
+    def _resolve_paddle_config_path(self, arch: ModelArchitecture | None) -> Optional[Path]:
+        if not arch:
+            return None
+        params = arch.default_params if isinstance(arch.default_params, dict) else {}
+        raw = params.get("config_path")
+        if raw is None:
+            return None
+        txt = str(raw).strip().replace("\\", "/")
+        if not txt:
+            return None
+
+        p = Path(txt)
+        if p.is_absolute() and p.exists():
+            return p.resolve(strict=False)
+
+        candidates = [
+            (settings.paddle_det_dir / txt).resolve(strict=False),
+            (settings.home_dir / txt).resolve(strict=False),
+        ]
+        for c in candidates:
+            if c.exists() and c.is_file():
+                return c
+        return None
 
     def _materialize_input(self, *, input_path: Optional[str], image_url: Optional[str]) -> tuple[Path, str, Dict[str, Any]]:
         meta: Dict[str, Any] = {}
@@ -121,13 +221,11 @@ class InferenceService:
             meta["image_url"] = raw
             return local_path, token, meta
 
-        # If client passes a /static/temp/... URL or a relative token, resolve to BASE_TEMP_DIR.
         p = resolve_temp_path(raw)
         if p.exists() and p.is_file():
             token = p.relative_to(settings.temp_dir.resolve()).as_posix() if settings.temp_dir.resolve() in p.parents else str(p)
             return p, token, meta
 
-        # As a fallback, accept absolute file paths on the server.
         p2 = Path(raw)
         if p2.is_absolute() and p2.exists() and p2.is_file():
             return p2, str(p2), meta
@@ -156,6 +254,21 @@ class InferenceService:
 
         token = out_path.relative_to(settings.temp_dir.resolve()).as_posix()
         return out_path, token
+
+    def _run_by_engine(
+        self,
+        *,
+        engine: str,
+        weights_path: Path,
+        image_path: Path,
+        conf: float,
+        iou: float,
+        config_path: Path | None = None,
+    ) -> Dict[str, Any]:
+        e = str(engine or "").strip().lower()
+        if e == "paddle-det":
+            return self._run_paddle_det(weights_path, image_path, config_path=config_path, conf=conf, iou=iou)
+        return self._run_ultralytics_yolo(weights_path, image_path, conf=conf, iou=iou)
 
     def _run_ultralytics_yolo(self, weights_path: Path, image_path: Path, *, conf: float, iou: float) -> Dict[str, Any]:
         worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
@@ -212,4 +325,67 @@ class InferenceService:
                 ) from e
             raise RuntimeError(f"Local inference fallback failed: {fallback_error}") from e
 
-        raise RuntimeError(worker_error or "Inference failed")
+    def _run_paddle_det(
+        self,
+        weights_path: Path,
+        image_path: Path,
+        *,
+        config_path: Path | None,
+        conf: float,
+        iou: float,
+    ) -> Dict[str, Any]:
+        if config_path is None:
+            raise ValidationError("Paddle inference requires config_path")
+        if not config_path.exists():
+            raise NotFoundError(f"Paddle config not found: {config_path}")
+
+        worker_url = os.getenv("PADDLE_INFERENCE_WORKER_URL", "http://127.0.0.1:18003").rstrip("/")
+        timeout = float(os.getenv("PADDLE_INFERENCE_WORKER_TIMEOUT", "240"))
+        fallback_local = str(os.getenv("INFERENCE_FALLBACK_LOCAL", "1")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        payload = {
+            "config_path": str(config_path),
+            "weights_path": str(weights_path),
+            "image_path": str(image_path),
+            "conf": float(conf),
+            "iou": float(iou),
+        }
+
+        worker_error: str | None = None
+        try:
+            resp = requests.post(f"{worker_url}/internal/inference/paddle-det", json=payload, timeout=timeout)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Paddle inference worker error {resp.status_code}: {resp.text}")
+            try:
+                data = resp.json()
+            except Exception as e:
+                raise RuntimeError(f"Paddle inference worker returned non-JSON response: {e}") from e
+            err = data.get("error")
+            if err:
+                raise RuntimeError(str(err))
+            output = data.get("output")
+            if output is None:
+                raise RuntimeError("Paddle inference worker response missing output")
+            return output
+        except Exception as e:
+            worker_error = f"{type(e).__name__}: {e}"
+
+        if not fallback_local:
+            raise RuntimeError(worker_error or "Paddle inference worker request failed")
+
+        try:
+            from train_platform.workers.paddle_inference_worker import _run_paddle_det as _local_paddle_infer
+
+            return _local_paddle_infer(config_path, weights_path, image_path, conf=float(conf), iou=float(iou))
+        except Exception as e:
+            fallback_error = f"{type(e).__name__}: {e}"
+            if worker_error:
+                raise RuntimeError(
+                    f"Paddle worker failed ({worker_error}); local fallback failed ({fallback_error})"
+                ) from e
+            raise RuntimeError(f"Local paddle inference fallback failed: {fallback_error}") from e

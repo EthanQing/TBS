@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -21,6 +22,7 @@ class InferenceRequest(BaseModel):
 class InferenceResponse(BaseModel):
     output: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    inference_time_ms: Optional[float] = None
 
 
 class ModelConversionRequest(BaseModel):
@@ -109,12 +111,13 @@ def run_inference(req: InferenceRequest) -> InferenceResponse:
     if not image_path.exists() or not image_path.is_file():
         raise HTTPException(status_code=404, detail=f"Image not found: {image_path}")
 
+    t0 = time.perf_counter()
     try:
         output = _run_ultralytics_yolo(weights_path, image_path, conf=req.conf, iou=req.iou)
     except Exception as e:
         return InferenceResponse(error=f"{type(e).__name__}: {e}")
-
-    return InferenceResponse(output=output)
+    dt_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    return InferenceResponse(output=output, inference_time_ms=dt_ms)
 
 
 @app.post("/internal/model-conversions/pt-to-onnx", response_model=WorkerStatusResponse)
