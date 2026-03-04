@@ -32,6 +32,8 @@ class Deployment(Base):
     endpoint_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     health_check_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    api_key_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    api_key_hint: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
 
@@ -41,6 +43,7 @@ class Deployment(Base):
 
     model_version = relationship("ModelVersion", back_populates="deployments")
     logs = relationship("DeploymentLog", back_populates="deployment", cascade="all, delete-orphan")
+    runs = relationship("DeploymentRun", back_populates="deployment", cascade="all, delete-orphan")
 
 
 class DeploymentLog(Base):
@@ -60,4 +63,3 @@ class DeploymentLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
     deployment = relationship("Deployment", back_populates="logs")
-

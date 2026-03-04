@@ -55,6 +55,28 @@ class DeploymentStatus(str, enum.Enum):
     DELETING = "deleting"
 
 
+class DeploymentTriggerType(str, enum.Enum):
+    MANUAL = "manual"
+
+
+class DeploymentRunStatus(str, enum.Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class DeploymentRunPhase(str, enum.Enum):
+    PREPARING = "preparing"
+    VALIDATE_ARTIFACTS = "validate_artifacts"
+    MATERIALIZE_RUNTIME = "materialize_runtime"
+    SMOKE_TEST = "smoke_test"
+    ACTIVATE = "activate"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
 class ModelStage(str, enum.Enum):
     DEVELOPMENT = "development"
     TESTING = "testing"
