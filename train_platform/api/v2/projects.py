@@ -9,7 +9,15 @@ from train_platform.models.enums import TrainingRunStatus
 from train_platform.models.project import Project
 from train_platform.models.training_run import TrainingRun, TrainingRunResult
 from train_platform.schemas.v2.common import DeleteResponse, Page, PageMeta
-from train_platform.schemas.v2.projects import ProjectCreate, ProjectModelSizeOut, ProjectOut, ProjectUpdate
+from train_platform.schemas.v2.projects import (
+    ProjectCompareBaselineOut,
+    ProjectCompareBaselineSetIn,
+    ProjectCreate,
+    ProjectModelSizeOut,
+    ProjectOut,
+    ProjectUpdate,
+)
+from train_platform.utils.exceptions import ValidationError
 from train_platform.services.project_service import ProjectService
 
 
@@ -103,6 +111,37 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
 @router.get("/{project_id}", response_model=ProjectOut)
 def get_project(project_id: int, db: Session = Depends(get_db)):
     return ProjectService().get_project(db, project_id)
+
+
+@router.get("/{project_id}/compare-baseline", response_model=ProjectCompareBaselineOut)
+def get_project_compare_baseline(
+    project_id: int,
+    framework_key: str = Query(..., description="pytorch|paddle|engine:<name>"),
+    db: Session = Depends(get_db),
+):
+    return ProjectService().get_compare_baseline(db, int(project_id), str(framework_key))
+
+
+@router.put("/{project_id}/compare-baseline", response_model=ProjectCompareBaselineOut)
+def set_project_compare_baseline(project_id: int, payload: ProjectCompareBaselineSetIn, db: Session = Depends(get_db)):
+    run_id = str(payload.baseline_run_id or "").strip()
+    if not run_id:
+        raise ValidationError("baseline_run_id is required")
+    return ProjectService().set_compare_baseline(
+        db,
+        int(project_id),
+        str(payload.framework_key),
+        run_id,
+    )
+
+
+@router.delete("/{project_id}/compare-baseline", response_model=ProjectCompareBaselineOut)
+def clear_project_compare_baseline(
+    project_id: int,
+    framework_key: str = Query(..., description="pytorch|paddle|engine:<name>"),
+    db: Session = Depends(get_db),
+):
+    return ProjectService().clear_compare_baseline(db, int(project_id), str(framework_key))
 
 
 @router.get("/{project_id}/model-size", response_model=ProjectModelSizeOut)

@@ -162,10 +162,16 @@ class TrainingRunCompareItem(BaseModel):
     dataset_version_id: int
     architecture_id: int
     created_at: datetime
+    engine: Optional[str] = None
+    framework_key: Optional[str] = None
+    framework_label: Optional[str] = None
+    family: Optional[str] = None
+    variant: Optional[str] = None
     parameters: Dict[str, Any]
     best_metrics: Optional[Dict[str, Any]] = None
     final_metrics: Optional[Dict[str, Any]] = None
     model_size_mb: Optional[float] = None
+    inference_time_ms: Optional[float] = None
 
 
 class TrainingRunCompareResponse(BaseModel):

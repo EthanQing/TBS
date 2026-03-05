@@ -11,7 +11,7 @@ import threading
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Any, Optional, List, Dict, Tuple
 
 import yaml
 from fastapi.concurrency import run_in_threadpool
@@ -790,6 +790,76 @@ class DatasetService:
         db.commit()
         return ds
 
+    @staticmethod
+    def _empty_conversion_progress() -> dict:
+        return {
+            "overall": {
+                "processed_images": 0,
+                "total_images": 0,
+                "current_image_index": 0,
+                "current_image_name": "",
+                "percent": 0,
+            },
+            "image": {
+                "phase": "scanning",
+                "processed_slices": 0,
+                "total_slices": 0,
+                "percent": 0,
+            },
+        }
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    def _build_conversion_progress(self, event: dict | None) -> tuple[dict, str, str]:
+        payload = dict(event or {})
+        phase = str(payload.get("phase") or "scanning").strip().lower() or "scanning"
+        message = str(payload.get("message") or "").strip()
+
+        overall_total = max(0, self._safe_int(payload.get("overall_total_images"), 0))
+        overall_processed = max(0, self._safe_int(payload.get("overall_processed_images"), 0))
+        if overall_total > 0:
+            overall_processed = min(overall_processed, overall_total)
+            overall_percent = int(round((overall_processed / overall_total) * 100))
+        else:
+            overall_percent = 0
+
+        current_image_index = max(0, self._safe_int(payload.get("current_image_index"), 0))
+        current_image_name = str(payload.get("current_image_name") or "").strip()
+
+        image_total = max(0, self._safe_int(payload.get("current_slice_total"), 0))
+        image_processed = max(0, self._safe_int(payload.get("current_slice_processed"), 0))
+        if image_total > 0:
+            image_processed = min(image_processed, image_total)
+            image_percent = int(round((image_processed / image_total) * 100))
+        else:
+            image_percent = 0
+
+        progress = {
+            "overall": {
+                "processed_images": int(overall_processed),
+                "total_images": int(overall_total),
+                "current_image_index": int(current_image_index),
+                "current_image_name": current_image_name,
+                "percent": int(max(0, min(100, overall_percent))),
+            },
+            "image": {
+                "phase": phase,
+                "processed_slices": int(image_processed),
+                "total_slices": int(image_total),
+                "percent": int(max(0, min(100, image_percent))),
+            },
+        }
+        signature = (
+            f"{phase}|{overall_processed}|{overall_total}|{current_image_index}|{current_image_name}|"
+            f"{image_processed}|{image_total}|{message}"
+        )
+        return progress, signature, message
+
     def convert_illegal_dataset(
         self,
         db: Session,
@@ -868,8 +938,14 @@ class DatasetService:
                 "label_strategy": strategy,
                 "label_level": level,
                 "label_separator": label_separator or "%",
+                "seq": 0,
+                "updated_at": _utcnow().isoformat(),
+                "phase": "scanning",
+                "progress": self._empty_conversion_progress(),
             }
         )
+        conv.pop("error_message", None)
+        conv.pop("output_version_id", None)
         conv["split"] = {
             "enabled": bool(split_enabled),
             "train_ratio": float(split_train_ratio) if split_train_ratio is not None else None,
@@ -935,10 +1011,8 @@ class DatasetService:
         label_level: Optional[int],
         label_separator: str,
     ) -> None:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(f"[Conversion] Starting illegal conversion job {job_id} for dataset {dataset_id}")
-        
+
         db = SessionLocal()
         try:
             ds = self.get_dataset(db, dataset_id)
@@ -952,12 +1026,69 @@ class DatasetService:
 
             meta = ver.meta if isinstance(ver.meta, dict) else {}
             conv = dict(meta.get("conversion") or {})
-            conv.update({"status": "running", "job_id": job_id})
+            conv.update(
+                {
+                    "status": "running",
+                    "job_id": job_id,
+                    "phase": "scanning",
+                    "updated_at": _utcnow().isoformat(),
+                }
+            )
+            conv["progress"] = conv.get("progress") if isinstance(conv.get("progress"), dict) else self._empty_conversion_progress()
+            conv["seq"] = self._safe_int(conv.get("seq"), 0)
+            conv.pop("error_message", None)
             meta["conversion"] = conv
             ver.meta = meta
             db.commit()
-            
-            logger.info(f"[Conversion] Job {job_id} status set to 'running'")
+
+            last_progress_commit_ts = 0.0
+            last_progress_signature = ""
+            last_phase = str(conv.get("phase") or "").strip().lower()
+
+            def _persist_progress_event(event: dict, *, force: bool = False) -> None:
+                nonlocal last_progress_commit_ts, last_progress_signature, last_phase, conv, meta
+
+                progress, signature, message = self._build_conversion_progress(event)
+                phase = str(progress.get("image", {}).get("phase") or "scanning").strip().lower()
+                image_info = progress.get("image") or {}
+                slice_processed = self._safe_int(image_info.get("processed_slices"), 0)
+                slice_total = self._safe_int(image_info.get("total_slices"), 0)
+
+                phase_changed = phase != last_phase
+                first_progress = self._safe_int(conv.get("seq"), 0) <= 0
+                stage_boundary = slice_total > 0 and slice_processed in (0, slice_total)
+                should_force = bool(force or first_progress or phase_changed or stage_boundary)
+
+                if signature == last_progress_signature and not should_force:
+                    return
+
+                now_ts = time.monotonic()
+                if not should_force and (now_ts - last_progress_commit_ts) < 0.5:
+                    return
+
+                conv["progress"] = progress
+                conv["phase"] = phase
+                conv["updated_at"] = _utcnow().isoformat()
+                conv["seq"] = self._safe_int(conv.get("seq"), 0) + 1
+                if message:
+                    conv["message"] = message
+                meta["conversion"] = conv
+                ver.meta = meta
+                db.commit()
+
+                last_progress_signature = signature
+                last_progress_commit_ts = now_ts
+                last_phase = phase
+
+            def _on_progress(event: dict) -> None:
+                try:
+                    _persist_progress_event(event, force=False)
+                except Exception as progress_err:
+                    logger.warning(
+                        "[Conversion] Failed to persist progress for job %s: %s",
+                        job_id,
+                        progress_err,
+                    )
 
             try:
                 db.add(
@@ -988,6 +1119,7 @@ class DatasetService:
                 label_separator=label_separator,
                 label_mapping=label_mapping,
                 slice_config=slice_config,
+                progress_cb=_on_progress,
             )
 
             ds.format = "yolo"
@@ -1042,7 +1174,42 @@ class DatasetService:
                 except Exception:
                     db.rollback()
 
-            conv.update({"status": "completed", "output_version_id": int(new_ver.version_id)})
+            overall = dict((conv.get("progress") or {}).get("overall") or {})
+            image = dict((conv.get("progress") or {}).get("image") or {})
+            overall_total = max(0, self._safe_int(overall.get("total_images"), 0))
+            if overall_total > 0:
+                overall["processed_images"] = overall_total
+                overall["percent"] = 100
+            image_total = max(0, self._safe_int(image.get("total_slices"), 0))
+            if image_total > 0:
+                image["processed_slices"] = image_total
+                image["percent"] = 100
+            image["phase"] = "done"
+            conv["progress"] = {
+                "overall": {
+                    "processed_images": max(0, self._safe_int(overall.get("processed_images"), 0)),
+                    "total_images": overall_total,
+                    "current_image_index": max(0, self._safe_int(overall.get("current_image_index"), 0)),
+                    "current_image_name": str(overall.get("current_image_name") or ""),
+                    "percent": max(0, min(100, self._safe_int(overall.get("percent"), 0))),
+                },
+                "image": {
+                    "phase": "done",
+                    "processed_slices": max(0, self._safe_int(image.get("processed_slices"), 0)),
+                    "total_slices": image_total,
+                    "percent": max(0, min(100, self._safe_int(image.get("percent"), 0))),
+                },
+            }
+            conv.update(
+                {
+                    "status": "completed",
+                    "output_version_id": int(new_ver.version_id),
+                    "phase": "done",
+                    "updated_at": _utcnow().isoformat(),
+                    "seq": self._safe_int(conv.get("seq"), 0) + 1,
+                }
+            )
+            conv.pop("error_message", None)
             meta["conversion"] = conv
             ver.meta = meta
             db.commit()
@@ -1062,8 +1229,6 @@ class DatasetService:
             except Exception:
                 db.rollback()
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.error(f"Illegal dataset conversion failed for dataset {dataset_id}: {e}", exc_info=True)
             try:
                 ver = (
@@ -1074,7 +1239,21 @@ class DatasetService:
                 if ver:
                     meta = ver.meta if isinstance(ver.meta, dict) else {}
                     conv = dict(meta.get("conversion") or {})
-                    conv.update({"status": "failed", "error_message": str(e)})
+                    progress = conv.get("progress") if isinstance(conv.get("progress"), dict) else self._empty_conversion_progress()
+                    image = progress.get("image") if isinstance(progress.get("image"), dict) else {}
+                    image = dict(image)
+                    image["phase"] = "failed"
+                    progress["image"] = image
+                    conv.update(
+                        {
+                            "status": "failed",
+                            "phase": "failed",
+                            "error_message": str(e),
+                            "updated_at": _utcnow().isoformat(),
+                            "seq": self._safe_int(conv.get("seq"), 0) + 1,
+                            "progress": progress,
+                        }
+                    )
                     meta["conversion"] = conv
                     ver.meta = meta
                     db.commit()
@@ -1944,6 +2123,91 @@ class DatasetService:
         db.commit()
         db.refresh(row)
         return row
+
+    def create_version_from_directory(
+        self,
+        db: Session,
+        dataset_id: int,
+        *,
+        source_dir: Path | str,
+        message: Optional[str] = None,
+        created_by: Optional[str] = None,
+        activate: bool = False,
+    ) -> tuple[Dataset, DatasetVersion]:
+        """
+        Create a new dataset version from an arbitrary source directory without
+        touching the dataset's main storage directory.
+
+        The source content is copied into `.versions/<token>/vN/snapshot/` and
+        that snapshot becomes the new version's `snapshot_path`.
+        """
+        ds = self.get_dataset(db, dataset_id)
+        src = Path(source_dir).expanduser().resolve(strict=False)
+        if not src.exists() or not src.is_dir():
+            raise ValidationError("source_dir does not exist")
+
+        latest = self.versions.get_latest(db, ds.dataset_id)
+        next_version = int(getattr(latest, "version", 0) or 0) + 1
+        parent_version_id = getattr(latest, "version_id", None) if latest else None
+
+        manifest_rel, file_count, size_bytes, stats = self._write_manifest(
+            dataset_token=_versions_token(ds),
+            dataset_id=int(ds.dataset_id),
+            dataset_name=str(ds.name),
+            dataset_path=src,
+            version=next_version,
+            dataset_type=ds.dataset_type,
+        )
+        snapshot_rel = self._create_snapshot(dataset_token=_versions_token(ds), dataset_path=src, version=next_version)
+
+        meta: dict | None = None
+        try:
+            meta_obj: dict = {}
+            if isinstance(stats, dict) and stats:
+                meta_obj["stats"] = stats
+            if ds.dataset_type == DatasetType.DETECTION:
+                yolo_yaml = find_yolo_dataset_yaml(src, dataset_name=str(getattr(ds, "name", "") or "") or None)
+                if yolo_yaml is not None and yolo_yaml.exists() and yolo_yaml.is_file():
+                    try:
+                        cfg = yaml.safe_load(yolo_yaml.read_text(encoding="utf-8", errors="ignore")) or {}
+                    except Exception:
+                        cfg = {}
+                    if isinstance(cfg, dict):
+                        names = self._normalize_yolo_names(cfg.get("names"), cfg.get("nc"))
+                        if names:
+                            meta_obj["yolo"] = {"nc": int(len(names)), "names": names}
+            meta = meta_obj or None
+        except Exception:
+            meta = {"stats": stats} if isinstance(stats, dict) and stats else None
+
+        row = DatasetVersion(
+            dataset_id=ds.dataset_id,
+            version=next_version,
+            parent_version_id=parent_version_id,
+            status=DatasetVersionStatus.FINALIZED,
+            message=message,
+            manifest_path=manifest_rel,
+            snapshot_path=snapshot_rel,
+            file_count=file_count,
+            size_bytes=size_bytes,
+            created_by=created_by,
+            meta=meta,
+        )
+        db.add(row)
+        db.flush()
+
+        if activate or ds.active_version_id is None:
+            ds.active_version_id = row.version_id
+
+        self._ensure_images_indexed(db, ds, row)
+
+        snapshot_abs = resolve_dataset_path(snapshot_rel)
+        self._trigger_thumbnail_pregeneration(ds.dataset_id, snapshot_abs)
+
+        db.commit()
+        db.refresh(ds)
+        db.refresh(row)
+        return ds, row
 
     def _create_version_row(
         self,

@@ -4,7 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query, HTTPException
 from fastapi import WebSocket, WebSocketDisconnect
 import requests
 from sqlalchemy import func
@@ -32,7 +32,7 @@ from train_platform.schemas.v2.training_runs import (
     TrainingRunOut,
     TrainingRunUpdate,
 )
-from train_platform.services.training_run_service import TrainingRunService
+from train_platform.services.training_run_service import FrameworkCompareConflict, TrainingRunService
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.mlflow_utils import fetch_mlflow_epoch_metrics
 
@@ -313,7 +313,16 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
 
 @router.post("/compare", response_model=TrainingRunCompareResponse)
 def compare_training_runs(payload: TrainingRunCompareRequest, db: Session = Depends(get_db)):
-    return TrainingRunService().compare_runs(db, payload.run_ids)
+    try:
+        return TrainingRunService().compare_runs(db, payload.run_ids)
+    except FrameworkCompareConflict as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(e),
+                "framework_groups": e.framework_groups,
+            },
+        ) from e
 
 
 @router.get("/{run_id}/meta", response_model=TrainingRunMetaOut)

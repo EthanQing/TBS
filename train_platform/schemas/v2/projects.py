@@ -46,3 +46,23 @@ class ProjectModelSizeOut(BaseModel):
 
     model_config = {"from_attributes": True}
 
+
+class ProjectCompareBaselineRunOut(BaseModel):
+    run_id: str
+    name: Optional[str] = None
+    status: Optional[str] = None
+    architecture_id: Optional[int] = None
+    engine: Optional[str] = None
+
+
+class ProjectCompareBaselineOut(BaseModel):
+    project_id: int
+    framework_key: str
+    baseline_run_id: Optional[str] = None
+    baseline_run: Optional[ProjectCompareBaselineRunOut] = None
+
+
+class ProjectCompareBaselineSetIn(BaseModel):
+    framework_key: str = Field(..., min_length=1, max_length=128)
+    baseline_run_id: str = Field(..., min_length=1, max_length=36)
+

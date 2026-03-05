@@ -41,6 +41,18 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+ENGINE_FRAMEWORK_MAP: dict[str, tuple[str, str]] = {
+    "ultralytics-yolo": ("pytorch", "PyTorch"),
+    "paddle-det": ("paddle", "Paddle"),
+}
+
+
+class FrameworkCompareConflict(ConflictError):
+    def __init__(self, message: str, framework_groups: Dict[str, List[str]]) -> None:
+        super().__init__(message)
+        self.framework_groups = framework_groups
+
+
 def _ensure_aware_utc(value: Optional[datetime]) -> Optional[datetime]:
     if value is None:
         return None
@@ -546,6 +558,16 @@ class TrainingRunService:
         path = settings.training_dir / str(run_id) / "logs" / log_name
         return _tail_text_file(path, lines=lines)
 
+    @staticmethod
+    def _resolve_framework(engine: str | None) -> tuple[str, str]:
+        raw = str(engine or "").strip().lower()
+        if not raw:
+            return "engine:unknown", "Engine: unknown"
+        mapped = ENGINE_FRAMEWORK_MAP.get(raw)
+        if mapped:
+            return mapped
+        return f"engine:{raw}", f"Engine: {raw}"
+
     # --------------------
     # compare
     # --------------------
@@ -564,9 +586,14 @@ class TrainingRunService:
 
         runs_out: List[Dict[str, Any]] = []
         params_by_run: Dict[str, Dict[str, Any]] = {}
+        framework_groups: Dict[str, List[str]] = {}
 
         for rid in ids:
             run = self.get_run(db, rid)
+            arch = run.architecture
+            engine = str(getattr(arch, "engine", "") or "").strip().lower()
+            framework_key, framework_label = self._resolve_framework(engine)
+            framework_groups.setdefault(framework_key, []).append(str(run.run_id))
 
             p: Dict[str, Any] = {}
             if run.parameters is not None:
@@ -590,6 +617,7 @@ class TrainingRunService:
             best_metrics = None
             final_metrics = None
             model_size_mb = None
+            inference_time_ms = None
             if run.result is not None:
                 best_metrics = run.result.best_metrics
                 final_metrics = run.result.final_metrics
@@ -597,6 +625,10 @@ class TrainingRunService:
                     model_size_mb = float(run.result.model_size_mb) if run.result.model_size_mb is not None else None
                 except Exception:
                     model_size_mb = None
+                try:
+                    inference_time_ms = float(run.result.inference_time_ms) if run.result.inference_time_ms is not None else None
+                except Exception:
+                    inference_time_ms = None
 
             runs_out.append(
                 {
@@ -607,13 +639,23 @@ class TrainingRunService:
                     "dataset_version_id": int(run.dataset_version_id),
                     "architecture_id": int(run.architecture_id),
                     "created_at": run.created_at,
+                    "engine": engine or None,
+                    "framework_key": framework_key,
+                    "framework_label": framework_label,
+                    "family": str(getattr(arch, "family", "") or "") or None,
+                    "variant": str(getattr(arch, "variant", "") or "") or None,
                     "parameters": p,
                     "best_metrics": best_metrics,
                     "final_metrics": final_metrics,
                     "model_size_mb": model_size_mb,
+                    "inference_time_ms": inference_time_ms,
                 }
             )
             params_by_run[run.run_id] = p
+
+        if len(framework_groups) > 1:
+            grouped = {k: sorted(v) for k, v in framework_groups.items()}
+            raise FrameworkCompareConflict("Only runs from the same framework can be compared", grouped)
 
         def _norm(v: Any) -> str:
             try:

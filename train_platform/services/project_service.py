@@ -7,6 +7,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.models.architecture import ModelArchitecture
 from train_platform.models.deployment import Deployment
 from train_platform.models.inference import InferenceRun
 from train_platform.models.model_registry import ModelVersion
@@ -94,6 +95,122 @@ class ProjectService:
         db.commit()
         db.refresh(p)
         return p
+
+    @staticmethod
+    def _normalize_framework_key(framework_key: str) -> str:
+        raw = str(framework_key or "").strip().lower()
+        if not raw:
+            raise ValidationError("framework_key is required")
+        if raw in ("pytorch", "paddle"):
+            return raw
+        if raw.startswith("engine:") and len(raw) > len("engine:"):
+            return raw
+        raise ValidationError("framework_key must be pytorch, paddle, or engine:<name>")
+
+    @staticmethod
+    def _resolve_framework_from_engine(engine: str | None) -> str:
+        raw = str(engine or "").strip().lower()
+        if not raw:
+            return "engine:unknown"
+        if raw == "ultralytics-yolo":
+            return "pytorch"
+        if raw == "paddle-det":
+            return "paddle"
+        return f"engine:{raw}"
+
+    @staticmethod
+    def _get_compare_baseline_map(tags: dict | None) -> dict[str, str]:
+        data = tags if isinstance(tags, dict) else {}
+        bucket = data.get("compare_baseline")
+        if not isinstance(bucket, dict):
+            return {}
+        out: dict[str, str] = {}
+        for k, v in bucket.items():
+            key = str(k or "").strip().lower()
+            rid = str(v or "").strip()
+            if not key or not rid:
+                continue
+            out[key] = rid
+        return out
+
+    def get_compare_baseline(self, db: Session, project_id: int, framework_key: str) -> dict:
+        project = self.get_project(db, int(project_id))
+        key = self._normalize_framework_key(framework_key)
+        baseline_map = self._get_compare_baseline_map(project.tags)
+        run_id = baseline_map.get(key)
+
+        baseline_run = None
+        if run_id:
+            run = db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id)).first()
+            if run and int(run.project_id) == int(project.project_id):
+                engine = None
+                try:
+                    engine = str(getattr(run.architecture, "engine", "") or "").strip().lower() or None
+                except Exception:
+                    engine = None
+                baseline_run = {
+                    "run_id": str(run.run_id),
+                    "name": run.name,
+                    "status": str(getattr(run.status, "value", run.status) or ""),
+                    "architecture_id": int(run.architecture_id),
+                    "engine": engine,
+                }
+
+        return {
+            "project_id": int(project.project_id),
+            "framework_key": key,
+            "baseline_run_id": run_id,
+            "baseline_run": baseline_run,
+        }
+
+    def set_compare_baseline(self, db: Session, project_id: int, framework_key: str, baseline_run_id: str) -> dict:
+        project = self.get_project(db, int(project_id))
+        key = self._normalize_framework_key(framework_key)
+
+        run = db.query(TrainingRun).filter(TrainingRun.run_id == str(baseline_run_id).strip()).first()
+        if not run:
+            raise NotFoundError("Training run not found")
+        if int(run.project_id) != int(project.project_id):
+            raise ConflictError("Baseline run does not belong to this project")
+
+        arch = db.query(ModelArchitecture).filter(ModelArchitecture.architecture_id == int(run.architecture_id)).first()
+        if not arch:
+            raise NotFoundError("Architecture not found")
+        run_framework = self._resolve_framework_from_engine(getattr(arch, "engine", None))
+        if run_framework != key:
+            raise ConflictError("Baseline run framework does not match framework_key")
+
+        tags = dict(project.tags) if isinstance(project.tags, dict) else {}
+        baseline_map = self._get_compare_baseline_map(tags)
+        baseline_map[key] = str(run.run_id)
+        tags["compare_baseline"] = baseline_map
+        project.tags = tags
+        db.commit()
+        db.refresh(project)
+        return self.get_compare_baseline(db, int(project.project_id), key)
+
+    def clear_compare_baseline(self, db: Session, project_id: int, framework_key: str) -> dict:
+        project = self.get_project(db, int(project_id))
+        key = self._normalize_framework_key(framework_key)
+
+        tags = dict(project.tags) if isinstance(project.tags, dict) else {}
+        baseline_map = self._get_compare_baseline_map(tags)
+        if key in baseline_map:
+            baseline_map.pop(key, None)
+            if baseline_map:
+                tags["compare_baseline"] = baseline_map
+            else:
+                tags.pop("compare_baseline", None)
+            project.tags = tags
+            db.commit()
+            db.refresh(project)
+
+        return {
+            "project_id": int(project.project_id),
+            "framework_key": key,
+            "baseline_run_id": None,
+            "baseline_run": None,
+        }
 
     def delete_project(self, db: Session, project_id: int, *, force: bool = False) -> None:
         p = self.get_project(db, project_id)

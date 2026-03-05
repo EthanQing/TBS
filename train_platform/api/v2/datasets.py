@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+import asyncio
+import time
+
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
 from train_platform.core.config import settings
+from train_platform.db.session import SessionLocal
 from train_platform.models.dataset_event import DatasetEvent
 from train_platform.models.dataset import Dataset, DatasetVersion
 from train_platform.schemas.v2.common import DeleteResponse, Page, PageMeta
@@ -40,6 +44,56 @@ from train_platform.utils.exceptions import ValidationError
 # path operations like `@router.get("")` would have both an empty prefix and path,
 # which FastAPI rejects at startup.
 router = APIRouter(prefix="/datasets", tags=["datasets"])
+
+
+def _parse_non_negative_int(value, default: int = 0) -> int:
+    try:
+        return max(0, int(str(value).strip()))
+    except Exception:
+        return max(0, int(default))
+
+
+def _load_illegal_conversion_state(dataset_id: int, job_id: str) -> dict | None:
+    db = SessionLocal()
+    try:
+        ds = db.query(Dataset).filter(Dataset.dataset_id == int(dataset_id)).first()
+        if not ds:
+            return None
+
+        versions = (
+            db.query(DatasetVersion)
+            .filter(DatasetVersion.dataset_id == int(dataset_id))
+            .order_by(DatasetVersion.version_id.desc())
+            .all()
+        )
+        target_job = str(job_id or "").strip()
+        for ver in versions:
+            meta = ver.meta if isinstance(ver.meta, dict) else {}
+            conv = meta.get("conversion")
+            if not isinstance(conv, dict):
+                continue
+            if str(conv.get("job_id") or "").strip() != target_job:
+                continue
+
+            progress = conv.get("progress") if isinstance(conv.get("progress"), dict) else {}
+            image_progress = progress.get("image") if isinstance(progress.get("image"), dict) else {}
+            phase = str(conv.get("phase") or image_progress.get("phase") or "scanning").strip().lower() or "scanning"
+            return {
+                "dataset_id": int(dataset_id),
+                "version_id": int(ver.version_id),
+                "job_id": target_job,
+                "status": str(conv.get("status") or "pending"),
+                "phase": phase,
+                "seq": _parse_non_negative_int(conv.get("seq"), 0),
+                "updated_at": conv.get("updated_at"),
+                "progress": progress,
+                "error_message": conv.get("error_message"),
+                "output_version_id": conv.get("output_version_id"),
+                "message": conv.get("message"),
+            }
+        return None
+    finally:
+        db.close()
 
 
 @router.post("", response_model=DatasetOut, status_code=201)
@@ -255,6 +309,66 @@ def convert_illegal_dataset(
         split_shuffle=data.get("split_shuffle"),
         split_overwrite=data.get("split_overwrite"),
     )
+
+
+@router.websocket("/{dataset_id}/convert/{job_id}/stream")
+async def stream_illegal_conversion_progress(websocket: WebSocket, dataset_id: int, job_id: str):
+    await websocket.accept()
+    last_seq = _parse_non_negative_int(websocket.query_params.get("from_seq"), 0)
+    ping_every_s = 15.0
+    last_ping = time.monotonic()
+
+    try:
+        snap = _load_illegal_conversion_state(int(dataset_id), str(job_id))
+        if snap is None:
+            await websocket.send_json({"type": "error", "data": {"message": "Conversion job not found"}})
+            await websocket.close(code=1008)
+            return
+
+        await websocket.send_json({"type": "snapshot", "data": snap})
+        last_seq = max(last_seq, _parse_non_negative_int(snap.get("seq"), 0))
+
+        status = str(snap.get("status") or "").strip().lower()
+        if status in {"completed", "failed"}:
+            await websocket.send_json({"type": "done", "data": snap})
+            await websocket.close()
+            return
+
+        while True:
+            state = _load_illegal_conversion_state(int(dataset_id), str(job_id))
+            if state is None:
+                await websocket.send_json({"type": "error", "data": {"message": "Conversion state unavailable"}})
+                await websocket.close(code=1011)
+                return
+
+            seq = _parse_non_negative_int(state.get("seq"), 0)
+            if seq > last_seq:
+                await websocket.send_json({"type": "progress", "data": state})
+                last_seq = seq
+
+            status = str(state.get("status") or "").strip().lower()
+            if status in {"completed", "failed"}:
+                await websocket.send_json({"type": "done", "data": state})
+                await websocket.close()
+                return
+
+            now = time.monotonic()
+            if (now - last_ping) >= ping_every_s:
+                await websocket.send_json({"type": "ping", "data": {}})
+                last_ping = now
+
+            await asyncio.sleep(1.0)
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "data": {"message": f"{type(e).__name__}: {e}"}})
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
 
 @router.get("/{dataset_id}/illegal-labels", response_model=DatasetIllegalLabelsOut)

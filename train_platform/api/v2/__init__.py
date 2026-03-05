@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from train_platform.api.v2.architectures import router as architectures_router
 from train_platform.api.v2.chart_configs import router as chart_configs_router
 from train_platform.api.v2.datasets import router as datasets_router
+from train_platform.api.v2.dataset_augmentations import router as dataset_augmentations_router
 from train_platform.api.v2.dataset_conversions import router as dataset_conversions_router
 from train_platform.api.v2.deployments import router as deployments_router
 from train_platform.api.v2.deployment_runs import router as deployment_runs_router
@@ -22,6 +23,7 @@ from train_platform.api.v2.training_runs import router as training_runs_router
 
 router = APIRouter()
 router.include_router(datasets_router)
+router.include_router(dataset_augmentations_router)
 router.include_router(dataset_conversions_router)
 router.include_router(projects_router)
 router.include_router(architectures_router)
