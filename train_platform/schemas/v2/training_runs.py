@@ -154,6 +154,12 @@ class TrainingRunCompareRequest(BaseModel):
     run_ids: List[str] = Field(..., min_length=2, max_length=20)
 
 
+class TrainingRunMetricSummaryOut(BaseModel):
+    best: Dict[str, float] = Field(default_factory=dict)
+    final: Dict[str, float] = Field(default_factory=dict)
+    source: Optional[str] = None
+
+
 class TrainingRunCompareItem(BaseModel):
     run_id: str
     name: str
@@ -170,6 +176,7 @@ class TrainingRunCompareItem(BaseModel):
     parameters: Dict[str, Any]
     best_metrics: Optional[Dict[str, Any]] = None
     final_metrics: Optional[Dict[str, Any]] = None
+    metric_summary: Optional[TrainingRunMetricSummaryOut] = None
     model_size_mb: Optional[float] = None
     inference_time_ms: Optional[float] = None
 
@@ -177,6 +184,23 @@ class TrainingRunCompareItem(BaseModel):
 class TrainingRunCompareResponse(BaseModel):
     runs: List[TrainingRunCompareItem]
     parameter_diff: Dict[str, Dict[str, Any]]
+
+
+class TrainingRunBenchmarkInferenceRequest(BaseModel):
+    run_ids: List[str] = Field(..., min_length=1, max_length=20)
+    force: bool = False
+
+
+class TrainingRunBenchmarkInferenceItem(BaseModel):
+    run_id: str
+    status: str
+    inference_time_ms: Optional[float] = None
+    engine: Optional[str] = None
+    message: Optional[str] = None
+
+
+class TrainingRunBenchmarkInferenceResponse(BaseModel):
+    items: List[TrainingRunBenchmarkInferenceItem]
 
 
 class TrainingRunLogTailOut(BaseModel):

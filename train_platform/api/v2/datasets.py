@@ -24,6 +24,8 @@ from train_platform.schemas.v2.datasets import (
     DatasetIllegalConvertOut,
     DatasetIllegalLabelsOut,
     DatasetIllegalLabelsUpdate,
+    IllegalLabelPresetOut,
+    IllegalLabelPresetUpdateIn,
     DatasetRenameClassesRequest,
     DatasetRenameClassesOut,
     DatasetSplitRequest,
@@ -94,6 +96,16 @@ def _load_illegal_conversion_state(dataset_id: int, job_id: str) -> dict | None:
         return None
     finally:
         db.close()
+
+
+@router.get("/illegal-label-presets", response_model=IllegalLabelPresetOut)
+def get_illegal_label_presets():
+    return DatasetService().get_illegal_label_presets()
+
+
+@router.put("/illegal-label-presets", response_model=IllegalLabelPresetOut)
+def save_illegal_label_presets(payload: IllegalLabelPresetUpdateIn):
+    return DatasetService().save_illegal_label_presets(payload.model_dump())
 
 
 @router.post("", response_model=DatasetOut, status_code=201)

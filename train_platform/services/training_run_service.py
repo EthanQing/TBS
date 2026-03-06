@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import statistics
+import time
 import uuid
 from pathlib import Path
 import yaml
@@ -33,8 +35,14 @@ from train_platform.repositories.training_run_meta_repo import TrainingRunMetaRe
 from train_platform.repositories.training_run_repo import TrainingRunRepository
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.training_artifacts import index_completion_artifacts
-from train_platform.utils.path_utils import resolve_dataset_path
+from train_platform.utils.path_utils import resolve_dataset_path, resolve_training_path
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
+from train_platform.services.inference_service import InferenceService
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - PIL is expected in runtime image.
+    Image = None
 
 
 def _utcnow() -> datetime:
@@ -45,6 +53,13 @@ ENGINE_FRAMEWORK_MAP: dict[str, tuple[str, str]] = {
     "ultralytics-yolo": ("pytorch", "PyTorch"),
     "paddle-det": ("paddle", "Paddle"),
 }
+
+COMPARE_METRIC_KEYS: tuple[str, ...] = (
+    "metrics/mAP50(B)",
+    "metrics/mAP50-95(B)",
+    "metrics/precision(B)",
+    "metrics/recall(B)",
+)
 
 
 class FrameworkCompareConflict(ConflictError):
@@ -568,6 +583,237 @@ class TrainingRunService:
             return mapped
         return f"engine:{raw}", f"Engine: {raw}"
 
+    @staticmethod
+    def _as_number(value: Any) -> float | None:
+        try:
+            n = float(value)
+        except Exception:
+            return None
+        return n if n == n else None
+
+    def _build_metric_summary(self, db: Session, run: TrainingRun) -> Dict[str, Any]:
+        best: Dict[str, float] = {}
+        final: Dict[str, float] = {}
+        used_result = False
+        used_epoch = False
+
+        result_best = run.result.best_metrics if run.result and isinstance(run.result.best_metrics, dict) else {}
+        result_final = run.result.final_metrics if run.result and isinstance(run.result.final_metrics, dict) else {}
+
+        for key in COMPARE_METRIC_KEYS:
+            n_best = self._as_number(result_best.get(key))
+            if n_best is not None:
+                best[key] = n_best
+                used_result = True
+            n_final = self._as_number(result_final.get(key))
+            if n_final is not None:
+                final[key] = n_final
+                used_result = True
+
+        needs_epoch = any((key not in best) or (key not in final) for key in COMPARE_METRIC_KEYS)
+        if needs_epoch:
+            rows = (
+                db.query(TrainingRunEpochMetric)
+                .filter(TrainingRunEpochMetric.run_id == str(run.run_id))
+                .order_by(TrainingRunEpochMetric.epoch.asc())
+                .all()
+            )
+            if rows:
+                epoch_best: Dict[str, float] = {}
+                epoch_final: Dict[str, float] = {}
+                for row in rows:
+                    metrics = row.metrics if isinstance(row.metrics, dict) else {}
+                    for key in COMPARE_METRIC_KEYS:
+                        n = self._as_number(metrics.get(key))
+                        if n is None:
+                            continue
+                        epoch_final[key] = n
+                        prev = epoch_best.get(key)
+                        if prev is None or n > prev:
+                            epoch_best[key] = n
+                if epoch_best or epoch_final:
+                    used_epoch = True
+                for key in COMPARE_METRIC_KEYS:
+                    if key not in best and key in epoch_best:
+                        best[key] = epoch_best[key]
+                    if key not in final and key in epoch_final:
+                        final[key] = epoch_final[key]
+
+        source = None
+        if used_result and used_epoch:
+            source = "mixed"
+        elif used_epoch:
+            source = "epoch_fallback"
+        elif used_result:
+            source = "result"
+
+        return {"best": best, "final": final, "source": source}
+
+    def _ensure_benchmark_image(self) -> Path:
+        if Image is None:
+            raise ValidationError("Pillow is required for benchmark image generation")
+        out_dir = (settings.temp_dir / "benchmark_inputs").resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "synthetic_640.jpg"
+        if not out_path.exists():
+            Image.new("RGB", (640, 640), color=(0, 0, 0)).save(out_path, format="JPEG", quality=95)
+        return out_path
+
+    def _measure_run_inference_latency(
+        self,
+        db: Session,
+        *,
+        run: TrainingRun,
+        benchmark_image: Path,
+        conf: float = 0.25,
+        iou: float = 0.45,
+        warmup: int = 1,
+        iters: int = 5,
+    ) -> float:
+        if not run.result:
+            raise ConflictError("Run has no result artifacts")
+
+        weights_rel = str(run.result.best_weights_path or run.result.last_weights_path or "").strip()
+        if not weights_rel:
+            raise ConflictError("Run has no weights path")
+
+        weights_path = resolve_training_path(weights_rel)
+        if not weights_path.exists() or not weights_path.is_file():
+            raise NotFoundError(f"Weights not found: {weights_path}")
+
+        arch = run.architecture
+        engine = str(getattr(arch, "engine", "") or "ultralytics-yolo").strip().lower()
+
+        infer = InferenceService()
+        config_path = None
+        if engine == "paddle-det":
+            config_path = infer._resolve_paddle_config_path(arch)
+            if not config_path:
+                raise ValidationError("Paddle model missing valid config_path")
+
+        warmup = max(0, int(warmup))
+        iters = max(1, int(iters))
+
+        for _ in range(warmup):
+            infer._run_by_engine(
+                engine=engine,
+                weights_path=weights_path,
+                image_path=benchmark_image,
+                conf=float(conf),
+                iou=float(iou),
+                config_path=config_path,
+            )
+
+        timings: List[float] = []
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            infer._run_by_engine(
+                engine=engine,
+                weights_path=weights_path,
+                image_path=benchmark_image,
+                conf=float(conf),
+                iou=float(iou),
+                config_path=config_path,
+            )
+            timings.append((time.perf_counter() - t0) * 1000.0)
+
+        return round(float(statistics.median(timings)), 4)
+
+    def benchmark_inference_times(
+        self,
+        db: Session,
+        *,
+        run_ids: List[str],
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        ids: List[str] = []
+        seen = set()
+        for x in run_ids or []:
+            s = str(x or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            ids.append(s)
+        if not ids:
+            raise ValidationError("run_ids is required")
+        if len(ids) > 20:
+            raise ValidationError("run_ids cannot exceed 20")
+
+        benchmark_image = self._ensure_benchmark_image()
+        items: List[Dict[str, Any]] = []
+
+        for rid in ids:
+            run: TrainingRun | None = None
+            engine: str | None = None
+            try:
+                run = self.get_run(db, rid)
+                engine = str(getattr(run.architecture, "engine", "") or "").strip().lower() or None
+
+                if run.status != TrainingRunStatus.COMPLETED:
+                    items.append(
+                        {
+                            "run_id": rid,
+                            "status": "skipped",
+                            "inference_time_ms": None,
+                            "engine": engine,
+                            "message": "run is not completed",
+                        }
+                    )
+                    continue
+
+                cached = self._as_number(getattr(run.result, "inference_time_ms", None) if run.result else None)
+                if cached is not None and not force:
+                    items.append(
+                        {
+                            "run_id": str(run.run_id),
+                            "status": "cached",
+                            "inference_time_ms": cached,
+                            "engine": engine,
+                            "message": "",
+                        }
+                    )
+                    continue
+
+                measured = self._measure_run_inference_latency(
+                    db,
+                    run=run,
+                    benchmark_image=benchmark_image,
+                    conf=0.25,
+                    iou=0.45,
+                    warmup=1,
+                    iters=5,
+                )
+
+                if run.result is None:
+                    run.result = TrainingRunResult(run_id=str(run.run_id))
+                    db.add(run.result)
+                run.result.inference_time_ms = measured
+                db.add(run)
+                db.commit()
+
+                items.append(
+                    {
+                        "run_id": str(run.run_id),
+                        "status": "measured",
+                        "inference_time_ms": measured,
+                        "engine": engine,
+                        "message": "",
+                    }
+                )
+            except Exception as e:
+                db.rollback()
+                items.append(
+                    {
+                        "run_id": str(getattr(run, "run_id", rid)),
+                        "status": "failed",
+                        "inference_time_ms": None,
+                        "engine": engine,
+                        "message": f"{type(e).__name__}: {e}",
+                    }
+                )
+
+        return {"items": items}
+
     # --------------------
     # compare
     # --------------------
@@ -629,6 +875,7 @@ class TrainingRunService:
                     inference_time_ms = float(run.result.inference_time_ms) if run.result.inference_time_ms is not None else None
                 except Exception:
                     inference_time_ms = None
+            metric_summary = self._build_metric_summary(db, run)
 
             runs_out.append(
                 {
@@ -647,6 +894,7 @@ class TrainingRunService:
                     "parameters": p,
                     "best_metrics": best_metrics,
                     "final_metrics": final_metrics,
+                    "metric_summary": metric_summary,
                     "model_size_mb": model_size_mb,
                     "inference_time_ms": inference_time_ms,
                 }

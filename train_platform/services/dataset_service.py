@@ -97,6 +97,9 @@ def _versions_token(ds: Dataset) -> str:
 
 
 class DatasetService:
+    _illegal_preset_lock = threading.Lock()
+    _illegal_preset_file_name = "illegal_label_mapping_presets.json"
+
     def __init__(self) -> None:
         self.datasets = DatasetRepository()
         self.versions = DatasetVersionRepository()
@@ -730,6 +733,128 @@ class DatasetService:
         if ver is not None:
             db.refresh(ver)
         return ds, ver
+
+    @classmethod
+    def _illegal_preset_file_path(cls) -> Path:
+        return (settings.temp_dir / cls._illegal_preset_file_name).resolve(strict=False)
+
+    @staticmethod
+    def _leaf_label(label: str, separator: str = "%") -> str:
+        parts = [p.strip() for p in str(label or "").split(separator) if p.strip()]
+        return parts[-1] if parts else str(label or "").strip()
+
+    @classmethod
+    def _normalize_illegal_preset_payload(cls, payload: dict | None) -> dict:
+        data = payload if isinstance(payload, dict) else {}
+
+        detection_rows: list[dict[str, str]] = []
+        raw_detection = data.get("detection")
+        if isinstance(raw_detection, dict):
+            for k, v in raw_detection.items():
+                src = str(k or "").strip()
+                if not src:
+                    continue
+                tgt = str(v or "").strip() or cls._leaf_label(src)
+                detection_rows.append({"source_label": src, "target_label": tgt})
+        elif isinstance(raw_detection, list):
+            for item in raw_detection:
+                if isinstance(item, str):
+                    src = str(item).strip()
+                    if not src:
+                        continue
+                    detection_rows.append({"source_label": src, "target_label": cls._leaf_label(src)})
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                src = str(item.get("source_label") or item.get("source") or item.get("raw_label") or "").strip()
+                if not src:
+                    continue
+                tgt = (
+                    str(item.get("target_label") or item.get("target") or item.get("mapped_label") or "").strip()
+                    or cls._leaf_label(src)
+                )
+                detection_rows.append({"source_label": src, "target_label": tgt})
+
+        dedup_detection: dict[str, str] = {}
+        for row in detection_rows:
+            dedup_detection[row["source_label"]] = row["target_label"]
+        normalized_detection = [
+            {"source_label": src, "target_label": tgt} for src, tgt in dedup_detection.items()
+        ]
+
+        classification_rows: list[dict[str, str]] = []
+        raw_classification = data.get("classification")
+        if isinstance(raw_classification, dict):
+            for category, sources in raw_classification.items():
+                cat = str(category or "").strip()
+                if not cat:
+                    continue
+                if isinstance(sources, list):
+                    for source in sources:
+                        src = str(source or "").strip()
+                        if not src:
+                            continue
+                        classification_rows.append(
+                            {"category": cat, "source_label": src, "target_label": cat}
+                        )
+        elif isinstance(raw_classification, list):
+            for item in raw_classification:
+                if not isinstance(item, dict):
+                    continue
+                cat = str(item.get("category") or item.get("group") or "").strip()
+                src = str(item.get("source_label") or item.get("source") or "").strip()
+                if not cat or not src:
+                    continue
+                tgt = str(item.get("target_label") or item.get("target") or "").strip() or cat
+                classification_rows.append({"category": cat, "source_label": src, "target_label": tgt})
+
+        dedup_classification: dict[tuple[str, str], str] = {}
+        for row in classification_rows:
+            dedup_classification[(row["category"], row["source_label"])] = row["target_label"]
+        normalized_classification = [
+            {"category": cat, "source_label": src, "target_label": tgt}
+            for (cat, src), tgt in dedup_classification.items()
+        ]
+
+        updated_at = str(data.get("updated_at") or "").strip() or None
+
+        return {
+            "detection": normalized_detection,
+            "classification": normalized_classification,
+            "updated_at": updated_at,
+        }
+
+    @classmethod
+    def _load_illegal_preset_payload(cls) -> dict:
+        path = cls._illegal_preset_file_path()
+        if not path.exists() or not path.is_file():
+            return cls._normalize_illegal_preset_payload({})
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            return cls._normalize_illegal_preset_payload({})
+        return cls._normalize_illegal_preset_payload(payload)
+
+    @classmethod
+    def _save_illegal_preset_payload(cls, payload: dict) -> None:
+        path = cls._illegal_preset_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+
+    def get_illegal_label_presets(self) -> dict:
+        with self._illegal_preset_lock:
+            return self._load_illegal_preset_payload()
+
+    def save_illegal_label_presets(self, payload: dict | None) -> dict:
+        normalized = self._normalize_illegal_preset_payload(payload)
+        normalized["updated_at"] = _utcnow().isoformat()
+        with self._illegal_preset_lock:
+            self._save_illegal_preset_payload(normalized)
+        return normalized
 
     def get_illegal_labels(self, db: Session, dataset_id: int) -> list[str]:
         ds = self.get_dataset(db, dataset_id)

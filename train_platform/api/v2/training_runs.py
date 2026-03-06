@@ -19,6 +19,8 @@ from train_platform.models.training_run import TrainingRun, TrainingRunArtifact,
 from train_platform.schemas.v2.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v2.training_runs import (
     TrainingRunArtifactOut,
+    TrainingRunBenchmarkInferenceRequest,
+    TrainingRunBenchmarkInferenceResponse,
     TrainingRunCompareRequest,
     TrainingRunCompareResponse,
     TrainingRunEpochMetricOut,
@@ -323,6 +325,18 @@ def compare_training_runs(payload: TrainingRunCompareRequest, db: Session = Depe
                 "framework_groups": e.framework_groups,
             },
         ) from e
+
+
+@router.post("/benchmark-inference-time", response_model=TrainingRunBenchmarkInferenceResponse)
+def benchmark_training_runs_inference_time(
+    payload: TrainingRunBenchmarkInferenceRequest,
+    db: Session = Depends(get_db),
+):
+    return TrainingRunService().benchmark_inference_times(
+        db,
+        run_ids=payload.run_ids,
+        force=bool(payload.force),
+    )
 
 
 @router.get("/{run_id}/meta", response_model=TrainingRunMetaOut)

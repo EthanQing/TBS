@@ -524,7 +524,6 @@ class DatasetIllegalConvertService:
         label_separator: str,
         label_mapping: Optional[dict] = None,
         slice_config: Optional[dict] = None,
-        progress_cb: ProgressCallback = None,
     ) -> dict:
         root = Path(dataset_root).expanduser().resolve(strict=False)
         if not root.exists() or not root.is_dir():
@@ -536,36 +535,10 @@ class DatasetIllegalConvertService:
 
         global_label_map: Dict[str, int] = {}
         processed = 0
-        processed_images = 0
         skipped_files: List[str] = []
         processed_pairs: List[Tuple[Path, Path]] = []
-        total_images = len(pairs)
 
-        _emit_progress(
-            progress_cb,
-            overall_processed_images=0,
-            overall_total_images=int(total_images),
-            current_image_index=0,
-            current_image_name="",
-            phase="scanning",
-            current_slice_processed=0,
-            current_slice_total=0,
-            message="conversion started",
-        )
-
-        for idx, (image_path, json_path) in enumerate(pairs, start=1):
-            current_name = str(image_path.name)
-            _emit_progress(
-                progress_cb,
-                overall_processed_images=int(processed_images),
-                overall_total_images=int(total_images),
-                current_image_index=int(idx),
-                current_image_name=current_name,
-                phase="scanning",
-                current_slice_processed=0,
-                current_slice_total=0,
-                message="image started",
-            )
+        for image_path, json_path in pairs:
             cfg = dict(self.DEFAULT_CONFIG)
             # Apply user-specified slice/crop overrides
             if isinstance(slice_config, dict):
@@ -593,51 +566,18 @@ class DatasetIllegalConvertService:
             cfg["label_mapping"] = label_mapping
 
             try:
-                stats, global_label_map, slicing_meta = self._run_single(
-                    cfg,
-                    progress_cb=progress_cb,
-                    progress_context={
-                        "overall_processed_images": int(processed_images),
-                        "overall_total_images": int(total_images),
-                        "current_image_index": int(idx),
-                        "current_image_name": current_name,
-                    },
-                )
+                stats, global_label_map, slicing_meta = self._run_single(cfg)
             except ValidationError as e:
                 # Skip files with no valid annotations instead of aborting
                 skipped_files.append(f"{json_path.name}: {e}")
                 warnings.append(f"Skipped {json_path.name}: {e}")
-                processed_images += 1
-                _emit_progress(
-                    progress_cb,
-                    overall_processed_images=int(processed_images),
-                    overall_total_images=int(total_images),
-                    current_image_index=int(idx),
-                    current_image_name=current_name,
-                    phase="skipped",
-                    current_slice_processed=0,
-                    current_slice_total=0,
-                    message=str(e),
-                )
                 continue
 
             info_path = root / f"slicing_info_{image_path.stem}.json"
             with open(info_path, "w", encoding="utf-8") as f:
                 json.dump(slicing_meta, f, ensure_ascii=False, indent=2)
             processed += 1
-            processed_images += 1
             processed_pairs.append((image_path, json_path))
-            _emit_progress(
-                progress_cb,
-                overall_processed_images=int(processed_images),
-                overall_total_images=int(total_images),
-                current_image_index=int(idx),
-                current_image_name=current_name,
-                phase="finalizing",
-                current_slice_processed=int(len(slicing_meta.get("slices") or [])),
-                current_slice_total=int(len(slicing_meta.get("slices") or [])),
-                message="image completed",
-            )
 
         if processed == 0:
             skipped_summary = "; ".join(skipped_files[:5])
@@ -671,18 +611,6 @@ class DatasetIllegalConvertService:
                 f.write(name + "\n")
 
         FileService()._create_yolo_data_yaml(root, root / "data.yaml")
-
-        _emit_progress(
-            progress_cb,
-            overall_processed_images=int(processed_images),
-            overall_total_images=int(total_images),
-            current_image_index=int(total_images),
-            current_image_name="",
-            phase="done",
-            current_slice_processed=0,
-            current_slice_total=0,
-            message="conversion completed",
-        )
 
         return {
             "pairs_total": len(pairs),
@@ -910,13 +838,7 @@ class DatasetIllegalConvertService:
 
         return pairs, warnings
 
-    def _run_single(
-        self,
-        cfg: dict,
-        *,
-        progress_cb: ProgressCallback = None,
-        progress_context: Optional[Dict[str, Any]] = None,
-    ) -> tuple[dict, Dict[str, int], dict]:
+    def _run_single(self, cfg: dict) -> tuple[dict, Dict[str, int], dict]:
         with rasterio.open(cfg["image_path"]) as ds:
             img_w, img_h = ds.width, ds.height
             n_bands, dtype = ds.count, ds.dtypes[0]
@@ -949,25 +871,12 @@ class DatasetIllegalConvertService:
         if not slices:
             raise ValidationError(f"No slices planned for {cfg['annotation_path']}")
 
-        base = dict(progress_context or {})
-        slice_total = int(len(slices))
-        _emit_progress(
-            progress_cb,
-            **base,
-            phase="scanning",
-            current_slice_processed=0,
-            current_slice_total=slice_total,
-            message="slice plan ready",
-        )
-
         slices = assign_labels(
             slices,
             bboxes,
             min_area_ratio=cfg["min_area_ratio"],
             min_visibility=cfg["min_visibility"],
             min_pixel_size=cfg["min_pixel_size"],
-            progress_cb=progress_cb,
-            progress_context=base,
         )
 
         slices = post_filter_slices(
@@ -975,21 +884,7 @@ class DatasetIllegalConvertService:
             action=cfg["empty_positive_action"],
         )
 
-        save_stats = save_slices(
-            cfg,
-            slices,
-            progress_cb=progress_cb,
-            progress_context=base,
-        )
-
-        _emit_progress(
-            progress_cb,
-            **base,
-            phase="finalizing",
-            current_slice_processed=slice_total,
-            current_slice_total=slice_total,
-            message="image finalized",
-        )
+        save_stats = save_slices(cfg, slices)
 
         save_negative = cfg["negative_ratio"] > 0
         meta = {

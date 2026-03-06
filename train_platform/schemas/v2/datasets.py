@@ -291,6 +291,28 @@ class DatasetIllegalLabelsUpdate(BaseModel):
     label_mapping: Dict[str, str] = Field(..., description="Mapping from old raw label to new absolute label")
 
 
+class IllegalLabelPresetDetectionRow(BaseModel):
+    source_label: str = Field(..., min_length=1, description="Raw source label path")
+    target_label: str = Field(..., min_length=1, description="Mapped target label")
+
+
+class IllegalLabelPresetClassificationRow(BaseModel):
+    category: str = Field(..., min_length=1, description="Classification category")
+    source_label: str = Field(..., min_length=1, description="Raw source label path")
+    target_label: Optional[str] = Field(
+        None, description="Optional mapped target label, defaults to category when omitted"
+    )
+
+
+class IllegalLabelPresetUpdateIn(BaseModel):
+    detection: list[IllegalLabelPresetDetectionRow] = Field(default_factory=list)
+    classification: list[IllegalLabelPresetClassificationRow] = Field(default_factory=list)
+
+
+class IllegalLabelPresetOut(IllegalLabelPresetUpdateIn):
+    updated_at: Optional[str] = None
+
+
 class DatasetRenameClassesRequest(BaseModel):
     """Rename class labels in a converted YOLO dataset.
 
