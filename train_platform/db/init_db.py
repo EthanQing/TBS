@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy.orm import Session
 
 from train_platform.db.session import SessionLocal
+
+logger = logging.getLogger("train_platform.db.init")
 
 
 def init_db() -> None:
@@ -20,16 +24,26 @@ def _seed_architectures(db: Session) -> None:
     from train_platform.models.architecture import ModelArchitecture
     from train_platform.db.seed_data import DEFAULT_ARCHITECTURES
 
-    # Fetch existing variants to avoid duplicates
-    existing_variants_and_families = {
-        (row[0], row[1]) for row in db.query(ModelArchitecture.variant, ModelArchitecture.family).all()
+    # Fetch existing rows to avoid duplicates
+    existing_keys = {
+        (str(row[0]), str(row[1]), str(row[2]))
+        for row in db.query(ModelArchitecture.variant, ModelArchitecture.family, ModelArchitecture.task_type).all()
     }
 
     to_add = []
     for d in DEFAULT_ARCHITECTURES:
-        if (d["variant"], d["family"]) not in existing_variants_and_families:
+        key = (str(d["variant"]), str(d["family"]), str(d["task_type"]))
+        if key not in existing_keys:
             to_add.append(ModelArchitecture(**d))
 
     if to_add:
         db.add_all(to_add)
         db.commit()
+        families = sorted({str(item.family) for item in to_add if getattr(item, "family", None)})
+        logger.info(
+            "Seeded %s model architectures on startup. Families=%s",
+            len(to_add),
+            ",".join(families),
+        )
+    else:
+        logger.info("Model architectures already seeded; no new rows added.")

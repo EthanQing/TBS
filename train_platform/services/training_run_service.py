@@ -54,6 +54,8 @@ ENGINE_FRAMEWORK_MAP: dict[str, tuple[str, str]] = {
     "paddle-det": ("paddle", "Paddle"),
 }
 
+DISABLED_TRAIN_ENGINES: set[str] = {"paddle-det"}
+
 COMPARE_METRIC_KEYS: tuple[str, ...] = (
     "metrics/mAP50(B)",
     "metrics/mAP50-95(B)",
@@ -262,6 +264,9 @@ class TrainingRunService:
             raise NotFoundError("Architecture not found")
         if arch.task_type != project.task_type:
             raise ValidationError("Architecture task_type does not match project task_type")
+        arch_engine = str(getattr(arch, "engine", "") or "").strip().lower()
+        if arch_engine in DISABLED_TRAIN_ENGINES:
+            raise ValidationError("Architecture engine is disabled for new training runs")
 
         # Check dataset train/val split before training (no auto-split).
         has_split = False

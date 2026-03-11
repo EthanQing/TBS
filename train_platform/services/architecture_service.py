@@ -8,6 +8,13 @@ from train_platform.repositories.architecture_repo import ArchitectureRepository
 from train_platform.utils.exceptions import ConflictError, ValidationError
 
 
+HIDDEN_ARCH_ENGINES = {"paddle-det"}
+
+
+def _normalize_engine(value: str | None) -> str:
+    return str(value or "").strip().lower()
+
+
 class ArchitectureService:
     def __init__(self) -> None:
         self.repo = ArchitectureRepository()
@@ -22,7 +29,8 @@ class ArchitectureService:
         skip: int = 0,
         limit: int = 100,
     ) -> list[ModelArchitecture]:
-        return self.repo.list(db, family=family, task_type=task_type, q=q, skip=skip, limit=limit)
+        rows = self.repo.list(db, family=family, task_type=task_type, q=q, skip=skip, limit=limit)
+        return [row for row in rows if _normalize_engine(getattr(row, "engine", None)) not in HIDDEN_ARCH_ENGINES]
 
     def create_architecture(self, db: Session, *, obj: dict) -> ModelArchitecture:
         family = str(obj.get("family") or "").strip()
@@ -50,4 +58,3 @@ class ArchitectureService:
         db.commit()
         db.refresh(row)
         return row
-

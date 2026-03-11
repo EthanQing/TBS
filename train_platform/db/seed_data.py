@@ -10,22 +10,103 @@ add a new helper and append its output to DEFAULT_ARCHITECTURES.
 from train_platform.models.enums import TaskType
 
 
-def yolov8_detection_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
+def ultralytics_detection_variants(
+    *,
+    family: str,
+    variants: list[str],
+    engine: str = "ultralytics-yolo",
+) -> list[dict]:
     """
-    Default YOLOv8 detection architectures.
-
-    Five standard variants: n/s/m/l/x.
+    Build Ultralytics detection architecture rows for one model family.
     """
-    variants = ["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"]
     return [
         {
-            "family": "YOLOv8",
+            "family": family,
             "variant": v,
             "task_type": TaskType.DETECTION,
             "engine": engine,
         }
         for v in variants
     ]
+
+
+def yolov8_detection_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
+    """
+    Default YOLOv8 detection architectures.
+
+    Five standard variants: n/s/m/l/x.
+    """
+    return ultralytics_detection_variants(
+        family="YOLOv8",
+        variants=["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"],
+        engine=engine,
+    )
+
+
+def yolov9_detection_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
+    """
+    YOLOv9 detection variants.
+    """
+    return ultralytics_detection_variants(
+        family="YOLOv9",
+        variants=["yolov9t", "yolov9s", "yolov9m", "yolov9c", "yolov9e"],
+        engine=engine,
+    )
+
+
+def yolov10_detection_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
+    """
+    YOLOv10 detection variants.
+    """
+    return ultralytics_detection_variants(
+        family="YOLOv10",
+        variants=["yolov10n", "yolov10s", "yolov10m", "yolov10b", "yolov10l", "yolov10x"],
+        engine=engine,
+    )
+
+
+def yolo11_detection_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
+    """
+    YOLO11 detection variants.
+    """
+    return ultralytics_detection_variants(
+        family="YOLO11",
+        variants=["yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x"],
+        engine=engine,
+    )
+
+
+def yolo12_detection_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
+    """
+    YOLO12 detection variants.
+    """
+    return ultralytics_detection_variants(
+        family="YOLO12",
+        variants=["yolo12n", "yolo12s", "yolo12m", "yolo12l", "yolo12x"],
+        engine=engine,
+    )
+
+
+def yolo26_detection_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
+    """
+    YOLO26 detection variants.
+    """
+    return ultralytics_detection_variants(
+        family="YOLO26",
+        variants=["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26x"],
+        engine=engine,
+    )
+
+
+def rtdetr_detection_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
+    """
+    RT-DETR detection variants (Ultralytics integration).
+    """
+    return ultralytics_detection_variants(
+        family="RT-DETR",
+        variants=["rtdetr-l", "rtdetr-x"],
+        engine=engine,
+    )
 
 def yolov8_classification_variants(*, engine: str = "ultralytics-yolo") -> list[dict]:
     """
@@ -103,6 +184,12 @@ def paddle_det_detection_variants(*, engine: str = "paddle-det") -> list[dict]:
 
 DEFAULT_ARCHITECTURES: list[dict] = [
     *yolov8_detection_variants(),
+    *yolov9_detection_variants(),
+    *yolov10_detection_variants(),
+    *yolo11_detection_variants(),
+    *yolo12_detection_variants(),
+    *yolo26_detection_variants(),
+    *rtdetr_detection_variants(),
     *paddle_det_detection_variants(),
     # *yolov8_classification_variants(),
     # *yolov8_segmentation_variants(),

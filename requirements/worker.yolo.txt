@@ -1,5 +1,5 @@
 -r worker.common.txt
 
-ultralytics==8.2.58
+ultralytics==8.4.14
 onnxruntime-gpu>=1.23.2
 onnx>=1.19.0
