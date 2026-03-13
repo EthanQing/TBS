@@ -20,9 +20,15 @@ class TrainContext:
 
 
 class TrainerPlugin(Protocol):
+    plugin_id: str
     name: str
+    display_name: str
+    implemented: bool
 
     def can_handle(self, model_family: str) -> bool: ...
 
-    def run(self, ctx: TrainContext) -> None: ...
+    def get_config_schema(self) -> Dict[str, Any]: ...
 
+    def normalize_config(self, raw: Dict[str, Any] | None) -> Dict[str, Any]: ...
+
+    def run(self, ctx: TrainContext, *, config: Dict[str, Any] | None = None) -> None: ...

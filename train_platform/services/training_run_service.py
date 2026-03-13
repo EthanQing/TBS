@@ -33,6 +33,7 @@ from train_platform.models.training_run import (
 from train_platform.models.training_run_meta import TrainingRunMeta
 from train_platform.repositories.training_run_meta_repo import TrainingRunMetaRepository
 from train_platform.repositories.training_run_repo import TrainingRunRepository
+from train_platform.training.registry import get_plugin
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.training_artifacts import index_completion_artifacts
 from train_platform.utils.path_utils import resolve_dataset_path, resolve_training_path
@@ -54,8 +55,6 @@ ENGINE_FRAMEWORK_MAP: dict[str, tuple[str, str]] = {
     "ultralytics-yolo": ("pytorch", "PyTorch"),
     "paddle-det": ("paddle", "Paddle"),
 }
-
-DISABLED_TRAIN_ENGINES: set[str] = {"paddle-det"}
 
 COMPARE_METRIC_KEYS: tuple[str, ...] = (
     "metrics/mAP50(B)",
@@ -271,8 +270,31 @@ class TrainingRunService:
         if arch.task_type != project.task_type:
             raise ValidationError("Architecture task_type does not match project task_type")
         arch_engine = str(getattr(arch, "engine", "") or "").strip().lower()
-        if arch_engine in DISABLED_TRAIN_ENGINES:
-            raise ValidationError("Architecture engine is disabled for new training runs")
+        try:
+            plugin = get_plugin(arch_engine)
+        except Exception as e:
+            raise ValidationError(f"Architecture engine is not registered: {arch_engine}") from e
+        if not bool(getattr(plugin, "implemented", True)):
+            raise ValidationError(
+                f"Architecture engine '{arch_engine}' is not implemented yet; select another framework plugin"
+            )
+
+        additional_params = params.get("additional_params")
+        if additional_params is not None and not isinstance(additional_params, dict):
+            raise ValidationError("parameters.additional_params must be an object")
+        if isinstance(additional_params, dict) and "framework_config" in additional_params:
+            framework_config = additional_params.get("framework_config")
+            if framework_config is not None and not isinstance(framework_config, dict):
+                raise ValidationError("parameters.additional_params.framework_config must be an object")
+            try:
+                normalized_framework_config = plugin.normalize_config(framework_config or {})
+            except Exception as e:
+                raise ValidationError(f"Invalid framework_config for engine '{arch_engine}': {e}") from e
+            if not isinstance(normalized_framework_config, dict):
+                raise ValidationError("framework_config normalize result must be an object")
+            params = dict(params)
+            params["additional_params"] = dict(additional_params)
+            params["additional_params"]["framework_config"] = normalized_framework_config
 
         # Check dataset train/val split before training (no auto-split).
         has_split = False

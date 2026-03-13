@@ -5,14 +5,17 @@ from sqlalchemy.orm import Session
 from train_platform.models.architecture import ModelArchitecture
 from train_platform.models.enums import TaskType
 from train_platform.repositories.architecture_repo import ArchitectureRepository
+from train_platform.training.registry import get_plugin
 from train_platform.utils.exceptions import ConflictError, ValidationError
 
 
-HIDDEN_ARCH_ENGINES = {"paddle-det"}
-
-
-def _normalize_engine(value: str | None) -> str:
-    return str(value or "").strip().lower()
+def _normalize_and_validate_engine(value: str | None) -> str:
+    engine = str(value or "").strip().lower() or "ultralytics-yolo"
+    try:
+        plugin = get_plugin(engine)
+    except Exception as e:
+        raise ValidationError(f"Unknown architecture engine: {engine}") from e
+    return str(getattr(plugin, "plugin_id", engine) or engine).strip().lower()
 
 
 class ArchitectureService:
@@ -29,8 +32,7 @@ class ArchitectureService:
         skip: int = 0,
         limit: int = 100,
     ) -> list[ModelArchitecture]:
-        rows = self.repo.list(db, family=family, task_type=task_type, q=q, skip=skip, limit=limit)
-        return [row for row in rows if _normalize_engine(getattr(row, "engine", None)) not in HIDDEN_ARCH_ENGINES]
+        return self.repo.list(db, family=family, task_type=task_type, q=q, skip=skip, limit=limit)
 
     def create_architecture(self, db: Session, *, obj: dict) -> ModelArchitecture:
         family = str(obj.get("family") or "").strip()
@@ -42,6 +44,7 @@ class ArchitectureService:
         exists = self.repo.get_by_family_variant(db, family=family, variant=variant, task_type=task_type)
         if exists:
             raise ConflictError("Architecture already exists")
+        engine = _normalize_and_validate_engine(obj.get("engine"))
 
         row = self.repo.create(
             db,
@@ -49,7 +52,7 @@ class ArchitectureService:
                 "family": family,
                 "variant": variant,
                 "task_type": task_type,
-                "engine": obj.get("engine") or "ultralytics-yolo",
+                "engine": engine,
                 "pretrained_path": obj.get("pretrained_path"),
                 "description": obj.get("description"),
                 "default_params": obj.get("default_params"),

@@ -10,6 +10,7 @@ from train_platform.api.v2.dataset_augmentations import router as dataset_augmen
 from train_platform.api.v2.dataset_conversions import router as dataset_conversions_router
 from train_platform.api.v2.deployments import router as deployments_router
 from train_platform.api.v2.deployment_runs import router as deployment_runs_router
+from train_platform.api.v2.frameworks import router as frameworks_router
 from train_platform.api.v2.inference import router as inference_router
 from train_platform.api.v2.inference_jobs import router as inference_jobs_router
 from train_platform.api.v2.model_conversions import router as model_conversions_router
@@ -29,6 +30,7 @@ router.include_router(dataset_augmentations_router)
 router.include_router(dataset_conversions_router)
 router.include_router(projects_router)
 router.include_router(architectures_router)
+router.include_router(frameworks_router)
 router.include_router(training_runs_router)
 router.include_router(model_versions_router)
 router.include_router(deployments_router)

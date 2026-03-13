@@ -216,9 +216,10 @@ def main(argv: list[str] | None = None) -> int:
 
         engine = str(getattr(run.architecture, "engine", "") or "")
         family = str(getattr(run.architecture, "family", "") or "")
-        key = engine or family or "yolo"
-
-        trainer = get_trainer(model_family=key)
+        trainer = get_trainer(
+            model_family=(family or engine or "yolo"),
+            engine=(engine or None),
+        )
         run_dir = settings.training_dir / run_id
 
         mlflow_logger = init_mlflow_logger(run, dataset_path=str(dataset_path), run_dir=str(run_dir))
@@ -249,8 +250,14 @@ def main(argv: list[str] | None = None) -> int:
 
         # Optional phase-2 bridge: enrich Paddle metrics from VisualDL scalars.
         additional_params = getattr(run.parameters, "additional_params", None) or {}
-        metrics_source = str(additional_params.get("metrics_source", "callback") or "callback").strip().lower()
-        if "paddle" in key.lower() and metrics_source == "hybrid":
+        framework_config_raw = additional_params.get("framework_config")
+        plugin_config = trainer.normalize_config(framework_config_raw) if isinstance(framework_config_raw, dict) else {}
+        metrics_source = str(
+            plugin_config.get("metrics_source")
+            or additional_params.get("metrics_source")
+            or "callback"
+        ).strip().lower()
+        if str(engine or "").strip().lower() == "paddle-det" and metrics_source == "hybrid":
             vdl_bridge = VisualDLScalarBridge(
                 run_id=run_id,
                 run_dir=run_dir,
@@ -260,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             vdl_bridge.start()
 
         print(f"[train_entry] start run_id={run_id} trainer={getattr(trainer, 'name', type(trainer).__name__)}", flush=True)
-        trainer.run(ctx)
+        trainer.run(ctx, config=plugin_config)
         mlflow_status = "FINISHED"
         print(f"[train_entry] completed run_id={run_id}", flush=True)
         exit_code = 0

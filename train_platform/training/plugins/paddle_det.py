@@ -462,13 +462,38 @@ class PaddleDetTrainer:
     Supports PP-YOLOE(+), PicoDet and other PaddleDetection architectures.
     """
 
+    plugin_id = "paddle-det"
     name = "paddle-det"
+    display_name = "PaddleDetection"
+    implemented = True
 
     def can_handle(self, model_family: str) -> bool:
         mf = (model_family or "").strip().lower()
         return any(kw in mf for kw in ("paddle", "ppyolo", "ppdet", "picodet"))
 
-    def run(self, ctx: TrainContext) -> None:  # noqa: C901  (complexity is inherent)
+    def get_config_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "config_path": {"type": "string"},
+                "resume_training": {"type": "boolean", "default": False},
+                "resume_job_id": {"type": "string"},
+                "use_pretrained": {"type": "boolean", "default": True},
+                "pretrained_model_path": {"type": "string"},
+                "metrics_source": {"type": "string", "enum": ["callback", "hybrid"], "default": "callback"},
+                "eval_during_train": {"type": "boolean", "default": True},
+                "eval_interval": {"type": "integer", "minimum": 1, "default": 1},
+                "momentum": {"type": "number"},
+                "weight_decay": {"type": "number"},
+                "warmup_epochs": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": True,
+        }
+
+    def normalize_config(self, raw: Dict[str, Any] | None) -> Dict[str, Any]:
+        return dict(raw or {})
+
+    def run(self, ctx: TrainContext, *, config: Dict[str, Any] | None = None) -> None:  # noqa: C901  (complexity is inherent)
         # ---- Lazy imports ----
         paddle = None
         try:
@@ -513,6 +538,10 @@ class PaddleDetTrainer:
 
         job = ctx.job
         add = getattr(getattr(job, "parameters", None), "additional_params", None) or {}
+        if isinstance(add.get("framework_config"), dict):
+            add = {**add, **dict(add.get("framework_config") or {})}
+        if config:
+            add = {**add, **self.normalize_config(config)}
         arch_defaults = getattr(getattr(job, "architecture", None), "default_params", None) or {}
 
         # ---- Resolve variant & config ----

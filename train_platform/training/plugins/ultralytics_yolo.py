@@ -126,13 +126,38 @@ def _collect_metrics(trainer: Any) -> Dict[str, float]:
 
 
 class UltralyticsYOLOTrainer:
+    plugin_id = "ultralytics-yolo"
     name = "ultralytics-yolo"
+    display_name = "Ultralytics YOLO"
+    implemented = True
 
     def can_handle(self, model_family: str) -> bool:
         mf = (model_family or "").strip().lower()
         return ("yolo" in mf) or ("rtdetr" in mf) or ("rt-detr" in mf)
 
-    def run(self, ctx: TrainContext) -> None:
+    def get_config_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "use_pretrained": {"type": "boolean", "default": True},
+                "pretrained_model_path": {"type": "string"},
+                "resume_training": {"type": "boolean", "default": False},
+                "resume_job_id": {"type": "string"},
+                "save_period": {"type": "integer", "default": -1, "minimum": -1},
+                "amp": {"type": "boolean", "default": True},
+                "momentum": {"type": "number", "default": 0.937},
+                "weight_decay": {"type": "number", "default": 0.0005},
+                "warmup_epochs": {"type": "number", "default": 3.0},
+                "warmup_momentum": {"type": "number", "default": 0.8},
+                "warmup_bias_lr": {"type": "number", "default": 0.1},
+            },
+            "additionalProperties": True,
+        }
+
+    def normalize_config(self, raw: Dict[str, Any] | None) -> Dict[str, Any]:
+        return dict(raw or {})
+
+    def run(self, ctx: TrainContext, *, config: Dict[str, Any] | None = None) -> None:
         def _coerce_bool(value, default: bool) -> bool:
             if value is None:
                 return bool(default)
@@ -159,6 +184,10 @@ class UltralyticsYOLOTrainer:
 
         job = ctx.job
         add = getattr(getattr(job, "parameters", None), "additional_params", None) or {}
+        if isinstance(add.get("framework_config"), dict):
+            add = {**add, **dict(add.get("framework_config") or {})}
+        if config:
+            add = {**add, **self.normalize_config(config)}
 
         model_variant = ""
         if getattr(job, "architecture", None) is not None:
