@@ -38,6 +38,7 @@ from train_platform.utils.training_artifacts import index_completion_artifacts
 from train_platform.utils.path_utils import resolve_dataset_path, resolve_training_path
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.services.inference_service import InferenceService
+from train_platform.services.alarm_service import AlarmService
 
 try:
     from PIL import Image
@@ -130,6 +131,9 @@ class TrainingRunService:
         self.runs = TrainingRunRepository()
         self.meta_repo = TrainingRunMetaRepository()
 
+    def _try_eval_alarms(self, db: Session, run_ids: List[str]) -> None:
+        AlarmService.try_evaluate_training_rules(db, run_ids=run_ids)
+
     def _stdout_has_completion_marker(self, run_id: str) -> bool:
         marker = f"[train_entry] completed run_id={str(run_id)}"
         path = settings.training_dir / str(run_id) / "logs" / "train.stdout.log"
@@ -200,6 +204,7 @@ class TrainingRunService:
         if self._maybe_repair_run_status(db, run):
             db.commit()
             db.refresh(run)
+            self._try_eval_alarms(db, [str(run.run_id)])
         return run
 
     def list_runs(
@@ -231,6 +236,7 @@ class TrainingRunService:
                 dirty = True
         if dirty:
             db.commit()
+            self._try_eval_alarms(db, [str(r.run_id) for r in runs])
 
         return runs
 
@@ -384,6 +390,7 @@ class TrainingRunService:
         db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="queued", message="Run queued"))
         db.commit()
         db.refresh(run)
+        self._try_eval_alarms(db, [str(run.run_id)])
         return run
 
     def resume_run(self, db: Session, run_id: str) -> TrainingRun:
@@ -438,6 +445,7 @@ class TrainingRunService:
         db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="cancel_requested", message=reason or "Cancel requested"))
         db.commit()
         db.refresh(run)
+        self._try_eval_alarms(db, [str(run.run_id)])
         return run
 
     def request_delete(self, db: Session, run_id: str) -> TrainingRun:
@@ -457,6 +465,7 @@ class TrainingRunService:
         db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="delete_requested", message="Delete requested"))
         db.commit()
         db.refresh(run)
+        self._try_eval_alarms(db, [str(run.run_id)])
         return run
 
     def delete_run(self, db: Session, run_id: str, *, force: bool = False) -> TrainingRun:

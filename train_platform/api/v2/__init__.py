@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from train_platform.api.v2.alarms import router as alarms_router
 from train_platform.api.v2.architectures import router as architectures_router
 from train_platform.api.v2.chart_configs import router as chart_configs_router
 from train_platform.api.v2.datasets import router as datasets_router
@@ -22,6 +23,7 @@ from train_platform.api.v2.training_runs import router as training_runs_router
 
 
 router = APIRouter()
+router.include_router(alarms_router)
 router.include_router(datasets_router)
 router.include_router(dataset_augmentations_router)
 router.include_router(dataset_conversions_router)

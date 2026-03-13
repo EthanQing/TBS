@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from train_platform.models.enums import TrainingRunStatus
 from train_platform.models.training_run import TrainingRun, TrainingRunEpochMetric
 from train_platform.repositories.training_run_repo import TrainingRunRepository
+from train_platform.services.alarm_service import AlarmService
 from train_platform.training.plugins.base import TrainContext
 from train_platform.training.registry import get_trainer
 from train_platform.utils.path_utils import resolve_dataset_path
@@ -125,6 +126,7 @@ def _heartbeat_tick(run_id: str) -> None:
             return
         _touch_run_liveness(db, run)
         db.commit()
+        AlarmService.try_evaluate_training_rules(db, run_ids=[str(run_id)])
     except Exception:
         db.rollback()
     finally:

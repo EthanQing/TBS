@@ -18,6 +18,7 @@ from train_platform.db.session import SessionLocal
 from train_platform.models.architecture import ModelArchitecture
 from train_platform.models.enums import DeploymentStatus, LogLevel, TrainingRunStatus
 from train_platform.models.training_run import TrainingRun, TrainingRunEvent
+from train_platform.services.alarm_service import AlarmService
 from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
 
 
@@ -223,6 +224,7 @@ class DbQueueWorker:
             run.heartbeat_at = None
 
             db.commit()
+            AlarmService.try_evaluate_training_rules(db, run_ids=[str(run.run_id)])
 
             # Optionally cleanup files if deleted
             if delete_requested:
@@ -297,6 +299,7 @@ class DbQueueWorker:
 
             _add_event(db, run.run_id, "started", f"Run started by worker {self.worker_id}")
             db.commit()
+            AlarmService.try_evaluate_training_rules(db, run_ids=[str(run.run_id)])
 
             self._running = RunningJob(
                 run_id=run.run_id,
@@ -333,6 +336,7 @@ class DbQueueWorker:
             run.pid = None
             run.heartbeat_at = None
 
+        changed_ids: list[str] = [str(r.run_id) for r in stale_queued]
         stale_running = (
             db.query(TrainingRun)
             .filter(TrainingRun.status == TrainingRunStatus.RUNNING)
@@ -375,9 +379,11 @@ class DbQueueWorker:
             run.claimed_at = None
             run.pid = None
             run.heartbeat_at = None
+            changed_ids.append(str(run.run_id))
 
         if stale_queued or stale_running:
             db.commit()
+            AlarmService.try_evaluate_training_rules(db, run_ids=changed_ids)
 
 
 def main() -> None:
