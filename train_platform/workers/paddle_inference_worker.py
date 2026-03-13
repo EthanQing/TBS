@@ -6,8 +6,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+
+from train_platform.core.config import settings
 
 app = FastAPI(title="Paddle Inference Worker", version="1.0")
 
@@ -29,6 +31,15 @@ class InferenceResponse(BaseModel):
 _CACHE_LOCK = threading.Lock()
 _INFER_LOCK = threading.Lock()
 _MODEL_CACHE: Dict[str, Tuple[Any, Dict[int, str]]] = {}
+
+
+def _verify_internal_auth(x_internal_token: Optional[str] = Header(default=None, alias="X-Internal-Token")) -> None:
+    expected = str(settings.internal_api_token or "").strip()
+    if not expected:
+        return
+    provided = str(x_internal_token or "").strip()
+    if provided != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized internal request")
 
 
 def _cache_key(config_path: Path, weights_path: Path) -> str:
@@ -143,7 +154,7 @@ def _run_paddle_det(config_path: Path, weights_path: Path, image_path: Path, *, 
 
 
 @app.post("/internal/inference/paddle-det", response_model=InferenceResponse)
-def run_inference(req: PaddleInferenceRequest) -> InferenceResponse:
+def run_inference(req: PaddleInferenceRequest, _: None = Depends(_verify_internal_auth)) -> InferenceResponse:
     config_path = Path(req.config_path)
     if not config_path.exists() or not config_path.is_file():
         raise HTTPException(status_code=404, detail=f"Config not found: {config_path}")
@@ -174,6 +185,10 @@ def run_inference(req: PaddleInferenceRequest) -> InferenceResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("PADDLE_INFERENCE_WORKER_HOST", "0.0.0.0")
+    host = (
+        str(settings.worker_bind_host).strip()
+        or os.getenv("PADDLE_INFERENCE_WORKER_HOST")
+        or "0.0.0.0"
+    )
     port = int(os.getenv("PADDLE_INFERENCE_WORKER_PORT", "18003"))
     uvicorn.run("train_platform.workers.paddle_inference_worker:app", host=host, port=port)

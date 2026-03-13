@@ -406,11 +406,16 @@ async def create_model_conversion(
     _write_status(job_id, status)
 
     worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
+    headers = {}
+    token = str(settings.internal_api_token or "").strip()
+    if token:
+        headers["X-Internal-Token"] = token
     try:
         resp = requests.post(
             f"{worker_url}/internal/model-conversions/pt-to-onnx",
             json={"job_id": job_id, "opset": opset, "dynamic": dynamic},
             timeout=10,
+            headers=headers,
         )
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")

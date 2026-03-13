@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -28,6 +29,7 @@ from train_platform.utils.path_utils import resolve_temp_path
 
 _LOCKS_GUARD = threading.Lock()
 _JOB_LOCKS: Dict[str, threading.Lock] = {}
+_CREATE_JOB_PROCESS_LOCK = threading.Lock()
 
 
 def _utcnow() -> datetime:
@@ -82,6 +84,7 @@ class InferenceJobService:
     ACTIVE_STATUSES = {"queued", "running"}
     TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
     ACTIVE_STALE_AFTER = timedelta(hours=2)
+    CREATE_JOB_LOCK_TIMEOUT_SEC = float(os.getenv("INFERENCE_JOB_CREATE_LOCK_TIMEOUT_SEC", "5"))
 
     def __init__(self) -> None:
         self._infer = InferenceService()
@@ -91,6 +94,39 @@ class InferenceJobService:
         root = settings.temp_dir / "inference_jobs"
         root.mkdir(parents=True, exist_ok=True)
         return root
+
+    def _create_job_lock_path(self) -> Path:
+        return self.jobs_root() / ".create_job.lock"
+
+    def _acquire_create_job_lock(self, timeout_sec: float) -> None:
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        lock_path = self._create_job_lock_path()
+
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(f"{os.getpid()}\n{time.time()}\n")
+                return
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise ConflictError("Another inference job request is being processed, please retry")
+                # stale lock recovery
+                try:
+                    if lock_path.exists():
+                        age = time.time() - float(lock_path.stat().st_mtime)
+                        if age > max(30.0, float(timeout_sec) * 3.0):
+                            lock_path.unlink(missing_ok=True)
+                            continue
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+    def _release_create_job_lock(self) -> None:
+        try:
+            self._create_job_lock_path().unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def job_dir(self, job_id: str) -> Path:
         d = self.jobs_root() / str(job_id)
@@ -338,54 +374,59 @@ class InferenceJobService:
         return tokens, None
 
     def create_job(self, db: Session, payload: InferenceJobCreate) -> InferenceJobOut:
-        active = self._has_active_job()
-        if active:
-            jid = active.get("job_id") or "unknown"
-            st = active.get("status") or "running"
-            raise ConflictError(f"Another inference job is active (job_id={jid}, status={st})")
+        with _CREATE_JOB_PROCESS_LOCK:
+            self._acquire_create_job_lock(self.CREATE_JOB_LOCK_TIMEOUT_SEC)
+            try:
+                active = self._has_active_job()
+                if active:
+                    jid = active.get("job_id") or "unknown"
+                    st = active.get("status") or "running"
+                    raise ConflictError(f"Another inference job is active (job_id={jid}, status={st})")
 
-        mv_id = self._ensure_model_version_for_payload(
-            db, model_version_id=payload.model_version_id, run_id=payload.run_id
-        )
-        ctx = self._infer.resolve_model_context(db, model_version_id=mv_id)
+                mv_id = self._ensure_model_version_for_payload(
+                    db, model_version_id=payload.model_version_id, run_id=payload.run_id
+                )
+                ctx = self._infer.resolve_model_context(db, model_version_id=mv_id)
 
-        tokens, video_token = self._normalize_inputs(payload)
-        mode = str(payload.mode)
-        total = len(tokens)
-        if mode == "video":
-            total = self._probe_total_frames(video_token)
+                tokens, video_token = self._normalize_inputs(payload)
+                mode = str(payload.mode)
+                total = len(tokens)
+                if mode == "video":
+                    total = self._probe_total_frames(video_token)
 
-        job_id = self._new_job_id()
-        self.job_dir(job_id)
+                job_id = self._new_job_id()
+                self.job_dir(job_id)
 
-        status: Dict[str, Any] = {
-            "job_id": job_id,
-            "status": "queued",
-            "phase": "preparing",
-            "mode": mode,
-            "progress": 0,
-            "processed": 0,
-            "total": int(total),
-            "seq": 1,
-            "last_result_id": 0,
-            "model_version_id": int(mv_id),
-            "run_id": str(ctx.get("run_id") or payload.run_id or ""),
-            "engine": str(ctx.get("engine") or ""),
-            "family": str(ctx.get("family") or "") or None,
-            "variant": str(ctx.get("variant") or "") or None,
-            "conf": float(payload.conf),
-            "iou": float(payload.iou),
-            "show_labels": bool(payload.show_labels),
-            "show_confidence": bool(payload.show_confidence),
-            "input_tokens": tokens,
-            "video_token": video_token,
-            "cancel_requested": False,
-            "result": {"mode": mode},
-            "error_message": None,
-            "created_at": _to_iso(),
-            "updated_at": _to_iso(),
-        }
-        _write_json_atomic(self.status_path(job_id), status)
+                status: Dict[str, Any] = {
+                    "job_id": job_id,
+                    "status": "queued",
+                    "phase": "preparing",
+                    "mode": mode,
+                    "progress": 0,
+                    "processed": 0,
+                    "total": int(total),
+                    "seq": 1,
+                    "last_result_id": 0,
+                    "model_version_id": int(mv_id),
+                    "run_id": str(ctx.get("run_id") or payload.run_id or ""),
+                    "engine": str(ctx.get("engine") or ""),
+                    "family": str(ctx.get("family") or "") or None,
+                    "variant": str(ctx.get("variant") or "") or None,
+                    "conf": float(payload.conf),
+                    "iou": float(payload.iou),
+                    "show_labels": bool(payload.show_labels),
+                    "show_confidence": bool(payload.show_confidence),
+                    "input_tokens": tokens,
+                    "video_token": video_token,
+                    "cancel_requested": False,
+                    "result": {"mode": mode},
+                    "error_message": None,
+                    "created_at": _to_iso(),
+                    "updated_at": _to_iso(),
+                }
+                _write_json_atomic(self.status_path(job_id), status)
+            finally:
+                self._release_create_job_lock()
 
         t = threading.Thread(target=self._run_job, args=(job_id,), daemon=True)
         t.start()

@@ -2114,14 +2114,27 @@ class DatasetService:
         
         # Resolve dataset path
         dataset_path = resolve_dataset_path(ds.storage_path).resolve(strict=False)
+
+        def _canonical_image_key_from_label(label_file: Path) -> str:
+            try:
+                rel = label_file.resolve(strict=False).relative_to((dataset_path / "labels").resolve(strict=False))
+            except Exception:
+                rel = label_file
+            return rel.with_suffix("").as_posix().lstrip("./")
+
+        def _canonical_image_key_from_manifest(rel_path: str) -> str:
+            s = str(rel_path or "").strip().replace("\\", "/")
+            if s.startswith("images/"):
+                s = s[len("images/") :]
+            return Path(s).with_suffix("").as_posix().lstrip("./")
         
         # Parse labels to build image -> classes mapping
-        image_classes: dict[str, set[int]] = {}  # image_stem -> set of class_ids
+        image_classes: dict[str, set[int]] = {}  # canonical image key -> set of class_ids
         labels_dir = dataset_path / "labels"
         
         if labels_dir.exists() and labels_dir.is_dir():
             for label_path in labels_dir.rglob("*.txt"):
-                stem = label_path.stem
+                key = _canonical_image_key_from_label(label_path)
                 try:
                     with label_path.open("r", encoding="utf-8", errors="ignore") as f:
                         class_ids = set()
@@ -2138,7 +2151,7 @@ class DatasetService:
                                 except ValueError:
                                     pass
                         if class_ids:
-                            image_classes[stem] = class_ids
+                            image_classes[key] = class_ids
                 except Exception:
                     pass
         
@@ -2160,7 +2173,7 @@ class DatasetService:
         
         # Get all images from manifest
         image_exts = IMAGE_EXTS
-        all_images: list[tuple[str, str]] = []  # (relative_path, stem)
+        all_images: list[tuple[str, str]] = []  # (relative_path, canonical_key)
         
         if ver.manifest_path:
             for rel, size_bytes, mtime in self._iter_manifest_entries(ver.manifest_path):
@@ -2170,16 +2183,16 @@ class DatasetService:
                 ext = Path(rel).suffix.lower()
                 if ext not in image_exts:
                     continue
-                stem = Path(rel).stem
-                all_images.append((rel, stem))
+                key = _canonical_image_key_from_manifest(rel)
+                all_images.append((rel, key))
         
         # Filter by class_id if specified
         if class_id is not None:
             filtered_images = []
-            for rel, stem in all_images:
-                class_ids = image_classes.get(stem, set())
+            for rel, key in all_images:
+                class_ids = image_classes.get(key, set())
                 if class_id in class_ids:
-                    filtered_images.append((rel, stem))
+                    filtered_images.append((rel, key))
             all_images = filtered_images
         
         # Pagination
@@ -2195,7 +2208,7 @@ class DatasetService:
         url_prefix = self._dataset_static_prefix(root_token)
         
         items = []
-        for idx, (rel, stem) in enumerate(page_images):
+        for idx, (rel, key) in enumerate(page_images):
             # Build URLs
             url = f"{url_prefix}/{rel.lstrip('/')}"
             # Use static path for pre-generated thumbnails (much faster)
@@ -2203,7 +2216,7 @@ class DatasetService:
             thumbnail_url = f"/static/thumbnails/{ds.dataset_id}/{rel_webp}"
             
             # Get class ids for this image
-            class_ids = list(image_classes.get(stem, set()))
+            class_ids = list(image_classes.get(key, set()))
             
             items.append({
                 "id": start + idx + 1,  # Simple sequential ID for this page

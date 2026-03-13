@@ -52,6 +52,10 @@ def _export_onnx_via_worker(
 ) -> None:
     worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
     timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "1200"))
+    headers = {}
+    token = str(settings.internal_api_token or "").strip()
+    if token:
+        headers["X-Internal-Token"] = token
     payload = {
         "src_pt": str(src_pt),
         "out_onnx": str(out_onnx),
@@ -61,7 +65,12 @@ def _export_onnx_via_worker(
     }
 
     try:
-        resp = requests.post(f"{worker_url}/internal/training-runs/export-onnx", json=payload, timeout=timeout)
+        resp = requests.post(
+            f"{worker_url}/internal/training-runs/export-onnx",
+            json=payload,
+            timeout=timeout,
+            headers=headers,
+        )
     except Exception as e:
         raise ValidationError(f"Failed to reach inference worker: {e}") from e
 

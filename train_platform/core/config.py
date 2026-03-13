@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Tuple
 
 from dotenv import load_dotenv
 
@@ -12,6 +13,14 @@ load_dotenv()
 def _default_home_dir() -> Path:
     # <repo>/backend_v2/train_platform/core/config.py -> parents[2] == <repo>/backend_v2
     return Path(__file__).resolve().parents[2]
+
+
+def _csv_env(name: str, default: str = "") -> Tuple[str, ...]:
+    raw = os.getenv(name, default)
+    if raw is None:
+        return tuple()
+    items = [x.strip() for x in str(raw).split(",")]
+    return tuple(x for x in items if x)
 
 
 @dataclass(frozen=True)
@@ -32,6 +41,12 @@ class Settings:
     pretrain_models_dir: Path = Path(os.getenv("BASE_PRETRAIN_MODELS_DIR") or (home_dir / "pretrain_models")).resolve()
     paddle_det_dir: Path = Path(os.getenv("PADDLE_DET_DIR") or (home_dir / "PaddleDetection")).resolve()
     disable_append_upload: bool = os.getenv("DISABLE_APPEND_UPLOAD", "1") in ("1", "true", "True")
+    internal_api_token: str = os.getenv("INTERNAL_API_TOKEN", "")
+    inference_max_download_bytes: int = int(os.getenv("INFERENCE_MAX_DOWNLOAD_BYTES", str(20 * 1024 * 1024)))
+    inference_download_timeout_sec: float = float(os.getenv("INFERENCE_DOWNLOAD_TIMEOUT_SEC", "20"))
+    inference_allowed_schemes: Tuple[str, ...] = _csv_env("INFERENCE_ALLOWED_SCHEMES", "http,https")
+    inference_allowed_hosts: Tuple[str, ...] = _csv_env("INFERENCE_ALLOWED_HOSTS", "")
+    worker_bind_host: str = os.getenv("WORKER_BIND_HOST", "").strip()
 
     @property
     def thumbnails_dir(self) -> Path:

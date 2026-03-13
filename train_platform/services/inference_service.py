@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import time
 import uuid
+import ipaddress
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import requests
 from sqlalchemy.orm import Session
@@ -20,6 +22,8 @@ from train_platform.utils.path_utils import resolve_temp_path, resolve_training_
 
 
 class InferenceService:
+    INTERNAL_TOKEN_HEADER = "X-Internal-Token"
+
     def create_inference_run(self, db: Session, *, obj: dict) -> InferenceRun:
         mv_id = int(obj["model_version_id"])
         mv = db.query(ModelVersion).filter(ModelVersion.model_version_id == mv_id).first()
@@ -223,12 +227,8 @@ class InferenceService:
 
         p = resolve_temp_path(raw)
         if p.exists() and p.is_file():
-            token = p.relative_to(settings.temp_dir.resolve()).as_posix() if settings.temp_dir.resolve() in p.parents else str(p)
+            token = p.relative_to(settings.temp_dir.resolve()).as_posix()
             return p, token, meta
-
-        p2 = Path(raw)
-        if p2.is_absolute() and p2.exists() and p2.is_file():
-            return p2, str(p2), meta
 
         raise NotFoundError(f"Input file not found: {raw}")
 
@@ -242,9 +242,23 @@ class InferenceService:
         out_path = out_dir / name
 
         try:
-            r = requests.get(url, timeout=20)
-            r.raise_for_status()
-            out_path.write_bytes(r.content)
+            self._validate_remote_url(url)
+            max_bytes = max(1, int(settings.inference_max_download_bytes))
+            timeout = max(1.0, float(settings.inference_download_timeout_sec))
+
+            written = 0
+            with requests.get(url, timeout=timeout, stream=True) as r:
+                r.raise_for_status()
+                with open(out_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=64 * 1024):
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise ValidationError(
+                                f"image_url exceeds max allowed size ({max_bytes} bytes)"
+                            )
+                        f.write(chunk)
         except Exception as e:
             try:
                 out_path.unlink(missing_ok=True)
@@ -254,6 +268,41 @@ class InferenceService:
 
         token = out_path.relative_to(settings.temp_dir.resolve()).as_posix()
         return out_path, token
+
+    def _validate_remote_url(self, url: str) -> None:
+        parsed = urlparse(url)
+        scheme = str(parsed.scheme or "").strip().lower()
+        if not scheme:
+            raise ValidationError("image_url scheme is required")
+
+        allowed_schemes = {str(s).strip().lower() for s in settings.inference_allowed_schemes if str(s).strip()}
+        if not allowed_schemes:
+            allowed_schemes = {"http", "https"}
+        if scheme not in allowed_schemes:
+            raise ValidationError(f"image_url scheme not allowed: {scheme}")
+
+        host = str(parsed.hostname or "").strip().lower()
+        if not host:
+            raise ValidationError("image_url host is required")
+
+        allowed_hosts = {str(h).strip().lower() for h in settings.inference_allowed_hosts if str(h).strip()}
+        if allowed_hosts and host not in allowed_hosts:
+            raise ValidationError(f"image_url host not allowed: {host}")
+
+        # When host allowlist is absent, block local/private addresses by default.
+        if not allowed_hosts:
+            try:
+                ip = ipaddress.ip_address(host)
+            except ValueError:
+                return
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                raise ValidationError("image_url host resolves to a disallowed private address")
+
+    def _internal_request_headers(self) -> Dict[str, str]:
+        token = str(settings.internal_api_token or "").strip()
+        if not token:
+            return {}
+        return {self.INTERNAL_TOKEN_HEADER: token}
 
     def _run_by_engine(
         self,
@@ -289,7 +338,12 @@ class InferenceService:
 
         worker_error: str | None = None
         try:
-            resp = requests.post(f"{worker_url}/internal/inference/yolo", json=payload, timeout=timeout)
+            resp = requests.post(
+                f"{worker_url}/internal/inference/yolo",
+                json=payload,
+                timeout=timeout,
+                headers=self._internal_request_headers(),
+            )
             if resp.status_code != 200:
                 raise RuntimeError(f"Inference worker error {resp.status_code}: {resp.text}")
 
@@ -358,7 +412,12 @@ class InferenceService:
 
         worker_error: str | None = None
         try:
-            resp = requests.post(f"{worker_url}/internal/inference/paddle-det", json=payload, timeout=timeout)
+            resp = requests.post(
+                f"{worker_url}/internal/inference/paddle-det",
+                json=payload,
+                timeout=timeout,
+                headers=self._internal_request_headers(),
+            )
             if resp.status_code != 200:
                 raise RuntimeError(f"Paddle inference worker error {resp.status_code}: {resp.text}")
             try:

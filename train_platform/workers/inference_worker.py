@@ -6,8 +6,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+
+from train_platform.core.config import settings
 
 app = FastAPI(title="Inference Worker", version="1.0")
 
@@ -42,6 +44,27 @@ class ExportOnnxRequest(BaseModel):
 class WorkerStatusResponse(BaseModel):
     status: str
     error: Optional[str] = None
+
+
+def _verify_internal_auth(x_internal_token: Optional[str] = Header(default=None, alias="X-Internal-Token")) -> None:
+    expected = str(settings.internal_api_token or "").strip()
+    if not expected:
+        return
+    provided = str(x_internal_token or "").strip()
+    if provided != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized internal request")
+
+
+def _resolve_training_path(raw: str, *, label: str, must_exist: bool = True) -> Path:
+    base = settings.training_dir.resolve()
+    path = Path(str(raw)).resolve(strict=False)
+    try:
+        path.relative_to(base)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"{label} must be under training directory") from e
+    if must_exist and (not path.exists() or not path.is_file()):
+        raise HTTPException(status_code=404, detail=f"{label} not found: {path}")
+    return path
 
 
 def _run_ultralytics_yolo(weights_path: Path, image_path: Path, *, conf: float, iou: float) -> Dict[str, Any]:
@@ -102,7 +125,7 @@ def _run_ultralytics_yolo(weights_path: Path, image_path: Path, *, conf: float, 
 
 
 @app.post("/internal/inference/yolo", response_model=InferenceResponse)
-def run_inference(req: InferenceRequest) -> InferenceResponse:
+def run_inference(req: InferenceRequest, _: None = Depends(_verify_internal_auth)) -> InferenceResponse:
     weights_path = Path(req.weights_path)
     if not weights_path.exists() or not weights_path.is_file():
         raise HTTPException(status_code=404, detail=f"Weights not found: {weights_path}")
@@ -121,7 +144,7 @@ def run_inference(req: InferenceRequest) -> InferenceResponse:
 
 
 @app.post("/internal/model-conversions/pt-to-onnx", response_model=WorkerStatusResponse)
-def start_model_conversion(req: ModelConversionRequest) -> WorkerStatusResponse:
+def start_model_conversion(req: ModelConversionRequest, _: None = Depends(_verify_internal_auth)) -> WorkerStatusResponse:
     try:
         from train_platform.api.v2.model_conversions import _run_pt_to_onnx
     except Exception as e:
@@ -136,12 +159,9 @@ def start_model_conversion(req: ModelConversionRequest) -> WorkerStatusResponse:
 
 
 @app.post("/internal/training-runs/export-onnx", response_model=WorkerStatusResponse)
-def export_training_onnx(req: ExportOnnxRequest) -> WorkerStatusResponse:
-    src_pt = Path(req.src_pt)
-    if not src_pt.exists() or not src_pt.is_file():
-        raise HTTPException(status_code=404, detail=f"Weights not found: {src_pt}")
-
-    out_onnx = Path(req.out_onnx)
+def export_training_onnx(req: ExportOnnxRequest, _: None = Depends(_verify_internal_auth)) -> WorkerStatusResponse:
+    src_pt = _resolve_training_path(req.src_pt, label="weights", must_exist=True)
+    out_onnx = _resolve_training_path(req.out_onnx, label="output", must_exist=False)
     out_onnx.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -193,6 +213,10 @@ def export_training_onnx(req: ExportOnnxRequest) -> WorkerStatusResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("INFERENCE_WORKER_HOST", "0.0.0.0")
+    host = (
+        str(settings.worker_bind_host).strip()
+        or os.getenv("INFERENCE_WORKER_HOST")
+        or "0.0.0.0"
+    )
     port = int(os.getenv("INFERENCE_WORKER_PORT", "18002"))
     uvicorn.run("train_platform.workers.inference_worker:app", host=host, port=port)

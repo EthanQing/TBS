@@ -389,9 +389,12 @@ class TrainingRunService:
     def resume_run(self, db: Session, run_id: str) -> TrainingRun:
         run = self.get_run(db, run_id)
 
-        # 1. Validation: only allow resuming cancelled or failed runs (or stopped?)
-        if run.status not in (TrainingRunStatus.CANCELLED, TrainingRunStatus.FAILED, TrainingRunStatus.COMPLETED):
-            raise ConflictError(f"Run status is {run.status}; must be CANCELLED, FAILED, or COMPLETED to resume")
+        if run.status == TrainingRunStatus.COMPLETED:
+            raise ConflictError("Run is COMPLETED and cannot be resumed; create a new training run instead")
+
+        # 1. Validation: only allow resuming cancelled or failed runs.
+        if run.status not in (TrainingRunStatus.CANCELLED, TrainingRunStatus.FAILED):
+            raise ConflictError(f"Run status is {run.status}; must be CANCELLED or FAILED to resume")
 
         # 2. Check for weights
         weights_path = settings.training_dir / str(run_id) / "weights" / "last.pt"

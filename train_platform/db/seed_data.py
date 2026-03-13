@@ -190,7 +190,7 @@ DEFAULT_ARCHITECTURES: list[dict] = [
     *yolo12_detection_variants(),
     *yolo26_detection_variants(),
     *rtdetr_detection_variants(),
-    *paddle_det_detection_variants(),
+    # *paddle_det_detection_variants(),
     # *yolov8_classification_variants(),
     # *yolov8_segmentation_variants(),
 ]
