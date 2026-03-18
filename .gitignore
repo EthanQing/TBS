@@ -13,6 +13,9 @@
 *.pyc
 *.pyo
 *.pyd
+*.c
+*.wheel
+*.so
 
 # --- 虚拟环境 ---
 .venv/
