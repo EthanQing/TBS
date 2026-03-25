@@ -19,6 +19,7 @@ from train_platform.api.v2.pretrain_models import router as pretrain_models_rout
 from train_platform.api.v2.projects import router as projects_router
 from train_platform.api.v2.stats import router as stats_router
 from train_platform.api.v2.serving import router as serving_router
+from train_platform.api.v2.system_metrics import router as system_metrics_router
 from train_platform.api.v2.thumbnails import router as thumbnails_router
 from train_platform.api.v2.training_runs import router as training_runs_router
 
@@ -41,5 +42,6 @@ router.include_router(inference_jobs_router)
 router.include_router(serving_router)
 router.include_router(pretrain_models_router)
 router.include_router(stats_router)
+router.include_router(system_metrics_router)
 router.include_router(thumbnails_router)
 router.include_router(chart_configs_router)

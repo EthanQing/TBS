@@ -34,6 +34,8 @@ dependencies = [
   "numba>=0.64.0",
   "motmetrics>=1.4.0",
   "paddlepaddle-gpu>=2.6.2",
+  "psutil>=7.2.2",
+  "pynvml>=13.0.1",
 ]
 
 [tool.uvicorn]
