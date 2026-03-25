@@ -122,12 +122,12 @@ class SystemMetricsService:
         gpu_used_mb = None
         gpu_total_mb = None
         if gpus:
-            gpu_utils = [float(x["utilization_percent"]) for x in gpus if x.get("utilization_percent") is not None]
+            gpu_mem_pcts = [float(x["memory_percent"]) for x in gpus if x.get("memory_percent") is not None]
             gpu_used = [float(x["memory_used_mb"]) for x in gpus if x.get("memory_used_mb") is not None]
             gpu_total = [float(x["memory_total_mb"]) for x in gpus if x.get("memory_total_mb") is not None]
 
-            if gpu_utils:
-                gpu_percent = sum(gpu_utils) / float(len(gpu_utils))
+            if gpu_mem_pcts:
+                gpu_percent = sum(gpu_mem_pcts) / float(len(gpu_mem_pcts))
             if gpu_used:
                 gpu_used_mb = sum(gpu_used)
             if gpu_total:
