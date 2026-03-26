@@ -3,23 +3,30 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from train_platform.models.enums import LogLevel, TrainingRunStatus
 
 
 class TrainingRunParametersIn(BaseModel):
     epochs: int = Field(100, gt=0)
-    batch_size: int = Field(16, gt=0)
+    batch_size: int = Field(16, description=">0 for fixed batch size; set -1 for Ultralytics auto batch")
     image_size: int = Field(640, gt=0)
     learning_rate: float = Field(0.01, gt=0)
     patience: int = Field(50, ge=0)
-    device: str = Field("auto")
+    device: str = Field("auto", description="auto | cpu | gpu | cuda:0 | 0,1")
     workers: int = Field(8, ge=-1)
     use_pretrained: bool = True
     optimizer: str = Field("AdamW")
     augmentation: Optional[Dict[str, Any]] = None
     additional_params: Optional[Dict[str, Any]] = None
+
+    @field_validator("batch_size")
+    @classmethod
+    def validate_batch_size(cls, value: int) -> int:
+        if int(value) == -1 or int(value) > 0:
+            return int(value)
+        raise ValueError("batch_size must be > 0, or -1 for auto batch")
 
 
 class TrainingRunParametersOut(TrainingRunParametersIn):

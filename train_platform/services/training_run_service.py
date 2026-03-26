@@ -37,6 +37,7 @@ from train_platform.training.registry import get_plugin
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.training_artifacts import index_completion_artifacts
 from train_platform.utils.path_utils import resolve_dataset_path, resolve_training_path
+from train_platform.utils.training_params import validate_training_params_for_engine
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.services.inference_service import InferenceService
 from train_platform.services.alarm_service import AlarmService
@@ -278,6 +279,11 @@ class TrainingRunService:
             raise ValidationError(
                 f"Architecture engine '{arch_engine}' is not implemented yet; select another framework plugin"
             )
+
+        try:
+            params = validate_training_params_for_engine(arch_engine, params)
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
 
         additional_params = params.get("additional_params")
         if additional_params is not None and not isinstance(additional_params, dict):

@@ -93,7 +93,8 @@
   "architecture_id": 12,
   "parameters": {
     "epochs": 100,
-    "batch_size": 16,
+    "batch_size": -1,
+    "device": "0",
     "additional_params": {
       "framework_config": {
         "resume_training": false,
@@ -105,3 +106,9 @@
 ```
 
 训练 worker 会按 `architecture.engine` 选择插件，并将 `framework_config` 传入插件执行。
+
+### 训练参数补充说明
+
+- `batch_size = -1`：仅 `ultralytics-yolo`（YOLO / RT-DETR）支持，表示启用 Ultralytics 自动 batch。
+- `device = "0,1"`：仅 `ultralytics-yolo` 支持，表示使用多卡训练。
+- Ultralytics 多卡训练时，`batch_size` 必须为正整数，且能被 GPU 数量整除；`batch_size=-1` 不支持多卡。

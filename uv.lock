@@ -2457,18 +2457,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pynvml"
-version = "13.0.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "nvidia-ml-py" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/5c/57/da7dc63a79f59e082e26a66ac02d87d69ea316b35b35b7a00d82f3ce3d2f/pynvml-13.0.1.tar.gz", hash = "sha256:1245991d9db786b4d2f277ce66869bd58f38ac654e38c9397d18f243c8f6e48f", size = 35226, upload_time = "2025-09-05T20:33:25.377Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d7/4a/cac76c174bb439a0c46c9a4413fcbea5c6cabfb01879f7bbdb9fdfaed76c/pynvml-13.0.1-py3-none-any.whl", hash = "sha256:e2b20e0a501eeec951e2455b7ab444759cf048e0e13a57b08049fa2775266aa8", size = 28810, upload_time = "2025-09-05T20:33:24.13Z" },
-]
-
-[[package]]
 name = "pyparsing"
 version = "3.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3288,6 +3276,7 @@ dependencies = [
     { name = "motmetrics" },
     { name = "nuitka" },
     { name = "numba" },
+    { name = "nvidia-ml-py" },
     { name = "onnx" },
     { name = "onnxruntime-gpu" },
     { name = "opencv-python-headless" },
@@ -3298,7 +3287,6 @@ dependencies = [
     { name = "protobuf", version = "3.20.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
     { name = "psutil" },
     { name = "pymysql" },
-    { name = "pynvml" },
     { name = "python-dotenv" },
     { name = "python-multipart" },
     { name = "pyyaml" },
@@ -3325,6 +3313,7 @@ requires-dist = [
     { name = "motmetrics", specifier = ">=1.4.0" },
     { name = "nuitka", specifier = ">=2.8.10" },
     { name = "numba", specifier = ">=0.64.0" },
+    { name = "nvidia-ml-py", specifier = ">=13.595.45" },
     { name = "onnx", specifier = "<=1.16.0" },
     { name = "onnxruntime-gpu", specifier = ">=1.23.2" },
     { name = "opencv-python-headless", specifier = "==4.9.0.80" },
@@ -3334,7 +3323,6 @@ requires-dist = [
     { name = "protobuf", specifier = "<=3.20.3" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "pymysql", specifier = "==1.1.0" },
-    { name = "pynvml", specifier = ">=13.0.1" },
     { name = "python-dotenv", specifier = "==1.0.1" },
     { name = "python-multipart", specifier = "==0.0.9" },
     { name = "pyyaml", specifier = "==6.0.1" },

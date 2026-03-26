@@ -13,6 +13,7 @@ from train_platform.core.config import settings
 from train_platform.training.plugins.base import TrainContext
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
+from train_platform.utils.training_params import AUTO_BATCH_SIZE, extract_selected_gpu_ids, normalize_device_spec
 
 logger = logging.getLogger("train_platform.training.ultralytics")
 
@@ -342,20 +343,36 @@ class UltralyticsYOLOTrainer:
             except Exception:
                 run_data_yaml = data_yaml
 
-            device_value = str(getattr(job.parameters, "device", "auto") or "auto").strip().lower()
-            if device_value in ("", "default", "自动"):
-                device_value = "auto"
-            elif device_value == "gpu":
-                device_value = "0"
-            elif device_value.startswith("cuda:"):
-                device_value = device_value.split("cuda:", 1)[1] or "0"
-            if device_value not in ("auto", "cpu") and not torch.cuda.is_available():
-                device_value = "cpu"
+            batch_size = int(getattr(job.parameters, "batch_size", 16) or 16)
+            device_value = normalize_device_spec(getattr(job.parameters, "device", "auto") or "auto")
+            selected_gpu_ids = extract_selected_gpu_ids(device_value)
+            multi_gpu = len(selected_gpu_ids) > 1
+
+            if selected_gpu_ids:
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        f"GPU device(s) requested ({device_value}) but CUDA is not available on this worker"
+                    )
+                available_gpu_count = int(torch.cuda.device_count())
+                missing_gpu_ids = [idx for idx in selected_gpu_ids if idx >= available_gpu_count]
+                if missing_gpu_ids:
+                    raise RuntimeError(
+                        f"Requested GPU device(s) {missing_gpu_ids} but this worker only has "
+                        f"{available_gpu_count} visible CUDA device(s)"
+                    )
+
+            if multi_gpu and batch_size == AUTO_BATCH_SIZE:
+                raise RuntimeError("Ultralytics auto batch (batch_size=-1) is not supported for multi-GPU training")
+            if multi_gpu and batch_size > 0 and batch_size % len(selected_gpu_ids) != 0:
+                raise RuntimeError(
+                    f"Ultralytics multi-GPU batch_size ({batch_size}) must be divisible by the "
+                    f"selected GPU count ({len(selected_gpu_ids)})"
+                )
 
             train_args: Dict[str, Any] = {
                 "data": str(run_data_yaml),
                 "epochs": int(job.parameters.epochs),
-                "batch": int(job.parameters.batch_size),
+                "batch": batch_size,
                 "imgsz": int(job.parameters.image_size),
                 "workers": int(getattr(job.parameters, "workers", 8) or 8),
                 "project": str(settings.training_dir),
