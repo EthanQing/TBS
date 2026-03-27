@@ -17,6 +17,7 @@ from train_platform.schemas.v2.datasets import (
     DatasetDetailOut,
     DatasetEventOut,
     DatasetFileOut,
+    DatasetImageAnnotationsOut,
     DatasetImageUploadOut,
     DatasetListOut,
     DatasetOut,
@@ -173,6 +174,21 @@ def get_dataset_view(
         class_id=class_id,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get("/{dataset_id}/image-annotations", response_model=DatasetImageAnnotationsOut)
+def get_dataset_image_annotations(
+    dataset_id: int,
+    image_path: str = Query(..., description="Relative image path, e.g. images/train/000001.jpg"),
+    version_id: int | None = Query(None, description="Version ID (default: active version)"),
+    db: Session = Depends(get_db),
+):
+    return DatasetService().get_image_annotations(
+        db,
+        int(dataset_id),
+        image_path=image_path,
+        version_id=version_id,
     )
 
 

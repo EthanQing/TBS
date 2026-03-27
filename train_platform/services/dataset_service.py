@@ -9,6 +9,7 @@ import time
 import uuid
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, List, Dict, Tuple
@@ -17,6 +18,14 @@ import yaml
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover
+    Image = None
+try:
+    import rasterio
+except Exception:  # pragma: no cover
+    rasterio = None
 
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
@@ -99,6 +108,8 @@ def _versions_token(ds: Dataset) -> str:
 class DatasetService:
     _illegal_preset_lock = threading.Lock()
     _illegal_preset_file_name = "illegal_label_mapping_presets.json"
+    _artifact_jobs_lock = threading.Lock()
+    _artifact_jobs: dict[str, dict[str, Any]] = {}
 
     def __init__(self) -> None:
         self.datasets = DatasetRepository()
@@ -2077,157 +2088,104 @@ class DatasetService:
     ) -> dict:
         """
         Get dataset view with category statistics and paginated image list.
-        
-        Parses YOLO labels to build class-to-image mapping and returns
-        category counts for sidebar and filtered image list for grid.
         """
         import math
-        
+
         ds = self.get_dataset(db, dataset_id)
-        
-        # Get version
-        ver: DatasetVersion | None = None
-        if version_id is not None:
-            ver = (
-                db.query(DatasetVersion)
-                .filter(DatasetVersion.version_id == int(version_id), DatasetVersion.dataset_id == ds.dataset_id)
-                .first()
-            )
-        else:
-            if ds.active_version_id is not None:
-                ver = (
-                    db.query(DatasetVersion)
-                    .filter(DatasetVersion.version_id == ds.active_version_id, DatasetVersion.dataset_id == ds.dataset_id)
-                    .first()
-                )
-        
-        if not ver:
-            raise NotFoundError("Dataset version not found (no active version?)")
-        
-        # Get class names from version metadata
-        class_names: list[str] = []
-        if isinstance(ver.meta, dict):
-            yolo = ver.meta.get("yolo")
-            if isinstance(yolo, dict):
-                names = yolo.get("names")
-                class_names = self._normalize_yolo_names(names, yolo.get("nc"))
-        
-        # Resolve dataset path
-        dataset_path = resolve_dataset_path(ds.storage_path).resolve(strict=False)
-
-        def _canonical_image_key_from_label(label_file: Path) -> str:
-            try:
-                rel = label_file.resolve(strict=False).relative_to((dataset_path / "labels").resolve(strict=False))
-            except Exception:
-                rel = label_file
-            return rel.with_suffix("").as_posix().lstrip("./")
-
-        def _canonical_image_key_from_manifest(rel_path: str) -> str:
-            s = str(rel_path or "").strip().replace("\\", "/")
-            if s.startswith("images/"):
-                s = s[len("images/") :]
-            return Path(s).with_suffix("").as_posix().lstrip("./")
-        
-        # Parse labels to build image -> classes mapping
-        image_classes: dict[str, set[int]] = {}  # canonical image key -> set of class_ids
-        labels_dir = dataset_path / "labels"
-        
-        if labels_dir.exists() and labels_dir.is_dir():
-            for label_path in labels_dir.rglob("*.txt"):
-                key = _canonical_image_key_from_label(label_path)
-                try:
-                    with label_path.open("r", encoding="utf-8", errors="ignore") as f:
-                        class_ids = set()
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            parts = line.split()
-                            if parts:
-                                try:
-                                    cid = int(parts[0])
-                                    if cid >= 0:
-                                        class_ids.add(cid)
-                                except ValueError:
-                                    pass
-                        if class_ids:
-                            image_classes[key] = class_ids
-                except Exception:
-                    pass
-        
-        # Build category counts
-        class_image_count: dict[int, int] = {}
-        for stem, class_ids in image_classes.items():
-            for cid in class_ids:
-                class_image_count[cid] = class_image_count.get(cid, 0) + 1
-        
-        # Build categories list for sidebar
-        categories = []
-        for cid, count in sorted(class_image_count.items()):
-            name = class_names[cid] if 0 <= cid < len(class_names) else f"class_{cid}"
-            categories.append({
-                "class_id": cid,
-                "name": name,
-                "count": count,
-            })
-        
-        # Get all images from manifest
-        image_exts = IMAGE_EXTS
-        all_images: list[tuple[str, str]] = []  # (relative_path, canonical_key)
-        
-        if ver.manifest_path:
-            for rel, size_bytes, mtime in self._iter_manifest_entries(ver.manifest_path):
-                rel = str(rel or "").strip().replace("\\", "/")
-                if not rel:
-                    continue
-                ext = Path(rel).suffix.lower()
-                if ext not in image_exts:
-                    continue
-                key = _canonical_image_key_from_manifest(rel)
-                all_images.append((rel, key))
-        
-        # Filter by class_id if specified
-        if class_id is not None:
-            filtered_images = []
-            for rel, key in all_images:
-                class_ids = image_classes.get(key, set())
-                if class_id in class_ids:
-                    filtered_images.append((rel, key))
-            all_images = filtered_images
-        
-        # Pagination
-        total_items = len(all_images)
-        total_pages = max(1, math.ceil(total_items / page_size))
-        page = max(1, min(page, total_pages))
-        start = (page - 1) * page_size
-        end = start + page_size
-        page_images = all_images[start:end]
-        
-        # Build image items
+        ver = self._resolve_dataset_version(db, ds, version_id)
         root_token = str(ver.snapshot_path or ds.storage_path)
+        dataset_path = resolve_dataset_path(root_token).resolve(strict=False)
         url_prefix = self._dataset_static_prefix(root_token)
-        
-        items = []
-        for idx, (rel, key) in enumerate(page_images):
-            # Build URLs
-            url = f"{url_prefix}/{rel.lstrip('/')}"
-            # Use static path for pre-generated thumbnails (much faster)
-            rel_webp = str(Path(rel).with_suffix(".webp"))
-            thumbnail_url = f"/static/thumbnails/{ds.dataset_id}/{rel_webp}"
-            
-            # Get class ids for this image
-            class_ids = list(image_classes.get(key, set()))
-            
-            items.append({
-                "id": start + idx + 1,  # Simple sequential ID for this page
-                "name": rel,
-                "url": url,
-                "thumbnail_url": thumbnail_url,
-                "width": None,
-                "height": None,
-                "classes": sorted(class_ids),
-            })
-        
+        class_names = self._get_version_class_names(ver)
+        image_rels = self._collect_manifest_image_rels(ver.manifest_path) if ver.manifest_path else []
+        index_payload = self._load_view_index(ver.manifest_path) if ver.manifest_path else None
+
+        if index_payload is None and ver.manifest_path:
+            # Filtering by class requires the complete index; build it on demand.
+            if class_id is not None and ds.dataset_type == DatasetType.DETECTION:
+                index_payload = self._build_and_store_view_index(ds, ver, dataset_root=dataset_path)
+            else:
+                self._trigger_view_index_generation(ds, ver, dataset_root=dataset_path)
+
+        if index_payload is not None:
+            items_payload = list(index_payload.get("images") or [])
+            if class_id is not None:
+                items_payload = [
+                    item for item in items_payload
+                    if int(class_id) in {int(cid) for cid in list(item.get("classes") or [])}
+                ]
+
+            total_items = len(items_payload)
+            total_pages = max(1, math.ceil(total_items / page_size))
+            page = max(1, min(page, total_pages))
+            start = (page - 1) * page_size
+            end = start + page_size
+            page_payload = items_payload[start:end]
+
+            categories = []
+            class_image_count = dict(index_payload.get("class_image_count") or {})
+            for raw_cid, raw_count in sorted(class_image_count.items(), key=lambda kv: int(kv[0])):
+                cid = int(raw_cid)
+                name = class_names[cid] if 0 <= cid < len(class_names) else f"class_{cid}"
+                categories.append({"class_id": cid, "name": name, "count": int(raw_count or 0)})
+
+            items = [
+                self._make_view_item(
+                    dataset_id=int(ds.dataset_id),
+                    version=ver,
+                    url_prefix=url_prefix,
+                    rel=str(item.get("rel") or ""),
+                    index=int(start + idx + 1),
+                    object_count=int(item.get("object_count") or 0),
+                    classes=[int(cid) for cid in list(item.get("classes") or [])],
+                )
+                for idx, item in enumerate(page_payload)
+                if str(item.get("rel") or "").strip()
+            ]
+            view_index_status = "ready"
+        else:
+            total_items = len(image_rels)
+            total_pages = max(1, math.ceil(total_items / page_size))
+            page = max(1, min(page, total_pages))
+            start = (page - 1) * page_size
+            end = start + page_size
+            page_rels = image_rels[start:end]
+            fallback_stats = (
+                self._load_detection_stats_for_image_rels(
+                    dataset_path=dataset_path,
+                    image_rels=page_rels,
+                    max_workers=max(1, settings.view_index_max_workers),
+                )
+                if ds.dataset_type == DatasetType.DETECTION
+                else {}
+            )
+            items = []
+            for idx, rel in enumerate(page_rels):
+                stat = fallback_stats.get(str(rel), {})
+                items.append(
+                    self._make_view_item(
+                        dataset_id=int(ds.dataset_id),
+                        version=ver,
+                        url_prefix=url_prefix,
+                        rel=rel,
+                        index=int(start + idx + 1),
+                        object_count=int(stat.get("object_count") or 0),
+                        classes=[int(cid) for cid in list(stat.get("classes") or [])],
+                    )
+                )
+            categories = []
+            view_index_status = self._get_artifact_job_summary(
+                self._artifact_job_key("view_index", int(ds.dataset_id), int(ver.version_id))
+            ).get("state", "building")
+
+        thumb_job = self._get_artifact_job_summary(
+            self._artifact_job_key(
+                "thumbnails",
+                int(ds.dataset_id),
+                int(ver.version_id) if ver.snapshot_path else None,
+            )
+        )
+
         return {
             "dataset_id": ds.dataset_id,
             "version_id": ver.version_id,
@@ -2238,7 +2196,60 @@ class DatasetService:
                 "page_size": page_size,
                 "total_items": total_items,
                 "total_pages": total_pages,
+                "thumbnail_status": thumb_job.get("state", "ready"),
+                "thumbnail_progress": thumb_job.get("progress"),
+                "view_index_status": view_index_status,
             },
+        }
+
+    def get_image_annotations(
+        self,
+        db: Session,
+        dataset_id: int,
+        *,
+        image_path: str,
+        version_id: int | None = None,
+    ) -> dict:
+        ds = self.get_dataset(db, dataset_id)
+        ver = self._resolve_dataset_version(db, ds, version_id)
+
+        root_token = str(ver.snapshot_path or ds.storage_path)
+        dataset_path = resolve_dataset_path(root_token).resolve(strict=False)
+        dataset_root = dataset_path.resolve(strict=False)
+
+        image_rel = Path(str(image_path or "").strip().replace("\\", "/").lstrip("/"))
+        if not image_rel.as_posix() or image_rel.is_absolute() or ".." in image_rel.parts:
+            raise ValidationError("image_path must be a safe relative path")
+
+        image_abs = (dataset_root / image_rel).resolve(strict=False)
+        if dataset_root not in image_abs.parents and image_abs != dataset_root:
+            raise ValidationError("Unsafe image_path")
+        if not image_abs.exists() or not image_abs.is_file():
+            raise NotFoundError("Image file not found")
+
+        width, height = self._read_image_size(image_abs)
+        class_names = self._get_version_class_names(ver)
+        label_rel = self._guess_label_rel_path_from_image(image_rel.as_posix())
+        label_abs = (dataset_root / label_rel).resolve(strict=False)
+
+        boxes = []
+        object_count = 0
+        if dataset_root in label_abs.parents and label_abs.exists() and label_abs.is_file():
+            object_count = self._count_yolo_objects(label_abs)
+            boxes = self._parse_yolo_boxes(label_abs, width=width, height=height, class_names=class_names)
+
+        url_prefix = self._dataset_static_prefix(root_token)
+        image_url = f"{url_prefix}/{image_rel.as_posix()}" if url_prefix else image_rel.as_posix()
+
+        return {
+            "dataset_id": int(ds.dataset_id),
+            "version_id": int(ver.version_id),
+            "image_path": image_rel.as_posix(),
+            "image_url": image_url,
+            "width": width,
+            "height": height,
+            "object_count": int(object_count),
+            "boxes": boxes,
         }
 
     def create_version(
@@ -2338,9 +2349,7 @@ class DatasetService:
             ds.active_version_id = row.version_id
 
         self._ensure_images_indexed(db, ds, row)
-
-        snapshot_abs = resolve_dataset_path(snapshot_rel)
-        self._trigger_thumbnail_pregeneration(ds.dataset_id, snapshot_abs)
+        self._schedule_version_artifacts(ds, row)
 
         db.commit()
         db.refresh(ds)
@@ -2419,9 +2428,7 @@ class DatasetService:
 
         # Index images for this version so every image has a stable ID.
         self._ensure_images_indexed(db, ds, row)
-
-        # Pre-generate thumbnails in background thread for instant loading
-        self._trigger_thumbnail_pregeneration(ds.dataset_id, dataset_path)
+        self._schedule_version_artifacts(ds, row)
 
         return row
 
@@ -2479,7 +2486,7 @@ class DatasetService:
 
         # Index images for preview
         self._ensure_images_indexed(db, ds, row)
-        self._trigger_thumbnail_pregeneration(ds.dataset_id, dataset_path)
+        self._schedule_version_artifacts(ds, row)
 
         return row
 
@@ -2916,6 +2923,467 @@ class DatasetService:
     # --------------------
     # dataset images / splits
     # --------------------
+    def _artifact_job_key(self, kind: str, dataset_id: int, version_id: int | None = None) -> str:
+        suffix = f":v{int(version_id)}" if version_id is not None else ":live"
+        return f"{str(kind).strip().lower()}:{int(dataset_id)}{suffix}"
+
+    def _set_artifact_job_summary(self, key: str, **fields: Any) -> dict[str, Any]:
+        with self._artifact_jobs_lock:
+            current = dict(self._artifact_jobs.get(key) or {})
+            current.update(fields)
+            current["updated_at"] = _utcnow().isoformat()
+            self._artifact_jobs[key] = current
+            return dict(current)
+
+    def _get_artifact_job_summary(self, key: str) -> dict[str, Any]:
+        with self._artifact_jobs_lock:
+            return dict(self._artifact_jobs.get(key) or {})
+
+    def _thumbnail_cache_prefix_for_version(self, ver: DatasetVersion) -> str | None:
+        if getattr(ver, "snapshot_path", None):
+            return f"v{int(ver.version_id)}"
+        return None
+
+    def _thumbnail_static_url(self, *, dataset_id: int, version: DatasetVersion, rel: str) -> str:
+        rel_webp = Path(str(rel or "")).with_suffix(".webp").as_posix().lstrip("/")
+        cache_prefix = self._thumbnail_cache_prefix_for_version(version)
+        if cache_prefix:
+            return f"/static/thumbnails/{int(dataset_id)}/{cache_prefix}/{rel_webp}"
+        return f"/static/thumbnails/{int(dataset_id)}/{rel_webp}"
+
+    def _make_view_item(
+        self,
+        *,
+        dataset_id: int,
+        version: DatasetVersion,
+        url_prefix: str | None,
+        rel: str,
+        index: int,
+        object_count: int,
+        classes: list[int],
+    ) -> dict[str, Any]:
+        rel_clean = str(rel or "").strip().replace("\\", "/").lstrip("/")
+        url = f"{url_prefix}/{rel_clean}" if url_prefix else rel_clean
+        return {
+            "id": int(index),
+            "name": rel_clean,
+            "url": url,
+            "thumbnail_url": self._thumbnail_static_url(dataset_id=int(dataset_id), version=version, rel=rel_clean),
+            "width": None,
+            "height": None,
+            "object_count": int(object_count or 0),
+            "classes": sorted({int(cid) for cid in list(classes or []) if int(cid) >= 0}),
+        }
+
+    def _view_index_path(self, manifest_rel: str | None) -> Path | None:
+        if not manifest_rel:
+            return None
+        base = settings.datasets_dir.resolve()
+        manifest_path = (base / str(manifest_rel)).resolve(strict=False)
+        if base not in manifest_path.parents and manifest_path != base:
+            raise ValidationError("Unsafe manifest path")
+        return manifest_path.with_name("view_index.json")
+
+    def _collect_manifest_image_rels(self, manifest_rel: str | None, *, limit: int | None = None) -> list[str]:
+        image_rels: list[str] = []
+        if not manifest_rel:
+            return image_rels
+        max_items = int(limit) if limit is not None else None
+        for rel, _size_bytes, _mtime in self._iter_manifest_entries(manifest_rel):
+            rel_str = str(rel or "").strip().replace("\\", "/")
+            if not rel_str:
+                continue
+            if Path(rel_str).suffix.lower() not in IMAGE_EXTS:
+                continue
+            image_rels.append(rel_str)
+            if max_items is not None and len(image_rels) >= max_items:
+                break
+        return image_rels
+
+    def _read_json_file(self, path: Path) -> dict[str, Any] | None:
+        try:
+            if not path.exists() or not path.is_file():
+                return None
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+            data = json.loads(raw or "{}")
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return None
+        return None
+
+    def _load_view_index(self, manifest_rel: str | None) -> dict[str, Any] | None:
+        path = self._view_index_path(manifest_rel)
+        if path is None:
+            return None
+        data = self._read_json_file(path)
+        if not isinstance(data, dict):
+            return None
+        images_raw = list(data.get("images") or [])
+        class_image_count_raw = data.get("class_image_count") or {}
+        images: list[dict[str, Any]] = []
+        for item in images_raw:
+            if not isinstance(item, dict):
+                continue
+            rel = str(item.get("rel") or "").strip().replace("\\", "/")
+            if not rel:
+                continue
+            images.append(
+                {
+                    "rel": rel,
+                    "key": self._canonical_image_key_from_rel(rel),
+                    "object_count": int(item.get("object_count") or 0),
+                    "classes": sorted({int(cid) for cid in list(item.get("classes") or []) if int(cid) >= 0}),
+                }
+            )
+        class_image_count: dict[str, int] = {}
+        if isinstance(class_image_count_raw, dict):
+            for raw_k, raw_v in class_image_count_raw.items():
+                try:
+                    class_image_count[str(int(raw_k))] = int(raw_v or 0)
+                except Exception:
+                    continue
+        return {
+            "generated_at": data.get("generated_at"),
+            "images": images,
+            "class_image_count": class_image_count,
+        }
+
+    def _write_view_index(self, manifest_rel: str | None, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._view_index_path(manifest_rel)
+        if path is None:
+            return payload
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(path)
+        return payload
+
+    def _summarize_yolo_label(self, label_path: Path) -> tuple[list[int], int]:
+        if not label_path.exists() or not label_path.is_file():
+            return [], 0
+        class_ids: set[int] = set()
+        object_count = 0
+        try:
+            with label_path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        cid = int(parts[0])
+                    except Exception:
+                        continue
+                    if cid < 0:
+                        continue
+                    class_ids.add(int(cid))
+                    object_count += 1
+        except Exception:
+            return [], 0
+        return sorted(class_ids), int(object_count)
+
+    def _load_detection_stats_for_image_rels(
+        self,
+        *,
+        dataset_path: Path,
+        image_rels: list[str],
+        max_workers: int,
+    ) -> dict[str, dict[str, Any]]:
+        if not image_rels:
+            return {}
+
+        dataset_root = Path(dataset_path).resolve(strict=False)
+        results: dict[str, dict[str, Any]] = {}
+
+        def _one(rel: str) -> tuple[str, list[int], int]:
+            rel_str = str(rel or "").strip().replace("\\", "/").lstrip("/")
+            if not rel_str:
+                return "", [], 0
+            label_rel = self._guess_label_rel_path_from_image(rel_str)
+            label_abs = (dataset_root / label_rel).resolve(strict=False)
+            if dataset_root not in label_abs.parents and label_abs != dataset_root:
+                return rel_str, [], 0
+            classes, object_count = self._summarize_yolo_label(label_abs)
+            return rel_str, classes, object_count
+
+        worker_count = max(1, min(int(max_workers or 1), max(1, len(image_rels))))
+        if worker_count <= 1 or len(image_rels) <= 1:
+            for rel in image_rels:
+                rel_str, classes, object_count = _one(rel)
+                if rel_str:
+                    results[rel_str] = {"classes": classes, "object_count": int(object_count)}
+            return results
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_one, rel) for rel in image_rels]
+            for future in as_completed(futures):
+                try:
+                    rel_str, classes, object_count = future.result()
+                except Exception:
+                    continue
+                if rel_str:
+                    results[rel_str] = {"classes": classes, "object_count": int(object_count)}
+        return results
+
+    def _build_view_index_payload(
+        self,
+        *,
+        dataset_path: Path,
+        image_rels: list[str],
+        dataset_type: DatasetType,
+    ) -> dict[str, Any]:
+        images: list[dict[str, Any]] = []
+        class_image_count: dict[str, int] = {}
+
+        detection_stats = (
+            self._load_detection_stats_for_image_rels(
+                dataset_path=dataset_path,
+                image_rels=image_rels,
+                max_workers=max(1, settings.view_index_max_workers),
+            )
+            if dataset_type == DatasetType.DETECTION
+            else {}
+        )
+
+        for rel in image_rels:
+            rel_str = str(rel or "").strip().replace("\\", "/")
+            if not rel_str:
+                continue
+            stat = detection_stats.get(rel_str, {})
+            classes = sorted({int(cid) for cid in list(stat.get("classes") or []) if int(cid) >= 0})
+            object_count = int(stat.get("object_count") or 0)
+            images.append(
+                {
+                    "rel": rel_str,
+                    "key": self._canonical_image_key_from_rel(rel_str),
+                    "object_count": object_count,
+                    "classes": classes,
+                }
+            )
+            for cid in classes:
+                key = str(int(cid))
+                class_image_count[key] = int(class_image_count.get(key, 0) + 1)
+
+        return {
+            "generated_at": _utcnow().isoformat(),
+            "images": images,
+            "class_image_count": class_image_count,
+        }
+
+    def _build_and_store_view_index(
+        self,
+        ds: Dataset,
+        ver: DatasetVersion,
+        *,
+        dataset_root: Path | None = None,
+    ) -> dict[str, Any]:
+        if not ver.manifest_path:
+            return {"generated_at": _utcnow().isoformat(), "images": [], "class_image_count": {}}
+        dataset_path = Path(dataset_root or resolve_dataset_path(ver.snapshot_path or ds.storage_path)).resolve(strict=False)
+        image_rels = self._collect_manifest_image_rels(ver.manifest_path)
+        payload = self._build_view_index_payload(
+            dataset_path=dataset_path,
+            image_rels=image_rels,
+            dataset_type=ds.dataset_type,
+        )
+        self._write_view_index(ver.manifest_path, payload)
+        return payload
+
+    def _trigger_view_index_generation(
+        self,
+        ds: Dataset,
+        ver: DatasetVersion,
+        *,
+        dataset_root: Path | None = None,
+    ) -> None:
+        if not ver.manifest_path:
+            return
+        if self._load_view_index(ver.manifest_path) is not None:
+            self._set_artifact_job_summary(
+                self._artifact_job_key("view_index", int(ds.dataset_id), int(ver.version_id)),
+                state="ready",
+                progress=100,
+            )
+            return
+
+        job_key = self._artifact_job_key("view_index", int(ds.dataset_id), int(ver.version_id))
+        current = self._get_artifact_job_summary(job_key)
+        if str(current.get("state") or "").lower() in {"queued", "running"}:
+            return
+
+        dataset_path = Path(dataset_root or resolve_dataset_path(ver.snapshot_path or ds.storage_path)).resolve(strict=False)
+        self._set_artifact_job_summary(job_key, state="queued", progress=0)
+
+        def _generate():
+            self._set_artifact_job_summary(job_key, state="running", progress=1)
+            try:
+                payload = self._build_and_store_view_index(ds, ver, dataset_root=dataset_path)
+                total_images = len(list(payload.get("images") or []))
+                self._set_artifact_job_summary(
+                    job_key,
+                    state="ready",
+                    progress=100,
+                    total_images=int(total_images),
+                )
+            except Exception as e:
+                self._set_artifact_job_summary(job_key, state="failed", progress=0, error=str(e))
+                logger.error(
+                    "View index generation failed for dataset %s version %s: %s",
+                    getattr(ds, "dataset_id", "?"),
+                    getattr(ver, "version_id", "?"),
+                    e,
+                )
+
+        threading.Thread(target=_generate, daemon=True).start()
+
+    def _schedule_version_artifacts(self, ds: Dataset, ver: DatasetVersion) -> None:
+        root_token = str(ver.snapshot_path or ds.storage_path)
+        dataset_path = resolve_dataset_path(root_token).resolve(strict=False)
+
+        try:
+            prewarm_limit = max(0, int(settings.thumbnail_first_page_prewarm or 0))
+        except Exception:
+            prewarm_limit = 0
+
+        if prewarm_limit > 0 and ver.manifest_path:
+            try:
+                priority_rels = self._collect_manifest_image_rels(ver.manifest_path, limit=prewarm_limit)
+                if priority_rels:
+                    ThumbnailService().pregenerate_for_dataset(
+                        dataset_id=int(ds.dataset_id),
+                        dataset_root=dataset_path,
+                        size=max(16, int(settings.thumbnail_size or 200)),
+                        max_workers=max(1, min(int(settings.thumbnail_max_workers or 1), len(priority_rels))),
+                        cache_prefix=self._thumbnail_cache_prefix_for_version(ver),
+                        rel_paths=priority_rels,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Thumbnail prewarm failed for dataset %s version %s: %s",
+                    getattr(ds, "dataset_id", "?"),
+                    getattr(ver, "version_id", "?"),
+                    e,
+                )
+
+        self._trigger_thumbnail_pregeneration(
+            dataset_id=int(ds.dataset_id),
+            version_id=int(ver.version_id),
+            dataset_path=dataset_path,
+            cache_prefix=self._thumbnail_cache_prefix_for_version(ver),
+        )
+        self._trigger_view_index_generation(ds, ver, dataset_root=dataset_path)
+
+    def _get_version_class_names(self, ver: DatasetVersion) -> list[str]:
+        class_names: list[str] = []
+        if isinstance(ver.meta, dict):
+            yolo = ver.meta.get("yolo")
+            if isinstance(yolo, dict):
+                names = yolo.get("names")
+                class_names = self._normalize_yolo_names(names, yolo.get("nc"))
+        return class_names
+
+    def _canonical_image_key_from_label_path(self, label_file: Path, dataset_path: Path) -> str:
+        try:
+            rel = label_file.resolve(strict=False).relative_to((dataset_path / "labels").resolve(strict=False))
+        except Exception:
+            rel = label_file
+        return rel.with_suffix("").as_posix().lstrip("./")
+
+    def _canonical_image_key_from_rel(self, rel_path: str) -> str:
+        s = str(rel_path or "").strip().replace("\\", "/")
+        if s.startswith("images/"):
+            s = s[len("images/") :]
+        return Path(s).with_suffix("").as_posix().lstrip("./")
+
+    def _guess_label_rel_path_from_image(self, image_rel: str) -> str:
+        rel = Path(str(image_rel or "").replace("\\", "/").lstrip("/"))
+        parts = list(rel.parts)
+        for idx, part in enumerate(parts):
+            if str(part).lower() == "images":
+                parts[idx] = "labels"
+                return Path(*parts).with_suffix(".txt").as_posix()
+        return (Path("labels") / rel).with_suffix(".txt").as_posix()
+
+    def _read_image_size(self, image_path: Path) -> tuple[int | None, int | None]:
+        try:
+            if Image is not None:
+                with Image.open(image_path) as img:
+                    w, h = img.size
+                    if w and h:
+                        return int(w), int(h)
+        except Exception:
+            pass
+
+        try:
+            if rasterio is not None:
+                with rasterio.open(str(image_path)) as ds:
+                    if ds.width and ds.height:
+                        return int(ds.width), int(ds.height)
+        except Exception:
+            pass
+
+        return None, None
+
+    def _parse_yolo_boxes(
+        self,
+        label_path: Path,
+        *,
+        width: int | None,
+        height: int | None,
+        class_names: list[str],
+    ) -> list[dict]:
+        if not width or not height:
+            return []
+        if not label_path.exists() or not label_path.is_file():
+            return []
+
+        boxes: list[dict] = []
+        try:
+            text = label_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return []
+
+        img_w = float(width)
+        img_h = float(height)
+        for line in text.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            try:
+                cid = int(parts[0])
+                x_c = float(parts[1])
+                y_c = float(parts[2])
+                w_n = float(parts[3])
+                h_n = float(parts[4])
+            except Exception:
+                continue
+            if cid < 0:
+                continue
+
+            box_w = max(0.0, w_n * img_w)
+            box_h = max(0.0, h_n * img_h)
+            x1 = max(0.0, x_c * img_w - box_w / 2.0)
+            y1 = max(0.0, y_c * img_h - box_h / 2.0)
+            x2 = min(img_w, x1 + box_w)
+            y2 = min(img_h, y1 + box_h)
+            class_name = class_names[cid] if 0 <= cid < len(class_names) else f"class_{cid}"
+
+            boxes.append(
+                {
+                    "class_id": int(cid),
+                    "class_name": str(class_name),
+                    "x1": round(x1, 3),
+                    "y1": round(y1, 3),
+                    "x2": round(x2, 3),
+                    "y2": round(y2, 3),
+                }
+            )
+        return boxes
+
+    def _count_yolo_objects(self, label_path: Path) -> int:
+        _classes, total = self._summarize_yolo_label(label_path)
+        return int(total)
+
     def _resolve_dataset_version(self, db: Session, ds: Dataset, version_id: int | None) -> DatasetVersion:
         if version_id is not None:
             ver = (
@@ -3387,27 +3855,66 @@ class DatasetService:
                     continue
                 yield obj.get("path"), obj.get("size_bytes"), obj.get("mtime")
 
-    def _trigger_thumbnail_pregeneration(self, dataset_id: int, dataset_path: Path) -> None:
+    def _trigger_thumbnail_pregeneration(
+        self,
+        *,
+        dataset_id: int,
+        version_id: int,
+        dataset_path: Path,
+        cache_prefix: str | None = None,
+    ) -> None:
         """
         Start thumbnail pre-generation in a background thread.
-        
+
         This allows the main request to return quickly while thumbnails are
         generated asynchronously. The frontend will use static file paths
         and gracefully handle missing thumbnails via onerror fallback.
         """
+        job_key = self._artifact_job_key("thumbnails", int(dataset_id), int(version_id) if cache_prefix else None)
+        current = self._get_artifact_job_summary(job_key)
+        if str(current.get("state") or "").lower() in {"queued", "running"}:
+            return
+
+        self._set_artifact_job_summary(job_key, state="queued", progress=0)
+
         def _generate():
+            self._set_artifact_job_summary(job_key, state="running", progress=1)
             try:
                 svc = ThumbnailService()
                 result = svc.pregenerate_for_dataset(
-                    dataset_id=dataset_id,
+                    dataset_id=int(dataset_id),
                     dataset_root=dataset_path,
-                    size=200,
-                    max_workers=4,
+                    size=max(16, int(settings.thumbnail_size or 200)),
+                    max_workers=max(1, int(settings.thumbnail_max_workers or 1)),
+                    cache_prefix=cache_prefix,
                 )
-                logger.info(f"Thumbnail pre-generation complete for dataset {dataset_id}: {result}")
+                total = int(result.get("total") or 0)
+                processed = int(result.get("generated") or 0) + int(result.get("skipped") or 0) + int(result.get("failed") or 0)
+                progress = 100 if total <= 0 else int(min(100, round((processed / max(1, total)) * 100)))
+                self._set_artifact_job_summary(
+                    job_key,
+                    state="ready",
+                    progress=progress,
+                    total=total,
+                    generated=int(result.get("generated") or 0),
+                    skipped=int(result.get("skipped") or 0),
+                    failed=int(result.get("failed") or 0),
+                )
+                logger.info(
+                    "Thumbnail pre-generation complete for dataset %s version %s: %s",
+                    dataset_id,
+                    version_id,
+                    result,
+                )
             except Exception as e:
-                logger.error(f"Thumbnail pre-generation failed for dataset {dataset_id}: {e}")
-        
+                self._set_artifact_job_summary(job_key, state="failed", progress=0, error=str(e))
+                logger.error(
+                    "Thumbnail pre-generation failed for dataset %s version %s: %s",
+                    dataset_id,
+                    version_id,
+                    e,
+                )
+
         thread = threading.Thread(target=_generate, daemon=True)
         thread.start()
 

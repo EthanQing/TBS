@@ -34,6 +34,8 @@ class ThumbnailService:
         dataset_root: Path,
         size: int = 200,
         max_workers: int = 4,
+        cache_prefix: str | None = None,
+        rel_paths: list[str] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> dict:
         """
@@ -44,6 +46,8 @@ class ThumbnailService:
             dataset_root: Root path of the dataset
             size: Thumbnail size (max edge length)
             max_workers: Number of parallel workers
+            cache_prefix: Optional cache namespace under dataset thumbnail root
+            rel_paths: Optional explicit relative image paths to generate first
             on_progress: Optional callback (completed, total)
             
         Returns:
@@ -54,13 +58,28 @@ class ThumbnailService:
             return {"generated": 0, "skipped": 0, "failed": 0, "errors": ["Dataset root not found"]}
         
         # Collect all image files
-        image_files = []
-        for ext in self._IMAGE_EXTS:
-            image_files.extend(dataset_root.rglob(f"*{ext}"))
-            image_files.extend(dataset_root.rglob(f"*{ext.upper()}"))
-        
-        # Remove duplicates
-        image_files = list(set(image_files))
+        image_files: list[Path] = []
+        if rel_paths:
+            seen_paths: set[Path] = set()
+            for raw_rel in rel_paths:
+                rel = self._safe_rel_path(raw_rel)
+                src = (dataset_root / rel).resolve(strict=False)
+                if dataset_root not in src.parents and src != dataset_root:
+                    continue
+                if not src.exists() or not src.is_file():
+                    continue
+                if src.suffix.lower() not in self._IMAGE_EXTS:
+                    continue
+                if src in seen_paths:
+                    continue
+                seen_paths.add(src)
+                image_files.append(src)
+        else:
+            for ext in self._IMAGE_EXTS:
+                image_files.extend(dataset_root.rglob(f"*{ext}"))
+                image_files.extend(dataset_root.rglob(f"*{ext.upper()}"))
+            # Remove duplicates
+            image_files = list(set(image_files))
         total = len(image_files)
         
         if total == 0:
@@ -80,6 +99,11 @@ class ThumbnailService:
                 
                 # Check if thumbnail already exists and is fresh
                 thumb_base = settings.thumbnails_dir / str(int(dataset_id))
+                if cache_prefix:
+                    cp = str(cache_prefix).strip().replace("\\", "/").strip("/\\")
+                    cp_path = Path(cp)
+                    if cp and (not cp_path.is_absolute()) and ".." not in cp_path.parts:
+                        thumb_base = thumb_base / cp_path
                 thumb = (thumb_base / rel).with_suffix(".webp").resolve(strict=False)
                 
                 if thumb.exists():

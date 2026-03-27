@@ -47,6 +47,10 @@ class Settings:
     inference_allowed_schemes: Tuple[str, ...] = _csv_env("INFERENCE_ALLOWED_SCHEMES", "http,https")
     inference_allowed_hosts: Tuple[str, ...] = _csv_env("INFERENCE_ALLOWED_HOSTS", "")
     worker_bind_host: str = os.getenv("WORKER_BIND_HOST", "").strip()
+    thumbnail_max_workers: int = int(os.getenv("THUMBNAIL_MAX_WORKERS", "4"))
+    thumbnail_first_page_prewarm: int = int(os.getenv("THUMBNAIL_FIRST_PAGE_PREWARM", "32"))
+    thumbnail_size: int = int(os.getenv("THUMBNAIL_SIZE", "200"))
+    view_index_max_workers: int = int(os.getenv("VIEW_INDEX_MAX_WORKERS", "8"))
 
     @property
     def thumbnails_dir(self) -> Path:

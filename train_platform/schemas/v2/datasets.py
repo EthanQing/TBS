@@ -225,6 +225,7 @@ class ViewImageItem(BaseModel):
     thumbnail_url: str
     width: Optional[int] = None
     height: Optional[int] = None
+    object_count: int = 0
     classes: list[int] = Field(default_factory=list)  # Class IDs present in this image
 
 
@@ -234,6 +235,9 @@ class ViewMeta(BaseModel):
     page_size: int
     total_items: int
     total_pages: int
+    thumbnail_status: Optional[str] = None
+    thumbnail_progress: Optional[int] = None
+    view_index_status: Optional[str] = None
 
 
 class DatasetViewOut(BaseModel):
@@ -243,6 +247,26 @@ class DatasetViewOut(BaseModel):
     categories: list[CategoryInfo]
     items: list[ViewImageItem]
     meta: ViewMeta
+
+
+class DatasetImageAnnotationBoxOut(BaseModel):
+    class_id: int
+    class_name: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+class DatasetImageAnnotationsOut(BaseModel):
+    dataset_id: int
+    version_id: int
+    image_path: str
+    image_url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+    object_count: int = 0
+    boxes: list[DatasetImageAnnotationBoxOut] = Field(default_factory=list)
 
 
 class DatasetIllegalConvertRequest(BaseModel):
