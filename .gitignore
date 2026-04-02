@@ -26,6 +26,7 @@ env/
 datasets/
 training_runs/
 temp/
+runs/
 *.log
 *.json
 
