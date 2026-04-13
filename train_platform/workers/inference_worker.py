@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from train_platform.core.config import settings
+from train_platform.services.usage_limit_service import UsageLimitService
 
 app = FastAPI(title="Inference Worker", version="1.0")
 
@@ -53,6 +54,12 @@ def _verify_internal_auth(x_internal_token: Optional[str] = Header(default=None,
     provided = str(x_internal_token or "").strip()
     if provided != expected:
         raise HTTPException(status_code=401, detail="Unauthorized internal request")
+
+
+def _ensure_usage_limit_allowed() -> None:
+    status = UsageLimitService.get_status()
+    if status["blocked"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 def _resolve_training_path(raw: str, *, label: str, must_exist: bool = True) -> Path:
@@ -125,7 +132,11 @@ def _run_ultralytics_yolo(weights_path: Path, image_path: Path, *, conf: float, 
 
 
 @app.post("/internal/inference/yolo", response_model=InferenceResponse)
-def run_inference(req: InferenceRequest, _: None = Depends(_verify_internal_auth)) -> InferenceResponse:
+def run_inference(
+    req: InferenceRequest,
+    _: None = Depends(_verify_internal_auth),
+    __: None = Depends(_ensure_usage_limit_allowed),
+) -> InferenceResponse:
     weights_path = Path(req.weights_path)
     if not weights_path.exists() or not weights_path.is_file():
         raise HTTPException(status_code=404, detail=f"Weights not found: {weights_path}")
@@ -144,7 +155,11 @@ def run_inference(req: InferenceRequest, _: None = Depends(_verify_internal_auth
 
 
 @app.post("/internal/model-conversions/pt-to-onnx", response_model=WorkerStatusResponse)
-def start_model_conversion(req: ModelConversionRequest, _: None = Depends(_verify_internal_auth)) -> WorkerStatusResponse:
+def start_model_conversion(
+    req: ModelConversionRequest,
+    _: None = Depends(_verify_internal_auth),
+    __: None = Depends(_ensure_usage_limit_allowed),
+) -> WorkerStatusResponse:
     try:
         from train_platform.api.v2.model_conversions import _run_pt_to_onnx
     except Exception as e:
@@ -159,7 +174,11 @@ def start_model_conversion(req: ModelConversionRequest, _: None = Depends(_verif
 
 
 @app.post("/internal/training-runs/export-onnx", response_model=WorkerStatusResponse)
-def export_training_onnx(req: ExportOnnxRequest, _: None = Depends(_verify_internal_auth)) -> WorkerStatusResponse:
+def export_training_onnx(
+    req: ExportOnnxRequest,
+    _: None = Depends(_verify_internal_auth),
+    __: None = Depends(_ensure_usage_limit_allowed),
+) -> WorkerStatusResponse:
     src_pt = _resolve_training_path(req.src_pt, label="weights", must_exist=True)
     out_onnx = _resolve_training_path(req.out_onnx, label="output", must_exist=False)
     out_onnx.parent.mkdir(parents=True, exist_ok=True)

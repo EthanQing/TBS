@@ -13,6 +13,7 @@ from train_platform.models.dataset_event import DatasetEvent
 from train_platform.models.dataset import Dataset, DatasetVersion
 from train_platform.schemas.v2.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v2.datasets import (
+    DatasetImportJobOut,
     DatasetCreate,
     DatasetDetailOut,
     DatasetEventOut,
@@ -29,6 +30,11 @@ from train_platform.schemas.v2.datasets import (
     IllegalLabelPresetUpdateIn,
     DatasetRenameClassesRequest,
     DatasetRenameClassesOut,
+    UploadCompleteOut,
+    UploadPartOut,
+    UploadSessionCreateIn,
+    UploadSessionCreateOut,
+    UploadSessionStatusOut,
     DatasetSplitRequest,
     DatasetSplitResultOut,
     DatasetSplitSummary,
@@ -40,6 +46,7 @@ from train_platform.schemas.v2.datasets import (
     DatasetViewOut,
 )
 from train_platform.services.dataset_service import DatasetService
+from train_platform.services.dataset_upload_service import DatasetUploadService
 from train_platform.utils.exceptions import ValidationError
 
 # NOTE: v2's root router (train_platform.api.v2) is included under `/api/v2` in the
@@ -47,6 +54,7 @@ from train_platform.utils.exceptions import ValidationError
 # path operations like `@router.get("")` would have both an empty prefix and path,
 # which FastAPI rejects at startup.
 router = APIRouter(prefix="/datasets", tags=["datasets"])
+upload_service = DatasetUploadService()
 
 
 def _parse_non_negative_int(value, default: int = 0) -> int:
@@ -95,6 +103,17 @@ def _load_illegal_conversion_state(dataset_id: int, job_id: str) -> dict | None:
                 "message": conv.get("message"),
             }
         return None
+    finally:
+        db.close()
+
+
+def _load_import_job_state(dataset_id: int, job_id: str) -> dict | None:
+    db = SessionLocal()
+    try:
+        try:
+            return upload_service.get_import_job(db, int(dataset_id), str(job_id))
+        except Exception:
+            return None
     finally:
         db.close()
 
@@ -242,6 +261,107 @@ async def upload_dataset_archive(
         split_overwrite=split_overwrite,
     )
     return ds
+
+
+@router.post("/{dataset_id}/upload-sessions", response_model=UploadSessionCreateOut, status_code=201)
+def create_upload_session(dataset_id: int, payload: UploadSessionCreateIn, db: Session = Depends(get_db)):
+    data = upload_service.create_session(
+        db,
+        int(dataset_id),
+        filename=payload.filename,
+        total_size=int(payload.total_size),
+        chunk_size=payload.chunk_size,
+    )
+    return upload_service.get_session_status(db, int(dataset_id), str(data.get("session_id") or ""))
+
+
+@router.get("/{dataset_id}/upload-sessions/{session_id}/status", response_model=UploadSessionStatusOut)
+def get_upload_session_status(dataset_id: int, session_id: str, db: Session = Depends(get_db)):
+    return upload_service.get_session_status(db, int(dataset_id), str(session_id))
+
+
+@router.put("/{dataset_id}/upload-sessions/{session_id}/parts/{part_no}", response_model=UploadPartOut)
+async def upload_session_part(
+    dataset_id: int,
+    session_id: str,
+    part_no: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    return upload_service.upload_part(db, int(dataset_id), str(session_id), part_no=int(part_no), upload=file)
+
+
+@router.post("/{dataset_id}/upload-sessions/{session_id}/complete", response_model=UploadCompleteOut, status_code=202)
+def complete_upload_session(dataset_id: int, session_id: str, db: Session = Depends(get_db)):
+    return upload_service.complete_session(db, int(dataset_id), str(session_id))
+
+
+@router.delete("/{dataset_id}/upload-sessions/{session_id}", response_model=DeleteResponse)
+def cancel_upload_session(dataset_id: int, session_id: str, db: Session = Depends(get_db)):
+    upload_service.cancel_session(db, int(dataset_id), str(session_id))
+    return DeleteResponse(ok=True, message="Upload session cancelled")
+
+
+@router.get("/{dataset_id}/imports/{job_id}", response_model=DatasetImportJobOut)
+def get_import_job_status(dataset_id: int, job_id: str, db: Session = Depends(get_db)):
+    return upload_service.get_import_job(db, int(dataset_id), str(job_id))
+
+
+@router.websocket("/{dataset_id}/imports/{job_id}/stream")
+async def stream_import_job_progress(websocket: WebSocket, dataset_id: int, job_id: str):
+    await websocket.accept()
+    last_seq = _parse_non_negative_int(websocket.query_params.get("from_seq"), 0)
+    ping_every_s = 15.0
+    last_ping = time.monotonic()
+    try:
+        snap = _load_import_job_state(int(dataset_id), str(job_id))
+        if snap is None:
+            await websocket.send_json({"type": "error", "data": {"message": "Import job not found"}})
+            await websocket.close(code=1008)
+            return
+
+        await websocket.send_json({"type": "snapshot", "data": snap})
+        last_seq = max(last_seq, _parse_non_negative_int(snap.get("seq"), 0))
+        status = str(snap.get("status") or "").strip().lower()
+        if status in {"completed", "failed"}:
+            await websocket.send_json({"type": "done", "data": snap})
+            await websocket.close()
+            return
+
+        while True:
+            state = _load_import_job_state(int(dataset_id), str(job_id))
+            if state is None:
+                await websocket.send_json({"type": "error", "data": {"message": "Import state unavailable"}})
+                await websocket.close(code=1011)
+                return
+
+            seq = _parse_non_negative_int(state.get("seq"), 0)
+            if seq > last_seq:
+                await websocket.send_json({"type": "progress", "data": state})
+                last_seq = seq
+
+            status = str(state.get("status") or "").strip().lower()
+            if status in {"completed", "failed"}:
+                await websocket.send_json({"type": "done", "data": state})
+                await websocket.close()
+                return
+
+            now = time.monotonic()
+            if (now - last_ping) >= ping_every_s:
+                await websocket.send_json({"type": "ping", "data": {}})
+                last_ping = now
+            await asyncio.sleep(1.0)
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "data": {"message": f"{type(e).__name__}: {e}"}})
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
 
 @router.post("/import", response_model=DatasetOut, status_code=201)

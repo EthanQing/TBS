@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Any, Optional, TextIO
 
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,7 @@ from train_platform.models.architecture import ModelArchitecture
 from train_platform.models.enums import DeploymentStatus, LogLevel, TrainingRunStatus
 from train_platform.models.training_run import TrainingRun, TrainingRunEvent
 from train_platform.services.alarm_service import AlarmService
+from train_platform.services.usage_limit_service import UsageLimitService
 from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
 
 
@@ -144,6 +145,7 @@ class DbQueueWorker:
 
         self._running: Optional[RunningJob] = None
         self._last_heartbeat_at: Optional[datetime] = None
+        self._usage_limit_block_logged = False
 
     def run_forever(self) -> None:
         engines_text = ",".join(sorted(self.allowed_engines)) if self.allowed_engines else "*"
@@ -157,21 +159,32 @@ class DbQueueWorker:
             time.sleep(self.poll_interval)
 
     def tick(self) -> None:
+        usage_status = UsageLimitService.get_status()
+        if usage_status["blocked"]:
+            if self._running is not None:
+                self._tick_running(usage_status=usage_status)
+            elif not self._usage_limit_block_logged:
+                print(f"[worker] usage-limit blocked new work: {usage_status['message']}", file=sys.stderr, flush=True)
+                self._usage_limit_block_logged = True
+            return
+
+        self._usage_limit_block_logged = False
         if self._running is not None:
-            self._tick_running()
+            self._tick_running(usage_status=usage_status)
             return
         self._try_start_next_run()
 
-    def _tick_running(self) -> None:
+    def _tick_running(self, *, usage_status: dict[str, Any] | None = None) -> None:
         assert self._running is not None
         run_id = self._running.run_id
 
         db = SessionLocal()
+        should_cleanup = False
         try:
             run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
             if not run:
                 _terminate_process_tree(self._running.proc)
-                self._cleanup_running()
+                should_cleanup = True
                 return
 
             # Heartbeat
@@ -180,6 +193,25 @@ class DbQueueWorker:
                 run.heartbeat_at = now
                 db.commit()
                 self._last_heartbeat_at = now
+
+            current_usage_status = usage_status or UsageLimitService.get_status()
+            if current_usage_status["blocked"]:
+                if self._running.proc.poll() is None:
+                    _terminate_process_tree(self._running.proc)
+
+                run.finished_at = now
+                run.status = TrainingRunStatus.FAILED
+                run.error_message = str(current_usage_status["message"])
+                _add_event(db, run_id, "failed", run.error_message, level=LogLevel.ERROR)
+                run.worker_id = None
+                run.claimed_at = None
+                run.pid = None
+                run.heartbeat_at = None
+
+                db.commit()
+                AlarmService.try_evaluate_training_rules(db, run_ids=[str(run.run_id)])
+                should_cleanup = True
+                return
 
             # Cancel / delete request handling
             cancel_requested = bool(run.cancel_requested_at is not None or run.delete_requested_at is not None)
@@ -229,10 +261,12 @@ class DbQueueWorker:
             # Optionally cleanup files if deleted
             if delete_requested:
                 _safe_remove_dir(settings.training_dir / run_id)
+            should_cleanup = True
 
         finally:
             db.close()
-            self._cleanup_running()
+            if should_cleanup:
+                self._cleanup_running()
 
     def _cleanup_running(self) -> None:
         if self._running is None:

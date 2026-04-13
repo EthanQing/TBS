@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Tuple
 
@@ -21,6 +22,19 @@ def _csv_env(name: str, default: str = "") -> Tuple[str, ...]:
         return tuple()
     items = [x.strip() for x in str(raw).split(",")]
     return tuple(x for x in items if x)
+
+
+def _datetime_env(name: str) -> datetime | None:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid ISO8601 datetime for {name}: {raw}") from exc
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -51,11 +65,30 @@ class Settings:
     thumbnail_first_page_prewarm: int = int(os.getenv("THUMBNAIL_FIRST_PAGE_PREWARM", "32"))
     thumbnail_size: int = int(os.getenv("THUMBNAIL_SIZE", "200"))
     view_index_max_workers: int = int(os.getenv("VIEW_INDEX_MAX_WORKERS", "8"))
+    upload_chunk_size_mb: int = max(1, int(os.getenv("UPLOAD_CHUNK_SIZE_MB", "64") or "64"))
+    upload_session_ttl_hours: int = max(1, int(os.getenv("UPLOAD_SESSION_TTL_HOURS", "24") or "24"))
+    upload_part_max_retries: int = max(0, int(os.getenv("UPLOAD_PART_MAX_RETRIES", "5") or "5"))
+    upload_max_parallel_parts: int = max(1, int(os.getenv("UPLOAD_MAX_PARALLEL_PARTS", "3") or "3"))
+    software_not_before_at: datetime | None = _datetime_env("SOFTWARE_NOT_BEFORE_AT")
+    software_not_after_at: datetime | None = _datetime_env("SOFTWARE_NOT_AFTER_AT")
+    software_expires_at: datetime | None = _datetime_env("SOFTWARE_EXPIRES_AT")
+    software_clock_rollback_tolerance_seconds: int = max(
+        0,
+        int(os.getenv("SOFTWARE_CLOCK_ROLLBACK_TOLERANCE_SECONDS", "300") or "300"),
+    )
+    software_guard_persist_interval_seconds: int = max(
+        1,
+        int(os.getenv("SOFTWARE_GUARD_PERSIST_INTERVAL_SECONDS", "60") or "60"),
+    )
 
     @property
     def thumbnails_dir(self) -> Path:
         # Keep thumbnails under the datasets root so they can be managed together.
         return (self.datasets_dir / ".thumbnails").resolve()
+
+    @property
+    def usage_limit_state_path(self) -> Path:
+        return (self.home_dir / ".runtime" / ".node_state.dat").resolve()
 
     @property
     def database_url(self) -> str:
@@ -67,6 +100,7 @@ class Settings:
         )
 
     def ensure_dirs(self) -> None:
+        self.home_dir.mkdir(parents=True, exist_ok=True)
         self.datasets_dir.mkdir(parents=True, exist_ok=True)
         self.thumbnails_dir.mkdir(parents=True, exist_ok=True)
         self.training_dir.mkdir(parents=True, exist_ok=True)

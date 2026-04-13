@@ -355,3 +355,63 @@ class DatasetRenameClassesOut(BaseModel):
     renamed: int = Field(..., description="Number of classes actually renamed")
     total_classes: int = Field(..., description="Total number of classes after rename")
     class_names: list[str] = Field(..., description="Updated class name list (ordered by class_id)")
+
+
+class UploadSessionCreateIn(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=512)
+    total_size: int = Field(..., gt=0)
+    chunk_size: Optional[int] = Field(None, gt=0, description="Bytes per chunk. Defaults to server policy.")
+
+
+class UploadSessionCreateOut(BaseModel):
+    session_id: str
+    dataset_id: int
+    filename: str
+    total_size: int
+    chunk_size: int
+    total_parts: int
+    uploaded_parts: int = 0
+    expires_at: datetime
+    status: str
+
+
+class UploadPartOut(BaseModel):
+    session_id: str
+    part_no: int
+    uploaded_parts: int
+    total_parts: int
+    status: str
+
+
+class UploadSessionStatusOut(BaseModel):
+    session_id: str
+    dataset_id: int
+    filename: str
+    total_size: int
+    chunk_size: int
+    total_parts: int
+    uploaded_parts: int
+    status: str
+    expires_at: datetime
+    job_id: Optional[str] = None
+
+
+class UploadCompleteOut(BaseModel):
+    session_id: str
+    job_id: str
+    status: str
+
+
+class DatasetImportJobOut(BaseModel):
+    job_id: str
+    dataset_id: int
+    session_id: str
+    status: str
+    phase: str
+    progress: int = Field(0, ge=0, le=100)
+    seq: int = 0
+    updated_at: datetime
+    output_version_id: Optional[int] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    error_hint: Optional[str] = None
