@@ -7,10 +7,11 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from train_platform.core.config import settings
-from train_platform.db.base import Base
+from train_platform.models.v3 import V3Base
 
 # Import models so they are registered on Base.metadata for autogenerate.
 from train_platform import models as _models  # noqa: F401
+from train_platform.models import v3 as _models_v3  # noqa: F401
 
 
 config = context.config
@@ -18,7 +19,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = Base.metadata
+target_metadata = V3Base.metadata
 
 
 def _get_database_url() -> str:
@@ -67,4 +68,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-

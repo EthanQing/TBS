@@ -11,10 +11,10 @@ from typing import Dict
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
 from sqlalchemy.orm import Session
-from train_platform.models.enums import TrainingRunStatus
-from train_platform.models.training_run import TrainingRun, TrainingRunEpochMetric
-from train_platform.repositories.training_run_repo import TrainingRunRepository
-from train_platform.services.alarm_service import AlarmService
+from train_platform.models.v3.enums import TrainingRunStatus
+from train_platform.models.v3.training_run import TrainingRun, TrainingRunEpochMetric
+from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
+from train_platform.services.v3.alarm_service import AlarmService
 from train_platform.training.plugins.base import TrainContext
 from train_platform.training.registry import get_trainer
 from train_platform.utils.path_utils import resolve_dataset_path
@@ -194,14 +194,13 @@ def main(argv: list[str] | None = None) -> int:
     vdl_bridge: VisualDLScalarBridge | None = None
     try:
         run = TrainingRunRepository().get(db, run_id)
-        if not run or not run.parameters or not run.project or not run.project.dataset or not run.dataset_version or not run.architecture:
+        if not run or not run.parameters or not run.project or not run.project.standard_dataset or not run.architecture:
             print(f"[train_entry] run not found or missing relations: {run_id}", file=sys.stderr, flush=True)
             exit_code = 2
             error_message = "Run not found or missing relations"
             return exit_code
 
-        # Prefer snapshot_path if present (reproducibility). Fallback to dataset.storage_path.
-        dataset_path_token = run.dataset_version.snapshot_path or run.project.dataset.storage_path
+        dataset_path_token = run.standard_dataset.storage_path
         dataset_path = resolve_dataset_path(dataset_path_token)
         if not dataset_path.exists():
             print(f"[train_entry] dataset path does not exist: {dataset_path}", file=sys.stderr, flush=True)

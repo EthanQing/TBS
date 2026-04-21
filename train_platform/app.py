@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from train_platform.api.v2 import router as api_router
+from train_platform.api.v3 import router as api_router
 from train_platform.core.config import settings
 from train_platform.db.init_db import init_db
 from train_platform.services.usage_limit_service import UsageLimitService
@@ -49,8 +49,8 @@ def create_app() -> FastAPI:
     settings.ensure_dirs()
 
     app = FastAPI(
-        title="Train Platform Backend (v2)",
-        version="0.1.0",
+        title="Train Platform Backend (v3)",
+        version="3.0.0",
         lifespan=lifespan,
     )
 
@@ -78,7 +78,7 @@ def create_app() -> FastAPI:
                 )
         return await call_next(request)
 
-    app.include_router(api_router, prefix="/api/v2")
+    app.include_router(api_router, prefix="/api/v3")
 
     app.mount("/static/datasets", StaticFiles(directory=str(settings.datasets_dir)), name="datasets")
     app.mount("/static/thumbnails", StaticFiles(directory=str(settings.thumbnails_dir)), name="thumbnails")

@@ -182,7 +182,7 @@ def init_mlflow_logger(run: Any, *, dataset_path: Optional[str] = None, run_dir:
         tags = {
             "train.run_id": str(run.run_id),
             "train.project_id": str(getattr(run, "project_id", "")),
-            "train.dataset_version_id": str(getattr(run, "dataset_version_id", "")),
+            "train.standard_dataset_id": str(getattr(run, "standard_dataset_id", "")),
             "train.architecture_id": str(getattr(run, "architecture_id", "")),
             "train.name": str(getattr(run, "name", "")),
         }
