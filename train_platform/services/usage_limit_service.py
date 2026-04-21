@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import hashlib
 import hmac
 import json
@@ -20,6 +21,8 @@ logger = logging.getLogger(__name__)
 class UsageLimitService:
     _state_lock = Lock()
     _cached_state_payload: dict[str, Any] | None = None
+    # Local-only hardcoded trial window: 6 calendar months from first successful startup.
+    _hardcoded_trial_months = 6
     _exempt_exact_paths = frozenset(
         {
             "/health",
@@ -140,13 +143,35 @@ class UsageLimitService:
         cls._cached_state_payload = dict(payload)
 
     @classmethod
-    def _window_bounds(cls) -> tuple[datetime | None, datetime | None]:
+    def _configured_window_bounds(cls) -> tuple[datetime | None, datetime | None]:
         window_start = cls._ensure_utc(getattr(settings, "software_not_before_at", None))
         window_end = cls._ensure_utc(getattr(settings, "software_not_after_at", None))
         legacy_end = cls._ensure_utc(getattr(settings, "software_expires_at", None))
         if window_end is None:
             window_end = legacy_end
         return window_start, window_end
+
+    @staticmethod
+    def _add_months(value: datetime, months: int) -> datetime:
+        if months <= 0:
+            return value
+
+        total_month = value.month - 1 + months
+        year = value.year + total_month // 12
+        month = total_month % 12 + 1
+        day = min(value.day, calendar.monthrange(year, month)[1])
+        return value.replace(year=year, month=month, day=day)
+
+    @classmethod
+    def _hardcoded_window_bounds(cls, *, first_seen_at: datetime | None) -> tuple[datetime | None, datetime | None]:
+        months = max(0, int(cls._hardcoded_trial_months or 0))
+        if first_seen_at is None or months <= 0:
+            return None, None
+
+        window_start = cls._ensure_utc(first_seen_at)
+        if window_start is None:
+            return None, None
+        return window_start, cls._add_months(window_start, months)
 
     @classmethod
     def _load_or_init_state(cls, *, now: datetime) -> tuple[dict[str, Any] | None, bool]:
@@ -192,8 +217,11 @@ class UsageLimitService:
     @classmethod
     def get_status(cls) -> dict[str, Any]:
         now = cls._utcnow()
-        window_start, window_end = cls._window_bounds()
-        enabled = window_start is not None or window_end is not None
+        configured_window_start, configured_window_end = cls._configured_window_bounds()
+        hardcoded_window_enabled = max(0, int(cls._hardcoded_trial_months or 0)) > 0
+        window_start = configured_window_start
+        window_end = configured_window_end
+        enabled = hardcoded_window_enabled or window_start is not None or window_end is not None
         rollback_tolerance = max(
             0,
             int(getattr(settings, "software_clock_rollback_tolerance_seconds", 0) or 0),
@@ -215,6 +243,8 @@ class UsageLimitService:
             if state:
                 first_seen_at = cls._parse_datetime(state.get("first_seen_at"))
                 last_seen_at = cls._parse_datetime(state.get("last_seen_at"))
+                if window_start is None and window_end is None and hardcoded_window_enabled:
+                    window_start, window_end = cls._hardcoded_window_bounds(first_seen_at=first_seen_at)
 
             if window_start and window_end and window_start > window_end:
                 blocked = True

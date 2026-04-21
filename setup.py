@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
+import shutil
+import sys
 from pathlib import Path
 
 try:
@@ -11,12 +14,19 @@ except ModuleNotFoundError as e:  # pragma: no cover
 
 try:
     from setuptools import Extension, find_packages, setup
+    from setuptools.command.build_ext import build_ext
 except ModuleNotFoundError as e:  # pragma: no cover
     raise SystemExit("setuptools is required. Install it with: pip install setuptools wheel") from e
 
 
 ROOT = Path(__file__).resolve().parent
 PKG_DIR = ROOT / "train_platform"
+BUILD_DIR = ROOT / "build"
+CYTHON_BUILD_DIR = BUILD_DIR / "cython"
+EXT_BUILD_LIB_DIR = BUILD_DIR / "lib"
+EXT_BUILD_TEMP_DIR = BUILD_DIR / "temp"
+RUNTIME_DIR = BUILD_DIR / "runtime"
+RUNTIME_ROOT_PATHS = [Path("alembic.ini")]
 
 
 def _read_version() -> str:
@@ -71,7 +81,14 @@ def _build_extensions() -> list[Extension]:
 
     # Safe defaults: Alembic loads migration scripts by reading .py files from disk.
     # If you compile/remove these, `alembic upgrade head` can break.
+    #
+    # FastAPI also inspects Python call signatures for route handlers/dependencies.
+    # Leaving the HTTP entry layer as `.py` avoids runtime issues like:
+    #   ValueError: no signature found for builtin <built-in function ...>
     default_exclude_globs = [
+        "train_platform/app.py",
+        "train_platform/api/*.py",
+        "train_platform/api/**/*.py",
         "train_platform/db/migrations/*.py",
         "train_platform/db/migrations/versions/*.py",
     ]
@@ -97,7 +114,7 @@ def _build_extensions() -> list[Extension]:
         if any(Path(rel_posix).match(pat) for pat in exclude_globs):
             continue
 
-        extensions.append(Extension(mod, [str(py)]))
+        extensions.append(Extension(mod, [os.fspath(py.relative_to(ROOT))]))
 
     if not extensions:
         raise RuntimeError("No extensions selected for cythonize (check exclude settings).")
@@ -105,10 +122,98 @@ def _build_extensions() -> list[Extension]:
     return extensions
 
 
+def _source_copy_ignore(_src: str, names: list[str]) -> set[str]:
+    patterns = {"__pycache__", "*.pyc", "*.pyo", "*.c", "*.so", "*.pyd", "*.dll"}
+    ignored: set[str] = set()
+    for name in names:
+        if any(fnmatch.fnmatch(name, pat) for pat in patterns):
+            ignored.add(name)
+    return ignored
+
+
+def _runtime_overlay_ignore(_src: str, names: list[str]) -> set[str]:
+    patterns = {"__pycache__", "*.pyc", "*.pyo"}
+    ignored: set[str] = set()
+    for name in names:
+        if any(fnmatch.fnmatch(name, pat) for pat in patterns):
+            ignored.add(name)
+    return ignored
+
+
+def _copy_path(src: Path, dst: Path) -> None:
+    if src.is_dir():
+        shutil.copytree(src, dst, dirs_exist_ok=True, ignore=_source_copy_ignore)
+        return
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def _assemble_runtime_tree(compiled_module_names: set[str]) -> None:
+    if not EXT_BUILD_LIB_DIR.exists():
+        raise RuntimeError(f"Compiled extension output not found: {EXT_BUILD_LIB_DIR}")
+
+    if RUNTIME_DIR.exists():
+        shutil.rmtree(RUNTIME_DIR)
+
+    # Start from source tree so we keep pure-Python files/resources that must remain visible.
+    shutil.copytree(PKG_DIR, RUNTIME_DIR / PKG_DIR.name, ignore=_source_copy_ignore)
+
+    # Copy top-level runtime support files (for example Alembic config) if they exist.
+    for rel_path in RUNTIME_ROOT_PATHS:
+        src = ROOT / rel_path
+        if src.exists():
+            _copy_path(src, RUNTIME_DIR / rel_path)
+
+    # Overlay compiled extension modules.
+    shutil.copytree(EXT_BUILD_LIB_DIR, RUNTIME_DIR, dirs_exist_ok=True, ignore=_runtime_overlay_ignore)
+
+    # Remove plaintext .py files for modules that were compiled into extension modules.
+    for mod_name in compiled_module_names:
+        rel_py = Path(*mod_name.split(".")).with_suffix(".py")
+        runtime_py = RUNTIME_DIR / rel_py
+        if runtime_py.exists():
+            runtime_py.unlink()
+
+
+def _remove_tree_if_exists(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
+class BuildExtToBuildDir(build_ext):
+    """
+    Always place compiled extensions and temporary files under `build/`,
+    then assemble a runnable deployment tree under `build/runtime/`.
+    """
+
+    def finalize_options(self) -> None:
+        super().finalize_options()
+        if self.inplace:
+            print(
+                "warning: --inplace is ignored for this project; "
+                "compiled outputs will be written under build/",
+                file=sys.stderr,
+            )
+        self.inplace = False
+        self.build_lib = str(EXT_BUILD_LIB_DIR)
+        self.build_temp = str(EXT_BUILD_TEMP_DIR)
+
+    def run(self) -> None:
+        _remove_tree_if_exists(EXT_BUILD_LIB_DIR)
+        _remove_tree_if_exists(EXT_BUILD_TEMP_DIR)
+        _remove_tree_if_exists(RUNTIME_DIR)
+        super().run()
+        _assemble_runtime_tree(COMPILED_MODULE_NAMES)
+        self.announce(f"runtime package assembled under: {RUNTIME_DIR}", level=2)
+
+
 extensions = _build_extensions()
+COMPILED_MODULE_NAMES = {ext.name for ext in extensions}
 
 ext_modules = cythonize(
     extensions,
+    build_dir=str(CYTHON_BUILD_DIR),
     compiler_directives={
         # Keep semantics close to CPython, but ensure Python-3 behavior.
         "language_level": "3",
@@ -131,5 +236,6 @@ setup(
     version=_read_version(),
     packages=find_packages(),
     ext_modules=ext_modules,
+    cmdclass={"build_ext": BuildExtToBuildDir},
     zip_safe=False,
 )

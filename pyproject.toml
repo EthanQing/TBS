@@ -3,7 +3,7 @@ name = "train-platform-backend"
 version = "0.1.0"
 description = "Train platform backend (v2 rewrite)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10, <3.11"
 dependencies = [
   "fastapi==0.111.0",
   "uvicorn[standard]==0.29.0",
@@ -26,16 +26,15 @@ dependencies = [
   "onnxruntime-gpu>=1.23.2",
   "onnx<=1.16.0",
   "nuitka>=2.8.10",
-  "cython>=3.2.4",
   "setuptools>=80.10.2",
   "wheel>=0.46.3",
   "rasterio>=1.4.4",
   "protobuf<=3.20.3",
   "numba>=0.64.0",
   "motmetrics>=1.4.0",
-  "paddlepaddle-gpu>=2.6.2",
   "psutil>=7.2.2",
   "nvidia-ml-py>=13.595.45",
+  "cython>=3.2.4",
 ]
 
 [tool.uvicorn]
