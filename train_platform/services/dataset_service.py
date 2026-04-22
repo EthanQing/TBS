@@ -3177,16 +3177,18 @@ class DatasetService:
         *,
         dataset_root: Path | None = None,
     ) -> dict[str, Any]:
-        if not ver.manifest_path:
+        manifest_path = str(ver.manifest_path or "").strip()
+        if not manifest_path:
             return {"generated_at": _utcnow().isoformat(), "images": [], "class_image_count": {}}
         dataset_path = Path(dataset_root or resolve_dataset_path(ver.snapshot_path or ds.storage_path)).resolve(strict=False)
-        image_rels = self._collect_manifest_image_rels(ver.manifest_path)
+        dataset_type = ds.dataset_type
+        image_rels = self._collect_manifest_image_rels(manifest_path)
         payload = self._build_view_index_payload(
             dataset_path=dataset_path,
             image_rels=image_rels,
-            dataset_type=ds.dataset_type,
+            dataset_type=dataset_type,
         )
-        self._write_view_index(ver.manifest_path, payload)
+        self._write_view_index(manifest_path, payload)
         return payload
 
     def _trigger_view_index_generation(
@@ -3196,28 +3198,40 @@ class DatasetService:
         *,
         dataset_root: Path | None = None,
     ) -> None:
-        if not ver.manifest_path:
+        manifest_path = str(ver.manifest_path or "").strip()
+        if not manifest_path:
             return
-        if self._load_view_index(ver.manifest_path) is not None:
+        dataset_id = int(ds.dataset_id)
+        version_id = int(ver.version_id)
+        dataset_type = ds.dataset_type
+        root_token = str(ver.snapshot_path or ds.storage_path)
+
+        if self._load_view_index(manifest_path) is not None:
             self._set_artifact_job_summary(
-                self._artifact_job_key("view_index", int(ds.dataset_id), int(ver.version_id)),
+                self._artifact_job_key("view_index", dataset_id, version_id),
                 state="ready",
                 progress=100,
             )
             return
 
-        job_key = self._artifact_job_key("view_index", int(ds.dataset_id), int(ver.version_id))
+        job_key = self._artifact_job_key("view_index", dataset_id, version_id)
         current = self._get_artifact_job_summary(job_key)
         if str(current.get("state") or "").lower() in {"queued", "running"}:
             return
 
-        dataset_path = Path(dataset_root or resolve_dataset_path(ver.snapshot_path or ds.storage_path)).resolve(strict=False)
+        dataset_path = Path(dataset_root or resolve_dataset_path(root_token)).resolve(strict=False)
         self._set_artifact_job_summary(job_key, state="queued", progress=0)
 
         def _generate():
             self._set_artifact_job_summary(job_key, state="running", progress=1)
             try:
-                payload = self._build_and_store_view_index(ds, ver, dataset_root=dataset_path)
+                image_rels = self._collect_manifest_image_rels(manifest_path)
+                payload = self._build_view_index_payload(
+                    dataset_path=dataset_path,
+                    image_rels=image_rels,
+                    dataset_type=dataset_type,
+                )
+                self._write_view_index(manifest_path, payload)
                 total_images = len(list(payload.get("images") or []))
                 self._set_artifact_job_summary(
                     job_key,
@@ -3229,8 +3243,8 @@ class DatasetService:
                 self._set_artifact_job_summary(job_key, state="failed", progress=0, error=str(e))
                 logger.error(
                     "View index generation failed for dataset %s version %s: %s",
-                    getattr(ds, "dataset_id", "?"),
-                    getattr(ver, "version_id", "?"),
+                    dataset_id,
+                    version_id,
                     e,
                 )
 

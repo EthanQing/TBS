@@ -83,26 +83,7 @@ class FileService:
                     if yolo_root is not None:
                         source_root = yolo_root
                 elif fmt == "coco":
-                    from train_platform.services.v3.dataset_conversion_service import DatasetConversionService
-
-                    detected_format = "coco"
-                    coco_json = info.get("coco_json")
-                    if coco_json is None:
-                        raise ValidationError("COCO json not found")
-
-                    images_dir = coco_json.parent
-                    if (coco_json.parent / "images").exists():
-                        images_dir = coco_json.parent / "images"
-                    elif (coco_json.parent / "train2017").exists():
-                        images_dir = coco_json.parent / "train2017"
-
-                    DatasetConversionService().conversion_coco_2_yolo(
-                        coco_json_path=coco_json,
-                        output_labels_dir=images_dir.parent / "labels" if images_dir.name == "images" else coco_json.parent / "labels",
-                        output_class_names_path=images_dir.parent / "class_names.txt" if images_dir.name == "images" else coco_json.parent / "class_names.txt",
-                    )
-
-                    source_root = images_dir.parent if images_dir.name == "images" else coco_json.parent
+                    raise ValidationError("COCO dataset conversion/upload is no longer supported in V3")
                 elif fmt == "labelme":
                     detected_format = "labelme"
                     illegal_reason = "labelme_json"
@@ -196,25 +177,7 @@ class FileService:
                     if yolo_root is not None:
                         source_root = yolo_root
                 elif fmt == "coco":
-                    from train_platform.services.v3.dataset_conversion_service import DatasetConversionService
-
-                    detected_format = "coco"
-                    coco_json = info.get("coco_json")
-                    if coco_json is None:
-                        raise ValidationError("COCO json not found")
-
-                    images_dir = coco_json.parent
-                    if (coco_json.parent / "images").exists():
-                        images_dir = coco_json.parent / "images"
-                    elif (coco_json.parent / "train2017").exists():
-                        images_dir = coco_json.parent / "train2017"
-
-                    DatasetConversionService().conversion_coco_2_yolo(
-                        coco_json_path=coco_json,
-                        output_labels_dir=images_dir.parent / "labels" if images_dir.name == "images" else coco_json.parent / "labels",
-                        output_class_names_path=images_dir.parent / "class_names.txt" if images_dir.name == "images" else coco_json.parent / "class_names.txt",
-                    )
-                    source_root = images_dir.parent if images_dir.name == "images" else coco_json.parent
+                    raise ValidationError("COCO dataset conversion/upload is no longer supported in V3")
                 elif fmt == "labelme":
                     detected_format = "labelme"
                     illegal_reason = "labelme_json"
