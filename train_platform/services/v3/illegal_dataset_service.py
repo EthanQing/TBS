@@ -34,6 +34,7 @@ from train_platform.services.v3.dataset_common import (
     read_class_names,
     resolve_storage_token,
     static_dataset_url,
+    dataset_thumbnail_url,
     to_storage_token,
     unpack_uploaded_archive,
 )
@@ -346,7 +347,20 @@ class IllegalDatasetService:
             .order_by(IllegalDatasetImage.path.asc())
             .all()
         )
-        payload = build_view_payload(resolve_storage_token(str(version.snapshot_path)), str(version.snapshot_path), images, page=page, page_size=page_size)
+        payload = build_view_payload(
+            resolve_storage_token(str(version.snapshot_path)),
+            str(version.snapshot_path),
+            images,
+            page=page,
+            page_size=page_size,
+            thumbnail_url_builder=lambda rel_path: dataset_thumbnail_url(
+                "illegal",
+                int(row.illegal_dataset_id),
+                rel_path,
+                version_id=int(version.version_id),
+                size=320,
+            ),
+        )
         if class_id is not None:
             payload["items"] = [item for item in payload["items"] if int(class_id) in item.get("classes", [])]
             payload["meta"]["total_items"] = len(payload["items"])

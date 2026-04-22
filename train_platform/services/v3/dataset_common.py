@@ -6,7 +6,8 @@ import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
+from urllib.parse import quote, urlencode
 
 import yaml
 from sqlalchemy.orm import Session
@@ -245,7 +246,35 @@ def static_dataset_url(storage_token: str, rel_path: str | Path) -> str:
     return f"/static/datasets/{base}/{rel}"
 
 
-def build_view_payload(root: Path, storage_token: str, image_rows: list[Any], *, page: int, page_size: int) -> dict[str, Any]:
+def dataset_thumbnail_url(
+    dataset_kind: str,
+    dataset_id: int,
+    rel_path: str | Path,
+    *,
+    version_id: int | None = None,
+    size: int | None = None,
+) -> str:
+    rel = ensure_safe_relative_path(rel_path).as_posix()
+    encoded_rel = quote(rel, safe="/")
+    base = f"/api/v3/thumbnails/{quote(str(dataset_kind).strip(), safe='')}/{int(dataset_id)}/{encoded_rel}"
+    params: dict[str, str] = {}
+    if version_id is not None:
+        params["version_id"] = str(int(version_id))
+    if size is not None:
+        params["size"] = str(int(size))
+    qs = urlencode(params)
+    return f"{base}?{qs}" if qs else base
+
+
+def build_view_payload(
+    root: Path,
+    storage_token: str,
+    image_rows: list[Any],
+    *,
+    page: int,
+    page_size: int,
+    thumbnail_url_builder: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
     class_names = read_class_names(root)
     category_image_ids: dict[int, set[int]] = {}
     items: list[dict[str, Any]] = []
@@ -267,8 +296,9 @@ def build_view_payload(root: Path, storage_token: str, image_rows: list[Any], *,
             {
                 "id": int(getattr(row, "image_id", idx) or idx),
                 "name": Path(rel_path).name,
+                "path": rel_path,
                 "url": static_dataset_url(storage_token, rel_path),
-                "thumbnail_url": static_dataset_url(storage_token, rel_path),
+                "thumbnail_url": thumbnail_url_builder(rel_path) if thumbnail_url_builder else static_dataset_url(storage_token, rel_path),
                 "width": width,
                 "height": height,
                 "object_count": len(boxes),
@@ -334,6 +364,8 @@ def build_statistics(root: Path, *, image_count: int | None = None) -> dict[str,
     total_files, total_size = count_tree(root)
     annotation_count = 0
     for label in root.rglob("*.txt"):
+        if label.name.lower() in {"classes.txt", "train.txt", "val.txt", "test.txt"}:
+            continue
         try:
             annotation_count += len([line for line in label.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip()])
         except Exception:

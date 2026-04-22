@@ -111,6 +111,7 @@ class CategoryInfo(BaseModel):
 class ViewImageItem(BaseModel):
     id: int
     name: str
+    path: str
     url: str
     thumbnail_url: str
     width: Optional[int] = None

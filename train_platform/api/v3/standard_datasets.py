@@ -9,6 +9,9 @@ from train_platform.schemas.v3.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v3.standard_datasets import (
     DatasetFileOut,
     DatasetImageAnnotationsOut,
+    DatasetSplitRequest,
+    DatasetSplitResultOut,
+    DatasetSplitSummary,
     DatasetStatisticsOut,
     DatasetViewOut,
     StandardDatasetCreate,
@@ -81,6 +84,36 @@ def upload_standard_dataset_archive(
     db: Session = Depends(get_db),
 ):
     return svc.upload_archive(db, standard_dataset_id, file, created_by=created_by)
+
+
+@router.post("/{standard_dataset_id}/split", response_model=DatasetSplitSummary)
+def split_standard_dataset(
+    standard_dataset_id: int,
+    payload: DatasetSplitRequest,
+    db: Session = Depends(get_db),
+):
+    return svc.split_dataset(db, standard_dataset_id, **payload.model_dump())
+
+
+@router.get("/{standard_dataset_id}/split", response_model=DatasetSplitResultOut)
+def get_standard_dataset_split(
+    standard_dataset_id: int,
+    page: int = 1,
+    page_size: int = 50,
+    split: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    page = max(int(page), 1)
+    page_size = min(max(int(page_size), 1), 500)
+    skip = (page - 1) * page_size
+    items, summary, total = svc.get_split_result(
+        db,
+        standard_dataset_id,
+        split=split,
+        skip=skip,
+        limit=page_size,
+    )
+    return {"summary": summary, "items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
 @router.get("/{standard_dataset_id}/events", response_model=Page[StandardDatasetEventOut])

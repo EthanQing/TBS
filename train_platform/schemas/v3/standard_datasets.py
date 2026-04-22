@@ -66,6 +66,15 @@ class DatasetImageOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class DatasetSplitRequest(BaseModel):
+    train_ratio: float = Field(0.9, gt=0, le=1)
+    val_ratio: Optional[float] = Field(None, ge=0, lt=1)
+    test_ratio: Optional[float] = Field(None, ge=0, lt=1)
+    seed: Optional[int] = None
+    shuffle: bool = True
+    overwrite: bool = True
+
+
 class DatasetStatisticsOut(BaseModel):
     total_files: int
     total_size_bytes: int
@@ -83,6 +92,7 @@ class CategoryInfo(BaseModel):
 class ViewImageItem(BaseModel):
     id: int
     name: str
+    path: str
     url: str
     thumbnail_url: str
     width: Optional[int] = None
