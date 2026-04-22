@@ -10,7 +10,6 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from train_platform.core.config import settings
-from train_platform.services.v3.usage_limit_service import UsageLimitService
 
 app = FastAPI(title="Paddle Inference Worker", version="1.0")
 
@@ -41,12 +40,6 @@ def _verify_internal_auth(x_internal_token: Optional[str] = Header(default=None,
     provided = str(x_internal_token or "").strip()
     if provided != expected:
         raise HTTPException(status_code=401, detail="Unauthorized internal request")
-
-
-def _ensure_usage_limit_allowed() -> None:
-    status = UsageLimitService.get_status()
-    if status["blocked"]:
-        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 def _cache_key(config_path: Path, weights_path: Path) -> str:
@@ -164,7 +157,6 @@ def _run_paddle_det(config_path: Path, weights_path: Path, image_path: Path, *, 
 def run_inference(
     req: PaddleInferenceRequest,
     _: None = Depends(_verify_internal_auth),
-    __: None = Depends(_ensure_usage_limit_allowed),
 ) -> InferenceResponse:
     config_path = Path(req.config_path)
     if not config_path.exists() or not config_path.is_file():

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Tuple
 
@@ -22,19 +21,6 @@ def _csv_env(name: str, default: str = "") -> Tuple[str, ...]:
         return tuple()
     items = [x.strip() for x in str(raw).split(",")]
     return tuple(x for x in items if x)
-
-
-def _datetime_env(name: str) -> datetime | None:
-    raw = str(os.getenv(name, "") or "").strip()
-    if not raw:
-        return None
-    try:
-        value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(f"Invalid ISO8601 datetime for {name}: {raw}") from exc
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -71,26 +57,11 @@ class Settings:
     upload_max_parallel_parts: int = max(1, int(os.getenv("UPLOAD_MAX_PARALLEL_PARTS", "3") or "3"))
     illegal_dataset_id_start: int = max(1, int(os.getenv("ILLEGAL_DATASET_ID_START", "1000000") or "1000000"))
     standard_dataset_id_start: int = max(1, int(os.getenv("STANDARD_DATASET_ID_START", "2000000") or "2000000"))
-    software_not_before_at: datetime | None = _datetime_env("SOFTWARE_NOT_BEFORE_AT")
-    software_not_after_at: datetime | None = _datetime_env("SOFTWARE_NOT_AFTER_AT")
-    software_expires_at: datetime | None = _datetime_env("SOFTWARE_EXPIRES_AT")
-    software_clock_rollback_tolerance_seconds: int = max(
-        0,
-        int(os.getenv("SOFTWARE_CLOCK_ROLLBACK_TOLERANCE_SECONDS", "300") or "300"),
-    )
-    software_guard_persist_interval_seconds: int = max(
-        1,
-        int(os.getenv("SOFTWARE_GUARD_PERSIST_INTERVAL_SECONDS", "60") or "60"),
-    )
 
     @property
     def thumbnails_dir(self) -> Path:
         # Keep thumbnails under the datasets root so they can be managed together.
         return (self.datasets_dir / ".thumbnails").resolve()
-
-    @property
-    def usage_limit_state_path(self) -> Path:
-        return (self.home_dir / ".runtime" / ".node_state.dat").resolve()
 
     @property
     def database_url(self) -> str:

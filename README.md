@@ -165,10 +165,6 @@ Optional overrides:
 - `WORKER_HEARTBEAT_INTERVAL`
 - `WORKER_STALE_AFTER_SECONDS`
 - `WORKER_BIND_HOST`
-- `SOFTWARE_NOT_BEFORE_AT`
-- `SOFTWARE_NOT_AFTER_AT`
-- `SOFTWARE_EXPIRES_AT`
-- `SOFTWARE_CLOCK_ROLLBACK_TOLERANCE_SECONDS`
 
 ### Storage
 
@@ -213,24 +209,6 @@ Required dependencies:
 
 - `psutil`
 - `pynvml`
-
-## Software Usage Limit
-
-The backend can enforce a hidden runtime time window:
-
-- start time: `SOFTWARE_NOT_BEFORE_AT=2026-04-03T00:00:00+08:00`
-- end time: `SOFTWARE_NOT_AFTER_AT=2026-05-15T23:59:59+08:00`
-
-`SOFTWARE_EXPIRES_AT` remains available as a legacy alias for the end time.
-
-The backend also persists a signed hidden state file and rejects obvious local clock rollback attempts.
-
-When the runtime guard blocks access:
-
-- normal business APIs return `403`
-- `/health` remains accessible and does not expose the configured window
-- queue workers stop accepting new training jobs
-- internal inference / export worker endpoints reject new work
 
 ## Framework Plugin System
 

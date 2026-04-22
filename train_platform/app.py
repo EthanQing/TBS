@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -11,7 +11,6 @@ from fastapi.staticfiles import StaticFiles
 from train_platform.api.v3 import router as api_router
 from train_platform.core.config import settings
 from train_platform.db.init_db import init_db
-from train_platform.services.v3.usage_limit_service import UsageLimitService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -22,20 +21,6 @@ logger = logging.getLogger("train_platform")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.ensure_dirs()
-    usage_limit_status = UsageLimitService.get_status()
-    if usage_limit_status["enabled"]:
-        logger.info(
-            "Runtime guard enabled: start=%s end=%s last_seen=%s",
-            usage_limit_status["window_start"],
-            usage_limit_status["window_end"],
-            usage_limit_status["last_seen_at"],
-        )
-        if usage_limit_status["blocked"]:
-            logger.warning(
-                "Runtime guard blocked startup: reason=%s detail=%s",
-                usage_limit_status["reason"],
-                usage_limit_status["message"],
-            )
     try:
         init_db()
     except Exception as e:
@@ -61,22 +46,6 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @app.middleware("http")
-    async def usage_limit_middleware(request: Request, call_next):
-        if request.method != "OPTIONS" and not UsageLimitService.is_exempt_path(request.url.path):
-            status = UsageLimitService.get_status()
-            if status["blocked"]:
-                logger.warning(
-                    "Runtime guard blocked request path=%s reason=%s",
-                    request.url.path,
-                    status["reason"],
-                )
-                return JSONResponse(
-                    status_code=403,
-                    content=UsageLimitService.get_denial_payload(status),
-                )
-        return await call_next(request)
 
     app.include_router(api_router, prefix="/api/v3")
 
