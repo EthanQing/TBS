@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from train_platform.core.config import settings
-from train_platform.services.usage_limit_service import UsageLimitService
+from train_platform.services.v3.usage_limit_service import UsageLimitService
 
 app = FastAPI(title="Paddle Inference Worker", version="1.0")
 

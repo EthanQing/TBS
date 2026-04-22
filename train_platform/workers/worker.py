@@ -15,11 +15,11 @@ from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
-from train_platform.models.architecture import ModelArchitecture
-from train_platform.models.enums import DeploymentStatus, LogLevel, TrainingRunStatus
-from train_platform.models.training_run import TrainingRun, TrainingRunEvent
-from train_platform.services.alarm_service import AlarmService
-from train_platform.services.usage_limit_service import UsageLimitService
+from train_platform.models.v3.architecture import ModelArchitecture
+from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
+from train_platform.models.v3.training_run import TrainingRun, TrainingRunEvent
+from train_platform.services.v3.alarm_service import AlarmService
+from train_platform.services.v3.usage_limit_service import UsageLimitService
 from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
 
 

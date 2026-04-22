@@ -220,11 +220,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
         raise ValidationError("weights must be 'best' or 'last'")
 
     weights_dir = (settings.training_dir / str(run.run_id) / "weights").resolve(strict=False)
-    src_primary = (weights_dir / ("best.pt" if weights == "best" else "last.pt")).resolve(strict=False)
-    src_fallback = (weights_dir / ("best.pth" if weights == "best" else "last.pth")).resolve(strict=False)
-
-    # Prefer .pt (Ultralytics); fallback to .pth (MMDet) for raw download.
-    src_weights = src_primary if src_primary.exists() else src_fallback
+    src_weights = (weights_dir / ("best.pt" if weights == "best" else "last.pt")).resolve(strict=False)
 
     if settings.training_dir.resolve() not in src_weights.parents:
         raise ValidationError("Unsafe weights path")
@@ -237,7 +233,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
         return TrainingRunExportOut(run_id=str(run.run_id), format=fmt, weights=weights, download_url=url, artifact=None)
 
     # fmt == onnx
-    if not src_primary.exists():
+    if not src_weights.exists():
         raise ValidationError("ONNX export is only supported for .pt weights (Ultralytics).")
 
     out_name = "best.onnx" if weights == "best" else "last.onnx"
@@ -247,7 +243,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
 
     if not out_onnx.exists():
         _export_onnx_via_worker(
-            src_primary,
+            src_weights,
             out_onnx,
             dynamic=bool(payload.dynamic),
             opset=payload.opset,

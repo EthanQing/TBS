@@ -29,8 +29,6 @@ class StandardDatasetOut(BaseModel):
     storage_path: str
     description: Optional[str] = None
     source_type: Optional[str] = None
-    source_illegal_dataset_id: Optional[int] = None
-    source_illegal_version_id: Optional[int] = None
     publish_config: Optional[dict] = None
     created_at: datetime
     updated_at: datetime

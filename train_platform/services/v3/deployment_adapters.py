@@ -78,5 +78,5 @@ def get_deployment_adapter(platform: DeploymentPlatform | str) -> DeploymentAdap
     key = str(platform.value if isinstance(platform, DeploymentPlatform) else platform).strip().lower()
     adapter = _ADAPTERS.get(key)
     if adapter is None:
-        raise ValidationError(f"Deployment platform not supported in v1: {key}")
+        raise ValidationError(f"Deployment platform not supported in V3: {key}")
     return adapter

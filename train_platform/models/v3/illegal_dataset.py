@@ -51,7 +51,6 @@ class IllegalDataset(V3Base):
         back_populates="illegal_dataset",
         cascade="all, delete-orphan",
     )
-    published_standard_datasets = relationship("StandardDataset", back_populates="source_illegal_dataset")
 
 
 class IllegalDatasetVersion(V3Base):
@@ -89,7 +88,6 @@ class IllegalDatasetVersion(V3Base):
     parent = relationship("IllegalDatasetVersion", remote_side=[version_id], foreign_keys=[parent_version_id])
     images = relationship("IllegalDatasetImage", back_populates="version", cascade="all, delete-orphan")
     events = relationship("IllegalDatasetEvent", back_populates="version")
-    published_standard_datasets = relationship("StandardDataset", back_populates="source_illegal_version")
 
     __table_args__ = (
         UniqueConstraint("illegal_dataset_id", "version", name="uq_illegal_dataset_versions_dataset_version"),

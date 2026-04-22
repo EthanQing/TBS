@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from train_platform.training.plugins.base import TrainerPlugin
-from train_platform.training.plugins.mmdet import MMDetTrainer
 from train_platform.training.plugins.paddle_det import PaddleDetTrainer
 from train_platform.training.plugins.ultralytics_yolo import UltralyticsYOLOTrainer
 
@@ -33,7 +32,6 @@ def _bootstrap_plugins() -> None:
         return
     register_plugin(UltralyticsYOLOTrainer())
     register_plugin(PaddleDetTrainer())
-    register_plugin(MMDetTrainer())
 
 
 def list_plugins() -> List[FrameworkPluginInfo]:

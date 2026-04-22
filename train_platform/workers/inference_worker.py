@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from train_platform.core.config import settings
-from train_platform.services.usage_limit_service import UsageLimitService
+from train_platform.services.v3.usage_limit_service import UsageLimitService
 
 app = FastAPI(title="Inference Worker", version="1.0")
 
@@ -161,7 +161,7 @@ def start_model_conversion(
     __: None = Depends(_ensure_usage_limit_allowed),
 ) -> WorkerStatusResponse:
     try:
-        from train_platform.api.v2.model_conversions import _run_pt_to_onnx
+        from train_platform.api.v3.model_conversions import _run_pt_to_onnx
     except Exception as e:
         return WorkerStatusResponse(status="error", error=f"Failed to import conversion worker: {type(e).__name__}: {e}")
 

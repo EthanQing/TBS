@@ -1,4 +1,3 @@
 from __future__ import annotations
 
-# V2 schemas live in train_platform.schemas.v2
-
+# Schema modules are versioned under train_platform.schemas.v3

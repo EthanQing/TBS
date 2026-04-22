@@ -193,7 +193,7 @@ def create_serving_job(deployment_id: int, payload: ServingJobCreate, db: Sessio
     return ServingJobOut(
         enabled=False,
         status="not_enabled",
-        message="mode not enabled in v1",
+        message="mode not enabled in V3",
         mode=str(payload.mode),
         job_id=None,
     )
@@ -204,7 +204,7 @@ def get_serving_job(job_id: str):
     return ServingJobOut(
         enabled=False,
         status="not_enabled",
-        message="mode not enabled in v1",
+        message="mode not enabled in V3",
         mode=None,
         job_id=str(job_id),
     )

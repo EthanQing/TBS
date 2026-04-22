@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
-from train_platform.models.training_run_meta import TrainingRunMeta
+from train_platform.models.v3.training_run_meta import TrainingRunMeta
 
 
 def _truthy(value: Optional[str]) -> bool:

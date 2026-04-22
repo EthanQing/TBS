@@ -5,7 +5,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.models.training_run import TrainingRunArtifact, TrainingRunResult
+from train_platform.models.v3.training_run import TrainingRunArtifact, TrainingRunResult
 
 
 def index_completion_artifacts(db: Session, run_id: str) -> None:
@@ -22,8 +22,6 @@ def index_completion_artifacts(db: Session, run_id: str) -> None:
     candidates: list[tuple[str, str, Path]] = [
         ("weights", "best.pt", run_dir / "weights" / "best.pt"),
         ("weights", "last.pt", run_dir / "weights" / "last.pt"),
-        ("weights", "best.pth", run_dir / "weights" / "best.pth"),
-        ("weights", "last.pth", run_dir / "weights" / "last.pth"),
         ("weights", "best.pdparams", run_dir / "weights" / "best.pdparams"),
         ("weights", "last.pdparams", run_dir / "weights" / "last.pdparams"),
         ("weights", "best.pdopt", run_dir / "weights" / "best.pdopt"),
@@ -76,7 +74,7 @@ def index_completion_artifacts(db: Session, run_id: str) -> None:
             )
         )
 
-    # Update/Upsert TrainingRunResult for compatibility with model registry.
+    # Update/Upsert TrainingRunResult for the V3 model registry flow.
     res = db.query(TrainingRunResult).filter(TrainingRunResult.run_id == str(run_id)).first()
     if not res:
         res = TrainingRunResult(run_id=str(run_id))
@@ -86,16 +84,12 @@ def index_completion_artifacts(db: Session, run_id: str) -> None:
 
     best_pt = run_dir / "weights" / "best.pt"
     last_pt = run_dir / "weights" / "last.pt"
-    best_pth = run_dir / "weights" / "best.pth"
-    last_pth = run_dir / "weights" / "last.pth"
     best_pd = run_dir / "weights" / "best.pdparams"
     last_pd = run_dir / "weights" / "last.pdparams"
 
     best = (
         best_pt
         if best_pt.exists()
-        else best_pth
-        if best_pth.exists()
         else best_pd
         if best_pd.exists()
         else None
@@ -103,8 +97,6 @@ def index_completion_artifacts(db: Session, run_id: str) -> None:
     last = (
         last_pt
         if last_pt.exists()
-        else last_pth
-        if last_pth.exists()
         else last_pd
         if last_pd.exists()
         else None

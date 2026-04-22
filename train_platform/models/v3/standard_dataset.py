@@ -24,18 +24,6 @@ class StandardDataset(V3Base):
     storage_path: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-    source_illegal_dataset_id: Mapped[Optional[int]] = mapped_column(
-        Integer,
-        ForeignKey("illegal_datasets.illegal_dataset_id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
-    source_illegal_version_id: Mapped[Optional[int]] = mapped_column(
-        Integer,
-        ForeignKey("illegal_dataset_versions.version_id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
     publish_config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -49,8 +37,6 @@ class StandardDataset(V3Base):
     images = relationship("StandardDatasetImage", back_populates="standard_dataset", cascade="all, delete-orphan")
     projects = relationship("Project", back_populates="standard_dataset")
     training_runs = relationship("TrainingRun", back_populates="standard_dataset")
-    source_illegal_dataset = relationship("IllegalDataset", back_populates="published_standard_datasets")
-    source_illegal_version = relationship("IllegalDatasetVersion", back_populates="published_standard_datasets")
 
 
 class StandardDatasetEvent(V3Base):

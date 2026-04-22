@@ -7,7 +7,7 @@ Keep this file declarative and easy to extend: when you add a new model family,
 add a new helper and append its output to DEFAULT_ARCHITECTURES.
 """
 
-from train_platform.models.enums import TaskType
+from train_platform.models.v3.enums import TaskType
 
 
 def ultralytics_detection_variants(
@@ -194,4 +194,3 @@ DEFAULT_ARCHITECTURES: list[dict] = [
     # *yolov8_classification_variants(),
     # *yolov8_segmentation_variants(),
 ]
-

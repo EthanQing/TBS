@@ -154,11 +154,14 @@ class IllegalDatasetService:
         name = str(obj.get("name") or "").strip()
         if not name:
             raise ValidationError("name is required")
+        fmt = str(obj.get("format") or "yolo").strip().lower() or "yolo"
+        if fmt != "yolo":
+            raise ValidationError("Only YOLO dataset format is supported")
         self._ensure_name_available(db, name)
         row = IllegalDataset(
             name=name,
             dataset_type=obj["dataset_type"],
-            format=str(obj.get("format") or "yolo").strip() or "yolo",
+            format=fmt,
             storage_path="pending/illegal",
             description=obj.get("description"),
         )
@@ -193,13 +196,6 @@ class IllegalDatasetService:
 
     def delete_dataset(self, db: Session, illegal_dataset_id: int, *, delete_files: bool = False, force: bool = False) -> None:
         row = self.get_dataset(db, illegal_dataset_id)
-        from train_platform.models.v3.standard_dataset import StandardDataset
-
-        standards = db.query(StandardDataset).filter(StandardDataset.source_illegal_dataset_id == int(row.illegal_dataset_id)).all()
-        if standards and not force:
-            raise ConflictError("Illegal dataset has published standard datasets")
-        for standard in standards:
-            db.delete(standard)
         root = self._root_path(row)
         version_root = settings.datasets_dir / "illegal" / ".versions" / str(int(row.illegal_dataset_id))
         db.delete(row)
@@ -490,8 +486,6 @@ class IllegalDatasetService:
             source_root=snapshot_root,
             description=obj.get("description"),
             source_type="illegal_publish",
-            source_illegal_dataset_id=int(row.illegal_dataset_id),
-            source_illegal_version_id=int(version.version_id),
             publish_config=publish_config,
         )
         self._add_event(

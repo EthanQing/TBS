@@ -1,2 +1,2 @@
-"""Trainer plugins (YOLO/PaddleDet/DETR...)."""
+"""Trainer plugins (Ultralytics YOLO / PaddleDet)."""
 

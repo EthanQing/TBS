@@ -89,16 +89,17 @@ class StandardDatasetService:
         name = str(obj.get("name") or "").strip()
         if not name:
             raise ValidationError("name is required")
+        fmt = str(obj.get("format") or "yolo").strip().lower() or "yolo"
+        if fmt != "yolo":
+            raise ValidationError("Only YOLO dataset format is supported")
         self._ensure_name_available(db, name)
         row = StandardDataset(
             name=name,
             dataset_type=obj["dataset_type"],
-            format=str(obj.get("format") or "yolo").strip() or "yolo",
+            format=fmt,
             storage_path="pending/standard",
             description=obj.get("description"),
             source_type=obj.get("source_type"),
-            source_illegal_dataset_id=obj.get("source_illegal_dataset_id"),
-            source_illegal_version_id=obj.get("source_illegal_version_id"),
             publish_config=obj.get("publish_config"),
         )
         db.add(row)
@@ -182,8 +183,6 @@ class StandardDatasetService:
         source_root: Path,
         description: str | None = None,
         source_type: str | None = None,
-        source_illegal_dataset_id: int | None = None,
-        source_illegal_version_id: int | None = None,
         publish_config: dict[str, Any] | None = None,
         created_by: str | None = None,
     ) -> StandardDataset:
@@ -195,8 +194,6 @@ class StandardDatasetService:
                 "format": "yolo",
                 "description": description,
                 "source_type": source_type,
-                "source_illegal_dataset_id": source_illegal_dataset_id,
-                "source_illegal_version_id": source_illegal_version_id,
                 "publish_config": publish_config,
             },
         )

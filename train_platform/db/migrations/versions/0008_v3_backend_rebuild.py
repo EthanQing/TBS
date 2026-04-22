@@ -48,25 +48,42 @@ def _drop_if_exists(table_name: str) -> None:
         op.drop_table(table_name)
 
 
+def _set_fk_checks(enabled: bool) -> None:
+    bind = op.get_bind()
+    dialect = bind.dialect.name
+    if dialect == "mysql":
+        op.execute(f"SET FOREIGN_KEY_CHECKS = {1 if enabled else 0}")
+    elif dialect == "sqlite":
+        op.execute(f"PRAGMA foreign_keys = {'ON' if enabled else 'OFF'}")
+
+
 def upgrade() -> None:
     bind = op.get_bind()
-    for table_name in _DROP_ORDER:
-        _drop_if_exists(table_name)
-    V3Base.metadata.create_all(bind=bind, checkfirst=True)
+    _set_fk_checks(False)
+    try:
+        for table_name in _DROP_ORDER:
+            _drop_if_exists(table_name)
+        V3Base.metadata.create_all(bind=bind, checkfirst=True)
+    finally:
+        _set_fk_checks(True)
 
 
 def downgrade() -> None:
     bind = op.get_bind()
-    for table_name in reversed(_DROP_ORDER):
-        _drop_if_exists(table_name)
-    for table_name in [
-        "standard_dataset_images",
-        "standard_dataset_events",
-        "standard_datasets",
-        "illegal_dataset_label_mappings",
-        "illegal_dataset_images",
-        "illegal_dataset_events",
-        "illegal_dataset_versions",
-        "illegal_datasets",
-    ]:
-        _drop_if_exists(table_name)
+    _set_fk_checks(False)
+    try:
+        for table_name in reversed(_DROP_ORDER):
+            _drop_if_exists(table_name)
+        for table_name in [
+            "standard_dataset_images",
+            "standard_dataset_events",
+            "standard_datasets",
+            "illegal_dataset_label_mappings",
+            "illegal_dataset_images",
+            "illegal_dataset_events",
+            "illegal_dataset_versions",
+            "illegal_datasets",
+        ]:
+            _drop_if_exists(table_name)
+    finally:
+        _set_fk_checks(True)

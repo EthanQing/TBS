@@ -82,8 +82,6 @@ class FileService:
                     yolo_root = info.get("yolo_root")
                     if yolo_root is not None:
                         source_root = yolo_root
-                elif fmt == "coco":
-                    raise ValidationError("COCO dataset conversion/upload is no longer supported in V3")
                 elif fmt == "labelme":
                     detected_format = "labelme"
                     illegal_reason = "labelme_json"
@@ -176,8 +174,6 @@ class FileService:
                     yolo_root = info.get("yolo_root")
                     if yolo_root is not None:
                         source_root = yolo_root
-                elif fmt == "coco":
-                    raise ValidationError("COCO dataset conversion/upload is no longer supported in V3")
                 elif fmt == "labelme":
                     detected_format = "labelme"
                     illegal_reason = "labelme_json"
@@ -570,7 +566,7 @@ class FileService:
     def _classify_json(self, path: Path) -> str:
         """
         Classify a json annotation file.
-        Returns: "coco", "labelme", or "unknown".
+        Returns: "labelme" or "unknown".
         """
         try:
             if not path.exists() or not path.is_file():
@@ -587,8 +583,6 @@ class FileService:
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
                         head = f.read(256 * 1024)
                     head_l = head.lower()
-                    if '"images"' in head_l and '"annotations"' in head_l and '"categories"' in head_l:
-                        return "coco"
                     if '"shapes"' in head_l and (
                         '"imagewidth"' in head_l or '"imageheight"' in head_l or '"imagepath"' in head_l
                     ):
@@ -602,8 +596,6 @@ class FileService:
             if not isinstance(data, dict):
                 return "unknown"
 
-            if "images" in data and "annotations" in data and "categories" in data:
-                return "coco"
             if "shapes" in data and (
                 "imageWidth" in data
                 or "imageHeight" in data
@@ -623,7 +615,6 @@ class FileService:
         result = {
             "format": "no_images",
             "yolo_root": None,
-            "coco_json": None,
             "labelme_json": None,
         }
         if dataset_type != DatasetType.DETECTION:
@@ -670,13 +661,9 @@ class FileService:
             unknown_json = False
             for p in json_paths:
                 kind = self._classify_json(p)
-                if kind == "coco":
-                    result["format"] = "coco"
-                    result["coco_json"] = p
-                    return result
                 if kind == "labelme" and labelme_json is None:
                     labelme_json = p
-                elif kind == "unknown":
+                else:
                     unknown_json = True
 
             if labelme_json is not None:
@@ -797,58 +784,6 @@ class FileService:
                     best = cand
 
         return best[2] if best else None
-
-    def _find_coco_annotation_file(self, root: Path) -> Optional[Path]:
-        """
-        Scan for a likely COCO JSON annotation file.
-        Look for .json files that contain 'images' and 'categories' top-level keys.
-        """
-        if not root.exists():
-            return None
-            
-        # Limit scan depth
-        for cur, dirnames, filenames in os.walk(root):
-            cur_p = Path(cur)
-            if len(cur_p.relative_to(root).parts) > 4:
-                dirnames[:] = []
-                continue
-                
-            for fname in filenames:
-                if not fname.lower().endswith(".json"):
-                    continue
-                
-                # Check content
-                p = cur_p / fname
-                try:
-                    # quick read first 1KB to check basic structure if possible, 
-                    # but keys might be anywhere.
-                    # better to parse but limited length?
-                    # COCO jsons can be huge. parsing whole file just to check is slow.
-                    # simple heuristic: check file name or just try to parse if size is reasonable?
-                    # Common names: instances_default.json, result.json, _annotations.coco.json
-                    
-                    # Heuristic name check first
-                    lower_name = fname.lower()
-                    likely_coco = "instances" in lower_name or "coco" in lower_name or "annotations" in lower_name
-                    
-                    if not likely_coco:
-                        # Skip unlikely names to avoid parsing irrelevant jsons
-                        continue
-                        
-                    # Basic check
-                    import json
-                    with open(p, "r", encoding="utf-8") as f:
-                        # streaming check would be better but let's just read start
-                        head = f.read(1024)
-                        if '"images":' in head and '"categories":' in head:
-                            return p
-                        if '"images":' in head and '"annotations":' in head:
-                            return p
-                            
-                except Exception:
-                    continue
-                    
-        return None
 
     def _find_labelme_json_file(self, root: Path) -> Optional[Path]:
         """
