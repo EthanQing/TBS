@@ -27,6 +27,29 @@ class ThumbnailService:
 
     _IMAGE_EXTS = IMAGE_EXTS
 
+    def _thumbnail_base(
+        self,
+        *,
+        dataset_id: int,
+        dataset_namespace: str | None = None,
+        cache_prefix: str | None = None,
+    ) -> Path:
+        base = settings.thumbnails_dir
+        ns = str(dataset_namespace or "").strip().replace("\\", "/").strip("/\\")
+        if ns:
+            ns_path = Path(ns)
+            if ns_path.is_absolute() or ".." in ns_path.parts:
+                raise ValidationError("Unsafe dataset_namespace")
+            base = base / ns_path
+        base = base / str(int(dataset_id))
+        if cache_prefix:
+            cp = str(cache_prefix).strip().replace("\\", "/").strip("/\\")
+            cp_path = Path(cp)
+            if not cp or cp_path.is_absolute() or ".." in cp_path.parts:
+                raise ValidationError("Unsafe cache_prefix")
+            base = base / cp_path
+        return base.resolve(strict=False)
+
     def pregenerate_for_dataset(
         self,
         *,
@@ -34,6 +57,7 @@ class ThumbnailService:
         dataset_root: Path,
         size: int = 200,
         max_workers: int = 4,
+        dataset_namespace: str | None = None,
         cache_prefix: str | None = None,
         rel_paths: list[str] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
@@ -98,12 +122,11 @@ class ThumbnailService:
                 rel_str = rel.as_posix()
                 
                 # Check if thumbnail already exists and is fresh
-                thumb_base = settings.thumbnails_dir / str(int(dataset_id))
-                if cache_prefix:
-                    cp = str(cache_prefix).strip().replace("\\", "/").strip("/\\")
-                    cp_path = Path(cp)
-                    if cp and (not cp_path.is_absolute()) and ".." not in cp_path.parts:
-                        thumb_base = thumb_base / cp_path
+                thumb_base = self._thumbnail_base(
+                    dataset_id=int(dataset_id),
+                    dataset_namespace=dataset_namespace,
+                    cache_prefix=cache_prefix,
+                )
                 thumb = (thumb_base / rel).with_suffix(".webp").resolve(strict=False)
                 
                 if thumb.exists():
@@ -173,6 +196,7 @@ class ThumbnailService:
         dataset_root: Path,
         file_rel_path: str,
         size: int = 200,
+        dataset_namespace: str | None = None,
         cache_prefix: str | None = None,
     ) -> Path:
         size_i = int(size or 0)
@@ -192,14 +216,11 @@ class ThumbnailService:
         if src.suffix.lower() not in self._IMAGE_EXTS:
             raise ValidationError("Unsupported image format")
 
-        thumb_base = settings.thumbnails_dir / str(int(dataset_id))
-        if cache_prefix:
-            cp = str(cache_prefix).strip().replace("\\", "/").strip("/\\")
-            cp_path = Path(cp)
-            if not cp or cp_path.is_absolute() or ".." in cp_path.parts:
-                raise ValidationError("Unsafe cache_prefix")
-            thumb_base = thumb_base / cp_path
-        thumb_base = thumb_base.resolve(strict=False)
+        thumb_base = self._thumbnail_base(
+            dataset_id=int(dataset_id),
+            dataset_namespace=dataset_namespace,
+            cache_prefix=cache_prefix,
+        )
         thumb = (thumb_base / rel).with_suffix(".webp").resolve(strict=False)
         if thumb_base not in thumb.parents and thumb != thumb_base:
             raise ValidationError("Unsafe thumbnail path")

@@ -69,6 +69,8 @@ class Settings:
     upload_session_ttl_hours: int = max(1, int(os.getenv("UPLOAD_SESSION_TTL_HOURS", "24") or "24"))
     upload_part_max_retries: int = max(0, int(os.getenv("UPLOAD_PART_MAX_RETRIES", "5") or "5"))
     upload_max_parallel_parts: int = max(1, int(os.getenv("UPLOAD_MAX_PARALLEL_PARTS", "3") or "3"))
+    illegal_dataset_id_start: int = max(1, int(os.getenv("ILLEGAL_DATASET_ID_START", "1000000") or "1000000"))
+    standard_dataset_id_start: int = max(1, int(os.getenv("STANDARD_DATASET_ID_START", "2000000") or "2000000"))
     software_not_before_at: datetime | None = _datetime_env("SOFTWARE_NOT_BEFORE_AT")
     software_not_after_at: datetime | None = _datetime_env("SOFTWARE_NOT_AFTER_AT")
     software_expires_at: datetime | None = _datetime_env("SOFTWARE_EXPIRES_AT")

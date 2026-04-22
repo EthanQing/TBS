@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
@@ -29,6 +30,7 @@ from train_platform.services.v3.dataset_common import (
     unpack_uploaded_archive,
     utcnow,
 )
+from train_platform.services.v3.file_service import FileService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -36,8 +38,23 @@ class StandardDatasetService:
     def __init__(self) -> None:
         self.repo = StandardDatasetRepository()
 
+    def _next_dataset_id(self, db: Session) -> int:
+        current_max = db.query(func.max(StandardDataset.standard_dataset_id)).scalar()
+        start = int(settings.standard_dataset_id_start)
+        if current_max is None:
+            return start
+        return max(start, int(current_max) + 1)
+
     def _root_path(self, dataset: StandardDataset) -> Path:
         return resolve_storage_token(dataset.storage_path)
+
+    def _resolve_uploaded_yolo_root(self, extracted_root: Path) -> Path | None:
+        root = Path(extracted_root)
+        if (root / "images").exists() and (root / "labels").exists():
+            return root
+        if any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
+            return root
+        return FileService()._find_yolo_export_root(root)
 
     def _ensure_name_available(self, db: Session, name: str, *, exclude_id: int | None = None) -> None:
         row = self.repo.get_by_name(db, str(name).strip())
@@ -94,6 +111,7 @@ class StandardDatasetService:
             raise ValidationError("Only YOLO dataset format is supported")
         self._ensure_name_available(db, name)
         row = StandardDataset(
+            standard_dataset_id=self._next_dataset_id(db),
             name=name,
             dataset_type=obj["dataset_type"],
             format=fmt,
@@ -158,7 +176,12 @@ class StandardDatasetService:
         temp_dir = Path(tempfile.mkdtemp(dir=settings.temp_dir))
         try:
             extracted_root = unpack_uploaded_archive(upload, temp_dir)
-            copy_tree(extracted_root, root)
+            yolo_root = self._resolve_uploaded_yolo_root(extracted_root)
+            if yolo_root is None:
+                raise ValidationError("Standard dataset upload only supports YOLO format")
+            copy_tree(yolo_root, root)
+            if not any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
+                FileService()._create_yolo_data_yaml(root, root / "data.yaml")
             self._index_images(db, row)
             self._add_event(
                 db,
@@ -199,6 +222,8 @@ class StandardDatasetService:
         )
         root = self._root_path(row)
         copy_tree(source_root, root)
+        if not any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
+            FileService()._create_yolo_data_yaml(root, root / "data.yaml")
         self._index_images(db, row)
         self._add_event(
             db,

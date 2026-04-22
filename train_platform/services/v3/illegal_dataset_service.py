@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
@@ -36,6 +37,7 @@ from train_platform.services.v3.dataset_common import (
     to_storage_token,
     unpack_uploaded_archive,
 )
+from train_platform.services.v3.illegal_dataset_publish_service import IllegalDatasetPublishService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -43,6 +45,13 @@ class IllegalDatasetService:
     def __init__(self) -> None:
         self.repo = IllegalDatasetRepository()
         self.version_repo = IllegalDatasetVersionRepository()
+
+    def _next_dataset_id(self, db: Session) -> int:
+        current_max = db.query(func.max(IllegalDataset.illegal_dataset_id)).scalar()
+        start = int(settings.illegal_dataset_id_start)
+        if current_max is None:
+            return start
+        return max(start, int(current_max) + 1)
 
     def _root_path(self, dataset: IllegalDataset) -> Path:
         return resolve_storage_token(dataset.storage_path)
@@ -159,6 +168,7 @@ class IllegalDatasetService:
             raise ValidationError("Only YOLO dataset format is supported")
         self._ensure_name_available(db, name)
         row = IllegalDataset(
+            illegal_dataset_id=self._next_dataset_id(db),
             name=name,
             dataset_type=obj["dataset_type"],
             format=fmt,
@@ -407,7 +417,9 @@ class IllegalDatasetService:
     def get_raw_labels(self, db: Session, illegal_dataset_id: int) -> list[str]:
         row = self.get_dataset(db, illegal_dataset_id)
         version = self._selected_version(db, row)
-        labels = set(read_class_names(resolve_storage_token(str(version.snapshot_path))))
+        snapshot_root = resolve_storage_token(str(version.snapshot_path))
+        labels = set(read_class_names(snapshot_root))
+        labels.update(IllegalDatasetPublishService().extract_dataset_labels(snapshot_root))
         for mapping in db.query(IllegalDatasetLabelMapping).filter(IllegalDatasetLabelMapping.illegal_dataset_id == int(row.illegal_dataset_id)).all():
             labels.add(str(mapping.raw_label))
         return sorted(label for label in labels if label)
@@ -470,6 +482,7 @@ class IllegalDatasetService:
         label_filters = [str(x) for x in (obj.get("label_filters") or []) if str(x).strip()]
         publish_config = {
             "source_illegal_dataset_id": int(row.illegal_dataset_id),
+            "source_illegal_dataset_name": str(row.name),
             "source_illegal_version_id": int(version.version_id),
             "source_version": int(version.version),
             "label_mappings": mapping_snapshot,
@@ -479,28 +492,56 @@ class IllegalDatasetService:
         }
         from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 
-        standard = StandardDatasetService().materialize_from_source_tree(
-            db,
-            name=str(obj.get("name") or "").strip(),
-            dataset_type=row.dataset_type,
-            source_root=snapshot_root,
-            description=obj.get("description"),
-            source_type="illegal_publish",
-            publish_config=publish_config,
-        )
-        self._add_event(
-            db,
-            int(row.illegal_dataset_id),
-            "published",
-            version_id=int(version.version_id),
-            message=f"Published standard dataset {standard.name}",
-            data={"standard_dataset_id": int(standard.standard_dataset_id)},
-        )
-        db.commit()
-        return {
-            "standard_dataset_id": int(standard.standard_dataset_id),
-            "name": standard.name,
-            "source_illegal_dataset_id": int(row.illegal_dataset_id),
-            "source_illegal_version_id": int(version.version_id),
-            "publish_config": publish_config,
-        }
+        settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(dir=settings.temp_dir))
+        processed_root = temp_dir / "standard_publish"
+        try:
+            publish_result = IllegalDatasetPublishService().convert_dataset(
+                snapshot_root,
+                processed_root,
+                label_mapping=mapping_snapshot,
+                label_filters=label_filters,
+                publish_config=obj.get("publish_config") or {},
+                split_config=obj.get("split") or {},
+            )
+            publish_config["conversion_result"] = {
+                "pairs_total": int(publish_result.get("pairs_total", 0)),
+                "pairs_processed": int(publish_result.get("pairs_processed", 0)),
+                "pairs_skipped": int(publish_result.get("pairs_skipped", 0)),
+                "class_names": publish_result.get("class_names") or [],
+                "stats": publish_result.get("stats") or {},
+                "split_summary": publish_result.get("split_summary"),
+                "normalized_slice_config": publish_result.get("normalized_slice_config") or {},
+            }
+
+            standard = StandardDatasetService().materialize_from_source_tree(
+                db,
+                name=str(obj.get("name") or "").strip(),
+                dataset_type=row.dataset_type,
+                source_root=processed_root,
+                description=obj.get("description"),
+                source_type="illegal_publish",
+                publish_config=publish_config,
+            )
+            self._add_event(
+                db,
+                int(row.illegal_dataset_id),
+                "published",
+                version_id=int(version.version_id),
+                message=f"Published standard dataset {standard.name}",
+                data={
+                    "standard_dataset_id": int(standard.standard_dataset_id),
+                    "pairs_processed": int(publish_result.get("pairs_processed", 0)),
+                    "pairs_skipped": int(publish_result.get("pairs_skipped", 0)),
+                },
+            )
+            db.commit()
+            return {
+                "standard_dataset_id": int(standard.standard_dataset_id),
+                "name": standard.name,
+                "source_illegal_dataset_id": int(row.illegal_dataset_id),
+                "source_illegal_version_id": int(version.version_id),
+                "publish_config": publish_config,
+            }
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)

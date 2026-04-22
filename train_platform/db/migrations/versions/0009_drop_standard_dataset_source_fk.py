@@ -1,6 +1,6 @@
 """Drop direct illegal-dataset foreign keys from standard datasets.
 
-Revision ID: 0009_drop_standard_dataset_source_fk
+Revision ID: 0009_drop_std_dataset_fk
 Revises: 0008_v3_backend_rebuild
 Create Date: 2026-04-22
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy import inspect
 
 
-revision = "0009_drop_standard_dataset_source_fk"
+revision = "0009_drop_std_dataset_fk"
 down_revision = "0008_v3_backend_rebuild"
 branch_labels = None
 depends_on = None

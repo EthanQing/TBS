@@ -57,6 +57,7 @@ def get_thumbnail(
     svc = ThumbnailService()
     thumb_path = svc.ensure_thumbnail(
         dataset_id=cache_dataset_id,
+        dataset_namespace=kind,
         dataset_root=dataset_root,
         file_rel_path=file_path,
         size=int(size),

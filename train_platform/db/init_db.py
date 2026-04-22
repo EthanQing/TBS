@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 
+from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
-from train_platform.db.session import SessionLocal
+from train_platform.db.session import SessionLocal, engine
 
 logger = logging.getLogger("train_platform.db.init")
 
@@ -16,9 +17,33 @@ def init_db() -> None:
     NOTE: Schema migrations should be managed via Alembic (see alembic.ini).
     This function intentionally does NOT call Base.metadata.create_all().
     """
+    _ensure_v3_schema_ready()
     with SessionLocal() as db:
         _seed_architectures(db)
         _seed_alarm_rules(db)
+
+
+def _ensure_v3_schema_ready() -> None:
+    from train_platform.models import v3 as _models_v3  # noqa: F401
+    from train_platform.models.v3 import V3Base
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    required_tables = set(V3Base.metadata.tables.keys())
+    missing_tables = sorted(required_tables - existing_tables)
+    if not missing_tables:
+        return
+
+    preview = ", ".join(missing_tables[:8])
+    if len(missing_tables) > 8:
+        preview = f"{preview}, ... (+{len(missing_tables) - 8} more)"
+
+    raise RuntimeError(
+        "V3 database schema is incomplete. "
+        f"Missing tables: {preview}. "
+        "Please run 'alembic -c alembic.ini upgrade head'. "
+        "If Alembic is already at head but tables are still missing, rebuild the dev database and run the migration again."
+    )
 
 
 def _seed_architectures(db: Session) -> None:
