@@ -154,11 +154,51 @@ class IllegalDatasetService:
         db.flush()
         return row
 
-    def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[IllegalDataset]:
+    def _build_dataset_statistics(
+        self,
+        db: Session,
+        dataset: IllegalDataset,
+        *,
+        version: IllegalDatasetVersion | None = None,
+    ) -> dict[str, Any]:
+        active_version = version or self._active_version(db, dataset)
+        if active_version:
+            root = resolve_storage_token(str(active_version.snapshot_path or dataset.storage_path))
+            image_count = (
+                db.query(IllegalDatasetImage)
+                .filter(IllegalDatasetImage.version_id == int(active_version.version_id))
+                .count()
+            )
+            total_files = int(active_version.file_count) if active_version.file_count is not None else None
+            total_size_bytes = int(active_version.size_bytes) if active_version.size_bytes is not None else None
+            return build_statistics(
+                root,
+                image_count=image_count,
+                total_files=total_files,
+                total_size_bytes=total_size_bytes,
+            )
+        return build_statistics(self._root_path(dataset), image_count=0)
+
+    def _dataset_with_statistics(self, db: Session, dataset: IllegalDataset) -> dict[str, Any]:
+        return {
+            "illegal_dataset_id": int(dataset.illegal_dataset_id),
+            "name": dataset.name,
+            "dataset_type": dataset.dataset_type,
+            "format": dataset.format,
+            "storage_path": dataset.storage_path,
+            "description": dataset.description,
+            "active_version_id": dataset.active_version_id,
+            "created_at": dataset.created_at,
+            "updated_at": dataset.updated_at,
+            "statistics": self._build_dataset_statistics(db, dataset),
+        }
+
+    def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[dict[str, Any]]:
         q = db.query(IllegalDataset)
         if format:
             q = q.filter(IllegalDataset.format == str(format))
-        return q.order_by(IllegalDataset.updated_at.desc()).offset(skip).limit(limit).all()
+        rows = q.order_by(IllegalDataset.updated_at.desc()).offset(skip).limit(limit).all()
+        return [self._dataset_with_statistics(db, row) for row in rows]
 
     def create_dataset(self, db: Session, *, obj: dict) -> IllegalDataset:
         name = str(obj.get("name") or "").strip()
@@ -293,17 +333,9 @@ class IllegalDatasetService:
     def get_detail(self, db: Session, illegal_dataset_id: int, *, versions_limit: int = 20, events_limit: int = 20) -> dict[str, Any]:
         row = self.get_dataset(db, illegal_dataset_id)
         active_version = self._active_version(db, row)
-        root = resolve_storage_token(str(active_version.snapshot_path)) if active_version and active_version.snapshot_path else self._root_path(row)
-        image_count = (
-            db.query(IllegalDatasetImage)
-            .filter(IllegalDatasetImage.version_id == int(active_version.version_id))
-            .count()
-            if active_version
-            else 0
-        )
         return {
             "dataset": row,
-            "statistics": build_statistics(root, image_count=image_count),
+            "statistics": self._build_dataset_statistics(db, row, version=active_version),
             "active_version": active_version,
             "versions": self.list_versions(db, int(row.illegal_dataset_id), skip=0, limit=versions_limit),
             "events": self.list_events(db, int(row.illegal_dataset_id), skip=0, limit=events_limit),
@@ -325,9 +357,7 @@ class IllegalDatasetService:
     def get_statistics(self, db: Session, illegal_dataset_id: int, *, version_id: int | None = None) -> dict[str, Any]:
         row = self.get_dataset(db, illegal_dataset_id)
         version = self._selected_version(db, row, version_id=version_id)
-        root = resolve_storage_token(str(version.snapshot_path))
-        image_count = db.query(IllegalDatasetImage).filter(IllegalDatasetImage.version_id == int(version.version_id)).count()
-        return build_statistics(root, image_count=image_count)
+        return self._build_dataset_statistics(db, row, version=version)
 
     def get_view(
         self,

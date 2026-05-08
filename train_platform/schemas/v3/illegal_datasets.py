@@ -88,8 +88,24 @@ class DatasetStatisticsOut(BaseModel):
     total_files: int
     total_size_bytes: int
     total_size_mb: float
+    size_mb: float = 0.0
+    dataset_size_mb: float = 0.0
     total_images: int
+    num_images: int = 0
+    image_count: int = 0
+    num_classes: int = 0
+    class_count: int = 0
+    declared_class_count: int = 0
+    used_class_count: int = 0
     annotations_count: Optional[int] = None
+    target_count: int = 0
+    total_targets: int = 0
+    object_count: int = 0
+    total_objects: int = 0
+
+
+class IllegalDatasetListOut(IllegalDatasetOut):
+    statistics: Optional[DatasetStatisticsOut] = None
 
 
 class DatasetImageUploadOut(BaseModel):

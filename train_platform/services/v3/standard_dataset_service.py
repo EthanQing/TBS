@@ -257,11 +257,35 @@ class StandardDatasetService:
             "yaml_path": data_yaml.name,
         }
 
-    def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[StandardDataset]:
+    def _build_dataset_statistics(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
+        image_count = (
+            db.query(StandardDatasetImage)
+            .filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id))
+            .count()
+        )
+        return build_statistics(self._root_path(dataset), image_count=image_count)
+
+    def _dataset_with_statistics(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
+        return {
+            "standard_dataset_id": int(dataset.standard_dataset_id),
+            "name": dataset.name,
+            "dataset_type": dataset.dataset_type,
+            "format": dataset.format,
+            "storage_path": dataset.storage_path,
+            "description": dataset.description,
+            "source_type": dataset.source_type,
+            "publish_config": dataset.publish_config,
+            "created_at": dataset.created_at,
+            "updated_at": dataset.updated_at,
+            "statistics": self._build_dataset_statistics(db, dataset),
+        }
+
+    def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[dict[str, Any]]:
         q = db.query(StandardDataset)
         if format:
             q = q.filter(StandardDataset.format == str(format))
-        return q.order_by(StandardDataset.updated_at.desc()).offset(skip).limit(limit).all()
+        rows = q.order_by(StandardDataset.updated_at.desc()).offset(skip).limit(limit).all()
+        return [self._dataset_with_statistics(db, row) for row in rows]
 
     def create_dataset(self, db: Session, *, obj: dict) -> StandardDataset:
         name = str(obj.get("name") or "").strip()
@@ -511,19 +535,15 @@ class StandardDatasetService:
 
     def get_detail(self, db: Session, standard_dataset_id: int, *, events_limit: int = 20) -> dict[str, Any]:
         row = self.get_dataset(db, standard_dataset_id)
-        root = self._root_path(row)
-        image_count = db.query(StandardDatasetImage).filter(StandardDatasetImage.standard_dataset_id == int(row.standard_dataset_id)).count()
         return {
             "dataset": row,
-            "statistics": build_statistics(root, image_count=image_count),
+            "statistics": self._build_dataset_statistics(db, row),
             "events": self.list_events(db, int(row.standard_dataset_id), skip=0, limit=events_limit),
         }
 
     def get_statistics(self, db: Session, standard_dataset_id: int) -> dict[str, Any]:
         row = self.get_dataset(db, standard_dataset_id)
-        root = self._root_path(row)
-        image_count = db.query(StandardDatasetImage).filter(StandardDatasetImage.standard_dataset_id == int(row.standard_dataset_id)).count()
-        return build_statistics(root, image_count=image_count)
+        return self._build_dataset_statistics(db, row)
 
     def get_view(self, db: Session, standard_dataset_id: int, *, page: int = 1, page_size: int = 50, class_id: int | None = None) -> dict[str, Any]:
         row = self.get_dataset(db, standard_dataset_id)

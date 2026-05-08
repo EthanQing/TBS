@@ -17,6 +17,7 @@ from train_platform.schemas.v3.standard_datasets import (
     StandardDatasetCreate,
     StandardDatasetDetailOut,
     StandardDatasetEventOut,
+    StandardDatasetListOut,
     StandardDatasetOut,
     StandardDatasetUpdate,
 )
@@ -32,7 +33,7 @@ def create_standard_dataset(payload: StandardDatasetCreate, db: Session = Depend
     return svc.create_dataset(db, obj=payload.model_dump())
 
 
-@router.get("", response_model=Page[StandardDatasetOut])
+@router.get("", response_model=Page[StandardDatasetListOut])
 def list_standard_datasets(
     page: int = 1,
     page_size: int = 50,

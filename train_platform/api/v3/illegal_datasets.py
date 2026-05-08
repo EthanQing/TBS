@@ -17,6 +17,7 @@ from train_platform.schemas.v3.illegal_datasets import (
     IllegalDatasetEventOut,
     IllegalDatasetLabelMappingsOut,
     IllegalDatasetLabelMappingsUpdate,
+    IllegalDatasetListOut,
     IllegalDatasetOut,
     IllegalDatasetPublishOut,
     IllegalDatasetPublishRequest,
@@ -36,7 +37,7 @@ def create_illegal_dataset(payload: IllegalDatasetCreate, db: Session = Depends(
     return svc.create_dataset(db, obj=payload.model_dump())
 
 
-@router.get("", response_model=Page[IllegalDatasetOut])
+@router.get("", response_model=Page[IllegalDatasetListOut])
 def list_illegal_datasets(
     page: int = 1,
     page_size: int = 50,

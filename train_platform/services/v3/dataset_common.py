@@ -360,23 +360,73 @@ def build_file_listing(root: Path, storage_token: str, *, page: int, page_size: 
     return items, total
 
 
-def build_statistics(root: Path, *, image_count: int | None = None) -> dict[str, Any]:
-    total_files, total_size = count_tree(root)
+def _scan_yolo_annotation_summary(root: Path) -> tuple[int, set[int]]:
+    """Return (object/target count, used class ids) from YOLO label files."""
     annotation_count = 0
+    class_ids: set[int] = set()
+    if not root.exists():
+        return annotation_count, class_ids
     for label in root.rglob("*.txt"):
         if label.name.lower() in {"classes.txt", "train.txt", "val.txt", "test.txt"}:
             continue
         try:
-            annotation_count += len([line for line in label.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip()])
+            lines = label.read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
             continue
+        for line in lines:
+            parts = [p for p in line.strip().split() if p]
+            if len(parts) < 5:
+                continue
+            try:
+                class_id = int(float(parts[0]))
+            except Exception:
+                continue
+            annotation_count += 1
+            class_ids.add(class_id)
+    return annotation_count, class_ids
+
+
+def build_statistics(
+    root: Path,
+    *,
+    image_count: int | None = None,
+    total_files: int | None = None,
+    total_size_bytes: int | None = None,
+) -> dict[str, Any]:
+    if total_files is None or total_size_bytes is None:
+        counted_files, counted_size = count_tree(root)
+        if total_files is None:
+            total_files = counted_files
+        if total_size_bytes is None:
+            total_size_bytes = counted_size
+
+    annotation_count, used_class_ids = _scan_yolo_annotation_summary(root)
+    try:
+        declared_class_count = len(read_class_names(root))
+    except Exception:
+        declared_class_count = 0
+    class_count = declared_class_count if declared_class_count > 0 else len(used_class_ids)
     total_images = int(image_count) if image_count is not None else len(iter_image_files(root))
+    size_mb = round(float(total_size_bytes or 0) / (1024 * 1024), 2)
+    target_count = int(annotation_count)
     return {
-        "total_files": int(total_files),
-        "total_size_bytes": int(total_size),
-        "total_size_mb": round(float(total_size) / (1024 * 1024), 2),
+        "total_files": int(total_files or 0),
+        "total_size_bytes": int(total_size_bytes or 0),
+        "total_size_mb": size_mb,
+        "size_mb": size_mb,
+        "dataset_size_mb": size_mb,
         "total_images": int(total_images),
-        "annotations_count": int(annotation_count),
+        "num_images": int(total_images),
+        "image_count": int(total_images),
+        "annotations_count": target_count,
+        "target_count": target_count,
+        "total_targets": target_count,
+        "object_count": target_count,
+        "total_objects": target_count,
+        "num_classes": int(class_count),
+        "class_count": int(class_count),
+        "declared_class_count": int(declared_class_count),
+        "used_class_count": int(len(used_class_ids)),
     }
 
 
