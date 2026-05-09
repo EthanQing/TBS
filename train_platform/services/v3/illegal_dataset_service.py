@@ -154,6 +154,51 @@ class IllegalDatasetService:
         db.flush()
         return row
 
+    def _effective_illegal_class_count(
+        self,
+        db: Session,
+        dataset: IllegalDataset,
+        root: Path,
+        *,
+        fallback_count: int = 0,
+    ) -> int:
+        labels: set[str] = set()
+        try:
+            labels.update(str(label).strip() for label in read_class_names(root) if str(label).strip())
+        except Exception:
+            pass
+        try:
+            labels.update(
+                str(label).strip()
+                for label in IllegalDatasetPublishService().extract_dataset_labels(root)
+                if str(label).strip()
+            )
+        except Exception:
+            pass
+
+        mapping: dict[str, str] = {}
+        rows = (
+            db.query(IllegalDatasetLabelMapping)
+            .filter(IllegalDatasetLabelMapping.illegal_dataset_id == int(dataset.illegal_dataset_id))
+            .all()
+        )
+        for row in rows:
+            raw_label = str(row.raw_label or "").strip()
+            mapped_label = str(row.mapped_label or "").strip()
+            if not raw_label:
+                continue
+            labels.add(raw_label)
+            if mapped_label:
+                mapping[raw_label] = mapped_label
+
+        effective_labels: set[str] = set()
+        for label in labels:
+            mapped_label = str(mapping.get(label, label) or "").strip()
+            if mapped_label and mapped_label != "__DISCARD__":
+                effective_labels.add(mapped_label)
+
+        return max(int(fallback_count or 0), len(effective_labels))
+
     def _build_dataset_statistics(
         self,
         db: Session,
@@ -171,13 +216,25 @@ class IllegalDatasetService:
             )
             total_files = int(active_version.file_count) if active_version.file_count is not None else None
             total_size_bytes = int(active_version.size_bytes) if active_version.size_bytes is not None else None
-            return build_statistics(
+            stats = build_statistics(
                 root,
                 image_count=image_count,
                 total_files=total_files,
                 total_size_bytes=total_size_bytes,
             )
-        return build_statistics(self._root_path(dataset), image_count=0)
+        else:
+            root = self._root_path(dataset)
+            stats = build_statistics(root, image_count=0)
+
+        class_count = self._effective_illegal_class_count(
+            db,
+            dataset,
+            root,
+            fallback_count=int(stats.get("num_classes") or stats.get("class_count") or 0),
+        )
+        stats["num_classes"] = int(class_count)
+        stats["class_count"] = int(class_count)
+        return stats
 
     def _dataset_with_statistics(self, db: Session, dataset: IllegalDataset) -> dict[str, Any]:
         return {
