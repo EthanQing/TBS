@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from train_platform.models.v3.enums import DatasetSplit, DatasetType, DatasetVersionStatus
 from train_platform.schemas.v3.common import PageMeta
@@ -169,7 +169,30 @@ class DatasetImageAnnotationsOut(BaseModel):
 
 class IllegalDatasetLabelMappingRow(BaseModel):
     raw_label: str = Field(..., min_length=1, max_length=255)
-    mapped_label: str = Field(..., min_length=1, max_length=255)
+    mapped_label: str = Field("", max_length=255)
+    status: Literal["keep", "delete"] = "keep"
+
+    @field_validator("raw_label", "mapped_label", mode="before")
+    @classmethod
+    def _strip_label_value(cls, value):
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status(cls, value):
+        return str(value or "keep").strip().lower()
+
+    @model_validator(mode="after")
+    def _normalize_delete_mapping(self):
+        if self.mapped_label == "__DISCARD__":
+            self.status = "delete"
+        if self.status == "delete" and not self.mapped_label:
+            self.mapped_label = "__DISCARD__"
+        if self.status == "keep" and not self.mapped_label:
+            raise ValueError("mapped_label is required when status is keep")
+        return self
 
 
 class IllegalDatasetLabelMappingsOut(BaseModel):

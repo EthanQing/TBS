@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import mimetypes
+
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
@@ -142,6 +145,18 @@ def activate_illegal_dataset_version(illegal_dataset_id: int, version_id: int, d
     return svc.activate_version(db, illegal_dataset_id, version_id)
 
 
+@router.get("/{illegal_dataset_id}/versions/{version_id}/files/{file_path:path}")
+def get_illegal_dataset_version_file(
+    illegal_dataset_id: int,
+    version_id: int,
+    file_path: str,
+    db: Session = Depends(get_db),
+):
+    path = svc.get_version_file_path(db, illegal_dataset_id, version_id, file_path)
+    media_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    return FileResponse(path=str(path), media_type=media_type)
+
+
 @router.get("/{illegal_dataset_id}/events", response_model=Page[IllegalDatasetEventOut])
 def list_illegal_dataset_events(
     illegal_dataset_id: int,
@@ -165,7 +180,12 @@ def get_illegal_dataset_raw_labels(illegal_dataset_id: int, db: Session = Depend
 @router.get("/{illegal_dataset_id}/label-mappings", response_model=IllegalDatasetLabelMappingsOut)
 def get_illegal_dataset_label_mappings(illegal_dataset_id: int, db: Session = Depends(get_db)):
     rows = svc.get_label_mappings(db, illegal_dataset_id)
-    return {"items": [{"raw_label": row.raw_label, "mapped_label": row.mapped_label} for row in rows]}
+    return {
+        "items": [
+            {"raw_label": row.raw_label, "mapped_label": row.mapped_label, "status": row.status or "keep"}
+            for row in rows
+        ]
+    }
 
 
 @router.put("/{illegal_dataset_id}/label-mappings", response_model=IllegalDatasetOut)

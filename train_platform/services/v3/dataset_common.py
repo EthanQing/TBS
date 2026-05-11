@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import shutil
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,7 +51,14 @@ def resolve_storage_token(token: str | Path) -> Path:
 
 def clear_directory(path: Path) -> None:
     if path.exists():
-        shutil.rmtree(path, ignore_errors=True)
+        def _onerror(func, raw_path, _exc_info):
+            try:
+                os.chmod(raw_path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            except Exception:
+                pass
+            func(raw_path)
+
+        shutil.rmtree(path, onerror=_onerror)
     path.mkdir(parents=True, exist_ok=True)
 
 

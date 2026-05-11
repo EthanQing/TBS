@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
 from train_platform.models.v3.illegal_dataset import IllegalDatasetVersion
+from train_platform.services.v3.illegal_dataset_cas import load_version_manifest, manifest_cas_file_path
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 from train_platform.services.v3.thumbnail_service import ThumbnailService
@@ -29,6 +30,7 @@ def get_thumbnail(
     root_token = None
     cache_prefix = None
     cache_dataset_id = int(dataset_id)
+    source_path = None
 
     if kind == "illegal":
         ds = IllegalDatasetService().get_dataset(db, int(dataset_id))
@@ -44,7 +46,11 @@ def get_thumbnail(
             )
             if not ver:
                 raise NotFoundError("Illegal dataset version not found")
-            if ver.snapshot_path:
+            manifest = load_version_manifest(ver)
+            if manifest:
+                source_path = manifest_cas_file_path(manifest, file_path, required=True)
+                cache_prefix = f"v{int(ver.version_id)}"
+            elif ver.snapshot_path:
                 root_token = ver.snapshot_path
                 cache_prefix = f"v{int(ver.version_id)}"
     elif kind == "standard":
@@ -53,15 +59,25 @@ def get_thumbnail(
     else:
         raise NotFoundError("Unknown dataset kind")
 
-    dataset_root = resolve_dataset_path(root_token).resolve(strict=False)
     svc = ThumbnailService()
-    thumb_path = svc.ensure_thumbnail(
-        dataset_id=cache_dataset_id,
-        dataset_namespace=kind,
-        dataset_root=dataset_root,
-        file_rel_path=file_path,
-        size=int(size),
-        cache_prefix=cache_prefix,
-    )
+    if source_path is not None:
+        thumb_path = svc.ensure_thumbnail_from_file(
+            dataset_id=cache_dataset_id,
+            dataset_namespace=kind,
+            source_path=source_path,
+            file_rel_path=file_path,
+            size=int(size),
+            cache_prefix=cache_prefix,
+        )
+    else:
+        dataset_root = resolve_dataset_path(root_token).resolve(strict=False)
+        thumb_path = svc.ensure_thumbnail(
+            dataset_id=cache_dataset_id,
+            dataset_namespace=kind,
+            dataset_root=dataset_root,
+            file_rel_path=file_path,
+            size=int(size),
+            cache_prefix=cache_prefix,
+        )
     media_type = svc.guess_media_type(thumb_path)
     return FileResponse(path=str(thumb_path), media_type=media_type)

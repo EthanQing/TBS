@@ -256,6 +256,64 @@ class ThumbnailService:
 
         return thumb
 
+    def ensure_thumbnail_from_file(
+        self,
+        *,
+        dataset_id: int,
+        source_path: Path,
+        file_rel_path: str,
+        size: int = 200,
+        dataset_namespace: str | None = None,
+        cache_prefix: str | None = None,
+    ) -> Path:
+        size_i = int(size or 0)
+        if size_i <= 0:
+            raise ValidationError("size must be a positive integer")
+        size_i = max(16, min(size_i, 1024))
+
+        rel = self._safe_rel_path(file_rel_path)
+        src = Path(source_path).resolve(strict=False)
+        if not src.exists() or not src.is_file():
+            raise NotFoundError("Image not found")
+        if rel.suffix.lower() not in self._IMAGE_EXTS and src.suffix.lower() not in self._IMAGE_EXTS:
+            raise ValidationError("Unsupported image format")
+
+        thumb_base = self._thumbnail_base(
+            dataset_id=int(dataset_id),
+            dataset_namespace=dataset_namespace,
+            cache_prefix=cache_prefix,
+        )
+        thumb = (thumb_base / rel).with_suffix(".webp").resolve(strict=False)
+        if thumb_base not in thumb.parents and thumb != thumb_base:
+            raise ValidationError("Unsafe thumbnail path")
+
+        try:
+            src_mtime = float(src.stat().st_mtime)
+            if thumb.exists():
+                try:
+                    if float(thumb.stat().st_mtime) >= src_mtime:
+                        return thumb
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(thumb.parent), prefix=f"{thumb.name}.", suffix=".tmp")
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            self._render_thumbnail(src, tmp, size=size_i)
+            os.replace(tmp, thumb)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        return thumb
+
     def guess_media_type(self, path: Path) -> str:
         """
         Guess image media type from file signature.

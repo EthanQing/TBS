@@ -168,6 +168,7 @@ class IllegalDatasetLabelMapping(V3Base):
     )
     raw_label: Mapped[str] = mapped_column(String(255), nullable=False)
     mapped_label: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="keep", server_default="keep")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
