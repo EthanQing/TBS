@@ -44,3 +44,5 @@ htmlcov/
 
 # --- Pytorch model checkpoints ---
 *.pt
+
+docs/
