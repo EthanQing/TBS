@@ -16,38 +16,73 @@ dependencies = [
   "pandas==2.2.2",
   "requests==2.32.3",
   "Pillow==10.4.0",
-  "opencv-python-headless==4.9.0.80",
   "mlflow==2.15.1",
-  # Training runtimes (YOLO + PaddleDetection).
+
+  # YOLO / PyTorch CUDA 11.8
   "torch==2.4.1",
   "torchvision==0.19.1",
   "ultralytics==8.4.14",
-  # PaddleDetection runtime. Windows/local development uses the CPU wheel;
-  # Linux x86_64 worker images can use the GPU wheel. PaddleDetection 2.6.0
-  # pins numpy<1.24, so keep numpy on the latest compatible 1.23.x line.
-  # Keep protobuf<=3.20.3 below for Paddle 2.6.x compatibility.
+
+  # PaddlePaddle GPU for Windows CUDA 11.8
+  # Paddle 官方 Windows CUDA 11.8 文档当前推荐 3.2.2。
+  "paddlepaddle-gpu==3.2.2",
+
+  # PaddleDetection 2.6.0 需要 numpy<1.24
   "numpy==1.23.5",
-  "paddlepaddle==2.6.2; sys_platform == 'win32' or sys_platform == 'darwin'",
-  "paddlepaddle-gpu==2.6.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "paddledet==2.6.0; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
-  "pycocotools>=2.0.7; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
-  "typeguard>=2.13.3; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
-  "visualdl>=2.2.0; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
-  "lap>=0.5.12; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
-  "terminaltables>=3.1.10; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
+
+  # ultralytics 需要 opencv-python>=4.6
+  # paddledet 2.6.0 的 opencv 上限通过 tool.uv.override-dependencies 覆盖
+  "opencv-python==4.9.0.80",
+
+  # 提供 ppdet
+  "paddledet==2.6.0",
+
+  # PaddleDetection 常用依赖
+  "pycocotools>=2.0.7",
+  "typeguard>=2.13.3",
+  "visualdl>=2.2.0",
+  "lap>=0.5.12",
+  "terminaltables>=3.1.10",
+
   "cryptography>=46.0.3",
   "onnxruntime-gpu>=1.23.2",
   "onnx<=1.16.0",
   "nuitka>=2.8.10",
-  "setuptools>=80.10.2",
+  # PaddleDetection 2.6.0 imports pkg_resources.
+  # setuptools 82+ no longer provides it, so keep setuptools on the last
+  # compatible major line.
+  "setuptools>=65,<81",
   "wheel>=0.46.3",
-  "rasterio>=1.4.4",
+
+  # numpy==1.23.5 时，rasterio 不能用 >=1.4.4
+  "rasterio>=1.3.10,<1.4.0",
+
+  # PaddleDetection / Paddle 老生态更稳
   "protobuf<=3.20.3",
-  "numba>=0.64.0",
+
+  # 不要放 >=0.64.0，容易继续拉新版 numpy 生态
+  "numba>=0.59.0,<0.61",
+
   "motmetrics>=1.4.0",
   "psutil>=7.2.2",
   "nvidia-ml-py>=13.595.45",
   "cython>=3.2.4",
+]
+
+[tool.uv]
+# 你只关心 Windows，就只解析 Windows。
+# 这样不会再触发 Linux 下 torch/paddle 的 cudnn 冲突。
+environments = [
+  "sys_platform == 'win32'",
+]
+
+# 关键：
+# paddledet==2.6.0 声明 opencv-python<4.6
+# ultralytics==8.4.14 需要 opencv-python>=4.6
+# 这里强制使用 4.9.0.80，让 uv 解析通过。
+# uv 官方说明 override-dependencies 会直接替换依赖声明，是解决这种元数据冲突的最后手段。
+override-dependencies = [
+  "opencv-python==4.9.0.80",
 ]
 
 [tool.uvicorn]
@@ -58,11 +93,20 @@ name = "pytorch-cu118"
 url = "https://download.pytorch.org/whl/cu118"
 explicit = true
 
+[[tool.uv.index]]
+name = "paddle-cu118"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
+explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu118", marker = "sys_platform == 'win32'" },
 ]
+
 torchvision = [
-  { index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu118", marker = "sys_platform == 'win32'" },
+]
+
+paddlepaddle-gpu = [
+  { index = "paddle-cu118", marker = "sys_platform == 'win32'" },
 ]
