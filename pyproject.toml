@@ -23,16 +23,18 @@ dependencies = [
   "torchvision==0.19.1",
   "ultralytics==8.4.14",
   # PaddleDetection runtime. Windows/local development uses the CPU wheel;
-  # Linux worker images can use the GPU wheel. Keep protobuf<=3.20.3 below.
-  "numpy==1.26.4",
+  # Linux x86_64 worker images can use the GPU wheel. PaddleDetection 2.6.0
+  # pins numpy<1.24, so keep numpy on the latest compatible 1.23.x line.
+  # Keep protobuf<=3.20.3 below for Paddle 2.6.x compatibility.
+  "numpy==1.23.5",
   "paddlepaddle==2.6.2; sys_platform == 'win32' or sys_platform == 'darwin'",
-  "paddlepaddle-gpu==2.6.2; sys_platform == 'linux'",
-  "paddledet==2.6.0",
-  "pycocotools>=2.0.7",
-  "typeguard>=2.13.3",
-  "visualdl>=2.2.0",
-  "lap>=0.5.12",
-  "terminaltables>=3.1.10",
+  "paddlepaddle-gpu==2.6.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "paddledet==2.6.0; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
+  "pycocotools>=2.0.7; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
+  "typeguard>=2.13.3; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
+  "visualdl>=2.2.0; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
+  "lap>=0.5.12; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
+  "terminaltables>=3.1.10; sys_platform == 'win32' or sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
   "cryptography>=46.0.3",
   "onnxruntime-gpu>=1.23.2",
   "onnx<=1.16.0",
