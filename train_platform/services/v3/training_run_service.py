@@ -35,7 +35,7 @@ from train_platform.repositories.v3.training_run_meta_repo import TrainingRunMet
 from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
 from train_platform.training.registry import get_plugin
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
-from train_platform.utils.training_artifacts import index_completion_artifacts
+from train_platform.utils.training_artifacts import compute_epoch_metric_snapshots, index_completion_artifacts
 from train_platform.utils.path_utils import resolve_dataset_path, resolve_training_path
 from train_platform.utils.training_augmentations import normalize_training_augmentation
 from train_platform.utils.training_loss_weights import normalize_training_loss_weights
@@ -65,6 +65,58 @@ COMPARE_METRIC_KEYS: tuple[str, ...] = (
     "metrics/precision(B)",
     "metrics/recall(B)",
 )
+
+REPORT_CORE_METRIC_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "mAP50-95": (
+        "metrics/mAP50-95(B)",
+        "metrics/mAP50-95(M)",
+        "mAP50-95",
+        "mAP",
+        "map",
+        "bbox_map",
+        "bbox_mAP",
+        "eval/bbox_mAP",
+        "eval/bbox_map",
+    ),
+    "mAP50": (
+        "metrics/mAP50(B)",
+        "metrics/mAP50(M)",
+        "mAP50",
+        "AP50",
+        "ap50",
+        "bbox_ap50",
+        "bbox_AP50",
+        "eval/bbox_AP50",
+        "eval/bbox_ap50",
+    ),
+    "mAP75": (
+        "metrics/mAP75(B)",
+        "metrics/mAP75(M)",
+        "mAP75",
+        "AP75",
+        "ap75",
+        "bbox_ap75",
+        "bbox_AP75",
+        "eval/bbox_AP75",
+        "eval/bbox_ap75",
+    ),
+    "Precision": (
+        "metrics/precision(B)",
+        "metrics/precision(M)",
+        "precision",
+        "Precision",
+        "bbox_precision",
+        "eval/bbox_precision",
+    ),
+    "Recall": (
+        "metrics/recall(B)",
+        "metrics/recall(M)",
+        "recall",
+        "Recall",
+        "bbox_recall",
+        "eval/bbox_recall",
+    ),
+}
 
 
 class FrameworkCompareConflict(ConflictError):
@@ -709,6 +761,194 @@ class TrainingRunService:
             source = "result"
 
         return {"best": best, "final": final, "source": source}
+
+    @staticmethod
+    def _enum_value(value: Any) -> str:
+        return str(getattr(value, "value", value) or "")
+
+    @staticmethod
+    def _duration_seconds(started_at: Optional[datetime], finished_at: Optional[datetime]) -> float | None:
+        start = _ensure_aware_utc(started_at)
+        end = _ensure_aware_utc(finished_at)
+        if start is None or end is None:
+            return None
+        try:
+            return max(0.0, round((end - start).total_seconds(), 3))
+        except Exception:
+            return None
+
+    @classmethod
+    def _pick_metric_value(cls, metrics: Dict[str, Any], candidates: tuple[str, ...]) -> float | None:
+        if not isinstance(metrics, dict):
+            return None
+        lowered = {str(k).lower(): k for k in metrics.keys()}
+        for key in candidates:
+            if key in metrics:
+                n = cls._as_number(metrics.get(key))
+                if n is not None:
+                    return n
+            actual = lowered.get(str(key).lower())
+            if actual is not None:
+                n = cls._as_number(metrics.get(actual))
+                if n is not None:
+                    return n
+        return None
+
+    @classmethod
+    def _extract_core_metrics(
+        cls,
+        best_metrics: Optional[Dict[str, Any]],
+        final_metrics: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
+        best = best_metrics if isinstance(best_metrics, dict) else {}
+        final = final_metrics if isinstance(final_metrics, dict) else {}
+        out: Dict[str, float] = {}
+        for label, candidates in REPORT_CORE_METRIC_CANDIDATES.items():
+            value = cls._pick_metric_value(best, candidates)
+            if value is None:
+                value = cls._pick_metric_value(final, candidates)
+            if value is not None:
+                out[label] = value
+        return out
+
+    @staticmethod
+    def _save_period_from_params(additional_params: Optional[Dict[str, Any]]) -> int | None:
+        add = additional_params if isinstance(additional_params, dict) else {}
+        for key in ("save_period", "snapshot_epoch"):
+            raw = add.get(key)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except Exception:
+                continue
+            return value
+        return None
+
+    def _ensure_report_metric_snapshots(self, db: Session, run: TrainingRun) -> TrainingRunResult | None:
+        result = run.result
+        best_present = bool(result and isinstance(result.best_metrics, dict) and result.best_metrics)
+        final_present = bool(result and isinstance(result.final_metrics, dict) and result.final_metrics)
+        if best_present and final_present:
+            return result
+
+        best_metrics, final_metrics = compute_epoch_metric_snapshots(db, str(run.run_id))
+        if best_metrics is None or final_metrics is None:
+            return result
+
+        if result is None:
+            result = TrainingRunResult(run_id=str(run.run_id))
+            db.add(result)
+            db.flush()
+            run.result = result
+
+        result.best_metrics = best_metrics
+        result.final_metrics = final_metrics
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result
+
+    def build_report(self, db: Session, run_id: str) -> Dict[str, Any]:
+        run = self.get_run(db, run_id)
+        if run.status != TrainingRunStatus.COMPLETED:
+            raise ValidationError("训练尚未完成，报告不可用")
+
+        result = self._ensure_report_metric_snapshots(db, run)
+        if result is None:
+            result = run.result
+
+        arch = run.architecture
+        if arch is None:
+            arch = db.query(ModelArchitecture).filter(ModelArchitecture.architecture_id == int(run.architecture_id)).first()
+        if arch is None:
+            raise NotFoundError("Architecture not found")
+
+        dataset = run.standard_dataset
+        if dataset is None:
+            dataset = (
+                db.query(StandardDataset)
+                .filter(StandardDataset.standard_dataset_id == int(run.standard_dataset_id))
+                .first()
+            )
+
+        params = run.parameters
+        if params is None:
+            raise NotFoundError("Training run parameters not found")
+
+        engine = str(getattr(arch, "engine", "") or "").strip().lower()
+        framework_key, framework_label = self._resolve_framework(engine)
+
+        best_metrics = result.best_metrics if result and isinstance(result.best_metrics, dict) else None
+        final_metrics = result.final_metrics if result and isinstance(result.final_metrics, dict) else None
+        core_metrics = self._extract_core_metrics(best_metrics, final_metrics)
+
+        if not core_metrics:
+            # Legacy fallback compatible with the comparison page's historical behavior.
+            metric_summary = self._build_metric_summary(db, run)
+            core_metrics = self._extract_core_metrics(
+                metric_summary.get("best") if isinstance(metric_summary, dict) else None,
+                metric_summary.get("final") if isinstance(metric_summary, dict) else None,
+            )
+
+        model_size_mb = self._as_number(getattr(result, "model_size_mb", None) if result else None)
+        inference_time_ms = self._as_number(getattr(result, "inference_time_ms", None) if result else None)
+
+        return {
+            "basic": {
+                "run_id": str(run.run_id),
+                "name": run.name,
+                "framework_label": framework_label,
+                "framework_key": framework_key,
+                "engine": engine,
+                "status": self._enum_value(run.status),
+                "created_at": run.created_at,
+                "started_at": run.started_at,
+                "finished_at": run.finished_at,
+                "duration_seconds": self._duration_seconds(run.started_at, run.finished_at),
+            },
+            "dataset": {
+                "dataset_id": int(dataset.standard_dataset_id) if dataset is not None else None,
+                "dataset_name": str(dataset.name) if dataset is not None else None,
+                # StandardDataset currently has no explicit version column.
+                "dataset_version": None,
+            },
+            "architecture": {
+                "architecture_id": int(arch.architecture_id),
+                "family": str(getattr(arch, "family", "") or ""),
+                "variant": str(getattr(arch, "variant", "") or ""),
+                "task_type": self._enum_value(getattr(arch, "task_type", "")),
+                "description": getattr(arch, "description", None),
+                "pretrained_path": getattr(arch, "pretrained_path", None),
+            },
+            "parameters": {
+                "epochs": int(params.epochs),
+                "batch_size": int(params.batch_size),
+                "image_size": int(params.image_size),
+                "learning_rate": self._as_number(params.learning_rate),
+                "patience": int(params.patience),
+                "device": str(params.device),
+                "workers": int(params.workers),
+                "optimizer": str(params.optimizer),
+                "use_pretrained": bool(params.use_pretrained),
+                "save_period": self._save_period_from_params(params.additional_params),
+                "augmentation": params.augmentation if isinstance(params.augmentation, dict) else None,
+                "loss_weights": params.loss_weights if isinstance(params.loss_weights, dict) else None,
+                "additional_params": params.additional_params if isinstance(params.additional_params, dict) else None,
+            },
+            "metrics": {
+                "best_metrics": best_metrics,
+                "final_metrics": final_metrics,
+                "core_metrics": core_metrics or None,
+            },
+            "artifacts": {
+                "best_weights_path": result.best_weights_path if result else None,
+                "last_weights_path": result.last_weights_path if result else None,
+                "model_size_mb": model_size_mb,
+                "inference_time_ms": inference_time_ms,
+                "flops": int(result.flops) if result and result.flops is not None else None,
+            },
+        }
 
     def _ensure_benchmark_image(self) -> Path:
         if Image is None:

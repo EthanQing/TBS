@@ -5,7 +5,67 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.models.v3.training_run import TrainingRunArtifact, TrainingRunResult
+from train_platform.models.v3.training_run import (
+    TrainingRunArtifact,
+    TrainingRunEpochMetric,
+    TrainingRunResult,
+)
+
+
+LOSS_METRIC_TERMS: tuple[str, ...] = ("loss", "l1", "dfl")
+
+
+def _metric_number(value) -> float | None:
+    """Return a JSON-safe finite number, or None for non-numeric metrics."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        n = float(value)
+    except Exception:
+        return None
+    return n if n == n else None
+
+
+def is_lower_better_metric(key: str) -> bool:
+    """Heuristic used by training reports: losses are minimized, other metrics maximized."""
+    key_lower = str(key or "").lower()
+    return any(term in key_lower for term in LOSS_METRIC_TERMS)
+
+
+def compute_epoch_metric_snapshots(db: Session, run_id: str) -> tuple[dict[str, float] | None, dict | None]:
+    """
+    Compute best/final metric snapshots from per-epoch metric rows.
+
+    Returns (None, None) when the run has no epoch metric rows so callers can keep
+    existing NULL values for abnormal/interrupted runs.
+    """
+    rows = (
+        db.query(TrainingRunEpochMetric)
+        .filter(TrainingRunEpochMetric.run_id == str(run_id))
+        .order_by(TrainingRunEpochMetric.epoch.asc())
+        .all()
+    )
+    if not rows:
+        return None, None
+
+    final_metrics = rows[-1].metrics if isinstance(rows[-1].metrics, dict) else {}
+
+    best: dict[str, float] = {}
+    for row in rows:
+        metrics = row.metrics if isinstance(row.metrics, dict) else {}
+        for key, value in metrics.items():
+            number = _metric_number(value)
+            if number is None:
+                continue
+            current_best = best.get(key)
+            if current_best is None:
+                best[key] = number
+            elif is_lower_better_metric(key):
+                best[key] = min(current_best, number)
+            else:
+                best[key] = max(current_best, number)
+
+    return best, final_metrics
 
 
 def index_completion_artifacts(db: Session, run_id: str) -> None:
@@ -111,3 +171,8 @@ def index_completion_artifacts(db: Session, run_id: str) -> None:
             res.model_size_mb = round(size_source.stat().st_size / (1024 * 1024), 2)
         except Exception:
             pass
+
+    best_metrics, final_metrics = compute_epoch_metric_snapshots(db, str(run_id))
+    if best_metrics is not None and final_metrics is not None:
+        res.best_metrics = best_metrics
+        res.final_metrics = final_metrics

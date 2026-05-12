@@ -22,6 +22,7 @@ from train_platform.api.v3.standard_datasets import router as standard_datasets_
 from train_platform.api.v3.stats import router as stats_router
 from train_platform.api.v3.system_metrics import router as system_metrics_router
 from train_platform.api.v3.thumbnails import router as thumbnails_router
+from train_platform.api.v3.training_reports import router as training_reports_router
 from train_platform.api.v3.training_runs import router as training_runs_router
 
 
@@ -34,6 +35,7 @@ router.include_router(projects_router)
 router.include_router(architectures_router)
 router.include_router(frameworks_router)
 router.include_router(training_runs_router)
+router.include_router(training_reports_router)
 router.include_router(model_versions_router)
 router.include_router(qualified_models_router)
 router.include_router(deployments_router)
