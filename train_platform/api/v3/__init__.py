@@ -16,6 +16,7 @@ from train_platform.api.v3.model_conversions import router as model_conversions_
 from train_platform.api.v3.model_versions import router as model_versions_router
 from train_platform.api.v3.pretrain_models import router as pretrain_models_router
 from train_platform.api.v3.projects import router as projects_router
+from train_platform.api.v3.qualified_models import router as qualified_models_router
 from train_platform.api.v3.serving import router as serving_router
 from train_platform.api.v3.standard_datasets import router as standard_datasets_router
 from train_platform.api.v3.stats import router as stats_router
@@ -34,6 +35,7 @@ router.include_router(architectures_router)
 router.include_router(frameworks_router)
 router.include_router(training_runs_router)
 router.include_router(model_versions_router)
+router.include_router(qualified_models_router)
 router.include_router(deployments_router)
 router.include_router(deployment_runs_router)
 router.include_router(model_conversions_router)

@@ -25,6 +25,7 @@ _DROP_ORDER = [
     "deployment_runs",
     "deployment_logs",
     "deployments",
+    "qualified_models",
     "model_versions",
     "training_run_meta",
     "training_run_artifacts",

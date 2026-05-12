@@ -41,3 +41,4 @@ class Project(Base):
     standard_dataset = relationship("StandardDataset", back_populates="projects")
     training_runs = relationship("TrainingRun", back_populates="project")
     model_versions = relationship("ModelVersion", back_populates="project")
+    qualified_models = relationship("QualifiedModel", back_populates="project")

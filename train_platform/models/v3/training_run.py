@@ -70,6 +70,7 @@ class TrainingRun(Base):
     artifacts = relationship("TrainingRunArtifact", back_populates="training_run", cascade="all, delete-orphan")
     events = relationship("TrainingRunEvent", back_populates="training_run", cascade="all, delete-orphan")
     model_versions = relationship("ModelVersion", back_populates="training_run")
+    qualified_models = relationship("QualifiedModel", back_populates="training_run")
     meta = relationship("TrainingRunMeta", back_populates="training_run", uselist=False, cascade="all, delete-orphan")
 
 

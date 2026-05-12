@@ -5,6 +5,7 @@ from train_platform.repositories.v3.illegal_dataset_repo import IllegalDatasetRe
 from train_platform.repositories.v3.illegal_dataset_version_repo import IllegalDatasetVersionRepository
 from train_platform.repositories.v3.model_version_repo import ModelVersionRepository
 from train_platform.repositories.v3.project_repo import ProjectRepository
+from train_platform.repositories.v3.qualified_model_repo import QualifiedModelRepository
 from train_platform.repositories.v3.standard_dataset_repo import StandardDatasetRepository
 from train_platform.repositories.v3.training_run_meta_repo import TrainingRunMetaRepository
 from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
@@ -16,6 +17,7 @@ __all__ = [
     'IllegalDatasetVersionRepository',
     'StandardDatasetRepository',
     'ProjectRepository',
+    'QualifiedModelRepository',
     'TrainingRunRepository',
     'TrainingRunMetaRepository',
     'ModelVersionRepository',

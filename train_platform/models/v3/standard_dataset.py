@@ -37,6 +37,7 @@ class StandardDataset(V3Base):
     images = relationship("StandardDatasetImage", back_populates="standard_dataset", cascade="all, delete-orphan")
     projects = relationship("Project", back_populates="standard_dataset")
     training_runs = relationship("TrainingRun", back_populates="standard_dataset")
+    qualified_models = relationship("QualifiedModel", back_populates="standard_dataset")
 
 
 class StandardDatasetEvent(V3Base):

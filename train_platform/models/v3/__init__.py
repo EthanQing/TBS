@@ -30,6 +30,7 @@ from train_platform.models.v3.illegal_dataset import (
 from train_platform.models.v3.inference import InferenceRun
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.project import Project
+from train_platform.models.v3.qualified_model import QualifiedModel
 from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetEvent, StandardDatasetImage
 from train_platform.models.v3.training_run import (
     TrainingRun,
@@ -64,6 +65,7 @@ __all__ = [
     "TrainingRunEvent",
     "TrainingRunMeta",
     "ModelVersion",
+    "QualifiedModel",
     "Deployment",
     "DeploymentLog",
     "DeploymentRun",

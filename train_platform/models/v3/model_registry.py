@@ -38,5 +38,6 @@ class ModelVersion(Base):
     project = relationship("Project", back_populates="model_versions")
     training_run = relationship("TrainingRun", back_populates="model_versions")
     deployments = relationship("Deployment", back_populates="model_version")
+    qualified_model = relationship("QualifiedModel", back_populates="model_version", uselist=False, cascade="all, delete-orphan")
 
     __table_args__ = (UniqueConstraint("project_id", "version", name="uq_model_versions_project_version"),)
