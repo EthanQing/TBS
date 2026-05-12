@@ -20,6 +20,7 @@ class ArchitectureRepository(BaseRepository[ModelArchitecture]):
         *,
         family: Optional[str] = None,
         task_type: Optional[TaskType] = None,
+        engine: Optional[str] = None,
         q: Optional[str] = None,
         skip: int = 0,
         limit: int = 100,
@@ -29,6 +30,8 @@ class ArchitectureRepository(BaseRepository[ModelArchitecture]):
             query = query.filter(func.lower(ModelArchitecture.family) == str(family).strip().lower())
         if task_type:
             query = query.filter(ModelArchitecture.task_type == task_type)
+        if engine:
+            query = query.filter(func.lower(ModelArchitecture.engine) == str(engine).strip().lower())
         if q:
             like = f"%{str(q).strip()}%"
             query = query.filter(ModelArchitecture.variant.ilike(like))

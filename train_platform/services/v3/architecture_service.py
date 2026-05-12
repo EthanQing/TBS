@@ -28,11 +28,21 @@ class ArchitectureService:
         *,
         family: str | None = None,
         task_type: TaskType | None = None,
+        engine: str | None = None,
         q: str | None = None,
         skip: int = 0,
         limit: int = 100,
     ) -> list[ModelArchitecture]:
-        return self.repo.list(db, family=family, task_type=task_type, q=q, skip=skip, limit=limit)
+        normalized_engine = _normalize_and_validate_engine(engine) if engine else None
+        return self.repo.list(
+            db,
+            family=family,
+            task_type=task_type,
+            engine=normalized_engine,
+            q=q,
+            skip=skip,
+            limit=limit,
+        )
 
     def create_architecture(self, db: Session, *, obj: dict) -> ModelArchitecture:
         family = str(obj.get("family") or "").strip()

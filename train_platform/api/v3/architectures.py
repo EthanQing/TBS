@@ -17,6 +17,7 @@ router = APIRouter(prefix="/architectures", tags=["architectures"])
 def list_architectures(
     family: str | None = Query(None),
     task_type: str | None = Query(None, description="detection/segmentation/classification"),
+    engine: str | None = Query(None, description="Training engine plugin id, e.g. ultralytics-yolo or paddle-det"),
     q: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
@@ -26,7 +27,7 @@ def list_architectures(
             tt = TaskType(str(task_type))
         except Exception:
             raise ValidationError("Invalid task_type")
-    return ArchitectureService().list_architectures(db, family=family, task_type=tt, q=q)
+    return ArchitectureService().list_architectures(db, family=family, task_type=tt, engine=engine, q=q)
 
 
 @router.post("", response_model=ArchitectureOut, status_code=201)
