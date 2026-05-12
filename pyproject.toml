@@ -18,10 +18,21 @@ dependencies = [
   "Pillow==10.4.0",
   "opencv-python-headless==4.9.0.80",
   "mlflow==2.15.1",
-  # Training runtimes (YOLO). You can remove/replace these when adding other engines.
+  # Training runtimes (YOLO + PaddleDetection).
   "torch==2.4.1",
   "torchvision==0.19.1",
   "ultralytics==8.4.14",
+  # PaddleDetection runtime. Windows/local development uses the CPU wheel;
+  # Linux worker images can use the GPU wheel. Keep protobuf<=3.20.3 below.
+  "numpy==1.26.4",
+  "paddlepaddle==2.6.2; sys_platform == 'win32' or sys_platform == 'darwin'",
+  "paddlepaddle-gpu==2.6.2; sys_platform == 'linux'",
+  "paddledet==2.6.0",
+  "pycocotools>=2.0.7",
+  "typeguard>=2.13.3",
+  "visualdl>=2.2.0",
+  "lap>=0.5.12",
+  "terminaltables>=3.1.10",
   "cryptography>=46.0.3",
   "onnxruntime-gpu>=1.23.2",
   "onnx<=1.16.0",
