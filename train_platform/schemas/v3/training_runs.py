@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -19,6 +19,7 @@ class TrainingRunParametersIn(BaseModel):
     use_pretrained: bool = True
     optimizer: str = Field("AdamW")
     augmentation: Optional[Dict[str, Any]] = None
+    loss_weights: Optional[Dict[str, Any]] = None
     additional_params: Optional[Dict[str, Any]] = None
 
     @field_validator("batch_size")
@@ -41,6 +42,46 @@ class TrainingRunCreate(BaseModel):
     architecture_id: int
     name: Optional[str] = Field(None, max_length=255)
     parameters: TrainingRunParametersIn
+
+
+class TrainingAugmentationOptionFieldOut(BaseModel):
+    key: str
+    label: str
+    group: str
+    value_type: Literal["number", "integer", "enum"]
+    default: Optional[Any] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
+    step: Optional[float] = None
+    options: Optional[List[Any]] = None
+    nullable: bool = False
+    tasks: List[str] = Field(default_factory=list)
+    description: Optional[str] = None
+
+
+class TrainingAugmentationOptionsOut(BaseModel):
+    engine: str
+    task_type: str
+    defaults_policy: str = "omit_uses_ultralytics_defaults"
+    fields: List[TrainingAugmentationOptionFieldOut] = Field(default_factory=list)
+
+
+class TrainingLossWeightOptionFieldOut(BaseModel):
+    key: str
+    label: str
+    value_type: Literal["number"]
+    default: float
+    min: Optional[float] = None
+    step: Optional[float] = None
+    tasks: List[str] = Field(default_factory=list)
+    description: Optional[str] = None
+
+
+class TrainingLossWeightOptionsOut(BaseModel):
+    engine: str
+    task_type: str
+    defaults_policy: str = "omit_uses_ultralytics_defaults"
+    fields: List[TrainingLossWeightOptionFieldOut] = Field(default_factory=list)
 
 
 class TrainingRunUpdate(BaseModel):

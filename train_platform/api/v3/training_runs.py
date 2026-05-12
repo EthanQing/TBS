@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from train_platform.api.deps import get_db
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
+from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun, TrainingRunArtifact, TrainingRunEpochMetric, TrainingRunEvent
 from train_platform.schemas.v3.common import DeleteResponse, Page, PageMeta
@@ -22,6 +23,8 @@ from train_platform.schemas.v3.training_runs import (
     TrainingRunBenchmarkInferenceResponse,
     TrainingRunCompareRequest,
     TrainingRunCompareResponse,
+    TrainingAugmentationOptionsOut,
+    TrainingLossWeightOptionsOut,
     TrainingRunEpochMetricOut,
     TrainingRunEventOut,
     TrainingRunExportOut,
@@ -34,7 +37,9 @@ from train_platform.schemas.v3.training_runs import (
     TrainingRunUpdate,
 )
 from train_platform.services.v3.training_run_service import FrameworkCompareConflict, TrainingRunService
-from train_platform.utils.exceptions import ValidationError
+from train_platform.utils.exceptions import NotFoundError, ValidationError
+from train_platform.utils.training_augmentations import get_training_augmentation_options
+from train_platform.utils.training_loss_weights import get_training_loss_weight_options
 from train_platform.utils.mlflow_utils import fetch_mlflow_epoch_metrics
 
 
@@ -137,6 +142,44 @@ def list_training_runs(
 @router.post("", response_model=TrainingRunOut, status_code=201)
 def create_training_run(payload: TrainingRunCreate, db: Session = Depends(get_db)):
     return TrainingRunService().create_run(db, obj=payload.model_dump())
+
+
+@router.get("/augmentation-options", response_model=TrainingAugmentationOptionsOut)
+def get_training_augmentation_options_endpoint(
+    architecture_id: int | None = Query(None),
+    engine: str | None = Query(None),
+    task_type: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    if architecture_id is not None:
+        arch = db.query(ModelArchitecture).filter(ModelArchitecture.architecture_id == int(architecture_id)).first()
+        if not arch:
+            raise NotFoundError("Architecture not found")
+        engine = str(getattr(arch, "engine", "") or "")
+        task_type = str(getattr(getattr(arch, "task_type", None), "value", getattr(arch, "task_type", "")) or "")
+    return get_training_augmentation_options(
+        engine=engine or "ultralytics-yolo",
+        task_type=task_type or "detection",
+    )
+
+
+@router.get("/loss-weight-options", response_model=TrainingLossWeightOptionsOut)
+def get_training_loss_weight_options_endpoint(
+    architecture_id: int | None = Query(None),
+    engine: str | None = Query(None),
+    task_type: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    if architecture_id is not None:
+        arch = db.query(ModelArchitecture).filter(ModelArchitecture.architecture_id == int(architecture_id)).first()
+        if not arch:
+            raise NotFoundError("Architecture not found")
+        engine = str(getattr(arch, "engine", "") or "")
+        task_type = str(getattr(getattr(arch, "task_type", None), "value", getattr(arch, "task_type", "")) or "")
+    return get_training_loss_weight_options(
+        engine=engine or "ultralytics-yolo",
+        task_type=task_type or "detection",
+    )
 
 
 @router.get("/{run_id}", response_model=TrainingRunOut)

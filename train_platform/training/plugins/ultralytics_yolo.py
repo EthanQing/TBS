@@ -13,6 +13,8 @@ from train_platform.core.config import settings
 from train_platform.training.plugins.base import TrainContext
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
+from train_platform.utils.training_augmentations import ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY
+from train_platform.utils.training_loss_weights import ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY
 from train_platform.utils.training_params import AUTO_BATCH_SIZE, extract_selected_gpu_ids, normalize_device_spec
 
 logger = logging.getLogger("train_platform.training.ultralytics")
@@ -413,6 +415,20 @@ class UltralyticsYOLOTrainer:
                         "warmup_bias_lr": float(add.get("warmup_bias_lr", 0.1)),
                     }
                 )
+
+            augmentation = getattr(getattr(job, "parameters", None), "augmentation", None) or {}
+            if isinstance(augmentation, dict):
+                for key, value in augmentation.items():
+                    key_s = str(key or "").strip()
+                    if key_s in ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY:
+                        train_args[key_s] = value
+
+            loss_weights = getattr(getattr(job, "parameters", None), "loss_weights", None) or {}
+            if isinstance(loss_weights, dict):
+                for key, value in loss_weights.items():
+                    key_s = str(key or "").strip()
+                    if key_s in ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY:
+                        train_args[key_s] = value
 
             if resume_training:
                 train_args["resume"] = True

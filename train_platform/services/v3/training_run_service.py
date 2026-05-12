@@ -37,6 +37,8 @@ from train_platform.training.registry import get_plugin
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.training_artifacts import index_completion_artifacts
 from train_platform.utils.path_utils import resolve_dataset_path, resolve_training_path
+from train_platform.utils.training_augmentations import normalize_training_augmentation
+from train_platform.utils.training_loss_weights import normalize_training_loss_weights
 from train_platform.utils.training_params import validate_training_params_for_engine
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.services.v3.inference_service import InferenceService
@@ -277,6 +279,27 @@ class TrainingRunService:
         except ValueError as e:
             raise ValidationError(str(e)) from e
 
+        try:
+            normalized_augmentation = normalize_training_augmentation(
+                params.get("augmentation"),
+                engine=arch_engine,
+                task_type=project.task_type,
+            )
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
+        params = dict(params)
+        params["augmentation"] = normalized_augmentation
+
+        try:
+            normalized_loss_weights = normalize_training_loss_weights(
+                params.get("loss_weights"),
+                engine=arch_engine,
+                task_type=project.task_type,
+            )
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
+        params["loss_weights"] = normalized_loss_weights
+
         additional_params = params.get("additional_params")
         if additional_params is not None and not isinstance(additional_params, dict):
             raise ValidationError("parameters.additional_params must be an object")
@@ -366,6 +389,7 @@ class TrainingRunService:
                 use_pretrained=bool(params.get("use_pretrained", True)),
                 optimizer=str(params.get("optimizer") or "AdamW"),
                 augmentation=params.get("augmentation"),
+                loss_weights=params.get("loss_weights"),
                 additional_params=params.get("additional_params"),
             )
         )
@@ -890,6 +914,8 @@ class TrainingRunService:
                     "workers": int(run.parameters.workers),
                     "use_pretrained": bool(run.parameters.use_pretrained),
                     "optimizer": str(run.parameters.optimizer),
+                    "augmentation": run.parameters.augmentation,
+                    "loss_weights": run.parameters.loss_weights,
                 }
                 add = run.parameters.additional_params or {}
                 if isinstance(add, dict):

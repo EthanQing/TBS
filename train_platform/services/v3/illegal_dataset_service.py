@@ -90,7 +90,7 @@ class IllegalDatasetService:
         if str(mapped_label or "").strip() == LABEL_MAPPING_DELETE_SENTINEL:
             return LABEL_MAPPING_STATUS_DELETE
         normalized = str(status or LABEL_MAPPING_STATUS_KEEP).strip().lower()
-        if normalized == LABEL_MAPPING_STATUS_DELETE:
+        if normalized in {LABEL_MAPPING_STATUS_DELETE, "discard", "drop", "remove", "删除", "丢弃", "忽略"}:
             return LABEL_MAPPING_STATUS_DELETE
         return LABEL_MAPPING_STATUS_KEEP
 
@@ -102,6 +102,30 @@ class IllegalDatasetService:
         if status == LABEL_MAPPING_STATUS_DELETE:
             return LABEL_MAPPING_DELETE_SENTINEL
         return str(mapping.mapped_label or "").strip()
+
+    def _normalize_label_mapping_override_value(self, value: Any) -> str | None:
+        """Normalize publish-time mapping overrides.
+
+        Accepts the legacy shape {"raw": "mapped"} and the status-aware shape
+        {"raw": {"mapped_label": "...", "status": "delete"}}.
+        """
+        if isinstance(value, dict):
+            mapped_label = str(
+                value.get("mapped_label")
+                or value.get("target_label")
+                or value.get("target")
+                or value.get("mapped")
+                or ""
+            ).strip()
+            status = self._normalize_label_mapping_status(value.get("status"), mapped_label)
+        else:
+            mapped_label = str(value or "").strip()
+            status = self._normalize_label_mapping_status(None, mapped_label)
+        if status == LABEL_MAPPING_STATUS_DELETE:
+            return LABEL_MAPPING_DELETE_SENTINEL
+        if not mapped_label:
+            return None
+        return mapped_label
 
     def _next_dataset_id(self, db: Session) -> int:
         current_max = db.query(func.max(IllegalDataset.illegal_dataset_id)).scalar()
@@ -861,7 +885,7 @@ class IllegalDatasetService:
                 continue
             if status == LABEL_MAPPING_STATUS_DELETE:
                 delete_count += 1
-                mapped_label = mapped_label or LABEL_MAPPING_DELETE_SENTINEL
+                mapped_label = ""
             elif not mapped_label:
                 continue
             seen.add(raw_label)
@@ -905,7 +929,11 @@ class IllegalDatasetService:
         }
         overrides = obj.get("label_mapping_overrides") or {}
         if isinstance(overrides, dict):
-            mapping_snapshot.update({str(k): str(v) for k, v in overrides.items() if str(k).strip() and str(v).strip()})
+            for raw_label, raw_value in overrides.items():
+                raw_label_s = str(raw_label or "").strip()
+                mapped_label = self._normalize_label_mapping_override_value(raw_value)
+                if raw_label_s and mapped_label:
+                    mapping_snapshot[raw_label_s] = mapped_label
         label_filters = [str(x) for x in (obj.get("label_filters") or []) if str(x).strip()]
         publish_config = {
             "source_illegal_dataset_id": int(row.illegal_dataset_id),

@@ -182,14 +182,17 @@ class IllegalDatasetLabelMappingRow(BaseModel):
     @field_validator("status", mode="before")
     @classmethod
     def _normalize_status(cls, value):
-        return str(value or "keep").strip().lower()
+        normalized = str(value or "keep").strip().lower()
+        if normalized in {"delete", "discard", "drop", "remove", "删除", "丢弃", "忽略"}:
+            return "delete"
+        return "keep"
 
     @model_validator(mode="after")
     def _normalize_delete_mapping(self):
         if self.mapped_label == "__DISCARD__":
             self.status = "delete"
-        if self.status == "delete" and not self.mapped_label:
-            self.mapped_label = "__DISCARD__"
+        if self.status == "delete":
+            self.mapped_label = ""
         if self.status == "keep" and not self.mapped_label:
             raise ValueError("mapped_label is required when status is keep")
         return self
@@ -212,7 +215,7 @@ class IllegalDatasetPublishRequest(BaseModel):
     description: Optional[str] = None
     version_id: Optional[int] = None
     label_filters: list[str] = Field(default_factory=list)
-    label_mapping_overrides: Dict[str, str] = Field(default_factory=dict)
+    label_mapping_overrides: Dict[str, Any] = Field(default_factory=dict)
     split: Dict[str, Any] = Field(default_factory=dict)
     publish_config: Dict[str, Any] = Field(default_factory=dict)
 

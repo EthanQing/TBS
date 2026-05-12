@@ -88,6 +88,7 @@ class TrainingRunParameters(Base):
     use_pretrained: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     optimizer: Mapped[str] = mapped_column(String(64), nullable=False, default="AdamW")
     augmentation: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    loss_weights: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     additional_params: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     training_run = relationship("TrainingRun", back_populates="parameters")

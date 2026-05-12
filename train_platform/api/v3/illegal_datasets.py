@@ -180,11 +180,21 @@ def get_illegal_dataset_raw_labels(illegal_dataset_id: int, db: Session = Depend
 @router.get("/{illegal_dataset_id}/label-mappings", response_model=IllegalDatasetLabelMappingsOut)
 def get_illegal_dataset_label_mappings(illegal_dataset_id: int, db: Session = Depends(get_db)):
     rows = svc.get_label_mappings(db, illegal_dataset_id)
+
+    def _out(row):
+        is_delete = (
+            str(row.status or "").strip().lower() == "delete"
+            or str(row.mapped_label or "").strip() == "__DISCARD__"
+        )
+        status = "delete" if is_delete else "keep"
+        return {
+            "raw_label": row.raw_label,
+            "mapped_label": "" if status == "delete" else row.mapped_label,
+            "status": status,
+        }
+
     return {
-        "items": [
-            {"raw_label": row.raw_label, "mapped_label": row.mapped_label, "status": row.status or "keep"}
-            for row in rows
-        ]
+        "items": [_out(row) for row in rows]
     }
 
 
