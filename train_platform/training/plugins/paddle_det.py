@@ -50,6 +50,9 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 
 
 def _safe_float(v: Any) -> float | None:
+    coerced = _coerce_metric_scalar(v)
+    if coerced is not None:
+        return coerced
     try:
         return float(v) if v is not None else None
     except Exception:
@@ -196,6 +199,208 @@ def _load_yaml(path: Path) -> dict:
     except Exception:
         obj = {}
     return obj if isinstance(obj, dict) else {}
+
+
+def _coerce_metric_scalar(value: Any) -> float | None:
+    """
+    Convert Paddle / NumPy metric values to plain Python floats defensively.
+
+    PaddleDetection 2.6 may surface ndarray-like values in training meters,
+    which later crash its logger on ``format(value, ".6f")``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    for attr in ("item", "numpy", "tolist"):
+        if not hasattr(value, attr):
+            continue
+        try:
+            nested = getattr(value, attr)()
+        except Exception:
+            continue
+        if nested is value:
+            continue
+        coerced = _coerce_metric_scalar(nested)
+        if coerced is not None:
+            return coerced
+
+    if isinstance(value, (list, tuple)):
+        numeric_values = [fv for item in value if (fv := _coerce_metric_scalar(item)) is not None]
+        if not numeric_values:
+            return None
+        if len(numeric_values) == 1:
+            return numeric_values[0]
+        return float(sum(numeric_values) / len(numeric_values))
+
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _patch_ppdet_training_stats() -> None:
+    """Patch PaddleDetection stats logging to tolerate ndarray-like values."""
+    try:
+        from ppdet.utils import stats as ppdet_stats
+    except Exception:
+        return
+
+    if getattr(ppdet_stats, "_train_platform_safe_stats_patch", False):
+        return
+
+    smoothed_value_cls = getattr(ppdet_stats, "SmoothedValue", None)
+    training_stats_cls = getattr(ppdet_stats, "TrainingStats", None)
+
+    if smoothed_value_cls is not None and callable(getattr(smoothed_value_cls, "update", None)):
+        original_smoothed_update = smoothed_value_cls.update
+
+        def _safe_smoothed_update(self: Any, value: Any) -> Any:
+            scalar = _coerce_metric_scalar(value)
+            if scalar is not None:
+                value = scalar
+            return original_smoothed_update(self, value)
+
+        smoothed_value_cls.update = _safe_smoothed_update
+
+    if training_stats_cls is not None and callable(getattr(training_stats_cls, "update", None)):
+        original_training_update = training_stats_cls.update
+
+        def _safe_training_update(self: Any, stats: Any) -> Any:
+            if not isinstance(stats, dict):
+                return original_training_update(self, stats)
+            normalized: Dict[str, Any] = {}
+            for key, value in stats.items():
+                scalar = _coerce_metric_scalar(value)
+                normalized[key] = scalar if scalar is not None else value
+            return original_training_update(self, normalized)
+
+        training_stats_cls.update = _safe_training_update
+
+    if training_stats_cls is not None and callable(getattr(training_stats_cls, "get", None)):
+        def _safe_training_get(self: Any, extras: Iterable[str] | None = None) -> Dict[str, str]:
+            meters = getattr(self, "meters", None)
+            if not isinstance(meters, dict):
+                return {}
+
+            extras_set = {str(k) for k in (extras or [])}
+            stats: Dict[str, str] = {}
+
+            def _format_meter(meter: Any, *, prefer_avg: bool) -> str:
+                attr_order = ("avg", "global_avg", "median", "value") if prefer_avg else (
+                    "median", "avg", "global_avg", "value"
+                )
+                for attr in attr_order:
+                    if not hasattr(meter, attr):
+                        continue
+                    scalar = _coerce_metric_scalar(getattr(meter, attr))
+                    if scalar is not None:
+                        return format(scalar, ".4f" if prefer_avg else ".6f")
+                raw_value = getattr(meter, "avg" if prefer_avg else "median", None)
+                return str(raw_value)
+
+            for key, meter in meters.items():
+                key_str = str(key)
+                stats[key_str] = _format_meter(meter, prefer_avg=key_str in extras_set)
+            return stats
+
+        training_stats_cls.get = _safe_training_get
+
+    ppdet_stats._train_platform_safe_stats_patch = True
+
+
+def _bind_ppdet_dataset_cfg(cfg: dict, *, dataset_dir: str, train_json: Path, val_json: Path) -> None:
+    targets = {
+        "TrainDataset": str(train_json),
+        "EvalDataset": str(val_json),
+        "TestDataset": str(val_json),
+    }
+    for ds_key, anno_path in targets.items():
+        node = cfg.get(ds_key)
+        if not isinstance(node, dict):
+            node = {}
+            cfg[ds_key] = node
+        node["dataset_dir"] = dataset_dir
+        node["image_dir"] = ""
+        node["anno_path"] = anno_path
+
+
+def _summarize_ppdet_dataset_cfg(cfg: dict, ds_key: str) -> Dict[str, Any]:
+    node = cfg.get(ds_key)
+    if not isinstance(node, dict):
+        return {"present": False}
+    return {
+        "present": True,
+        "name": node.get("name"),
+        "dataset_dir": node.get("dataset_dir"),
+        "image_dir": node.get("image_dir"),
+        "anno_path": node.get("anno_path"),
+    }
+
+
+def _rebind_runtime_dataset(dataset_obj: Any, *, dataset_dir: str, anno_path: str) -> bool:
+    if dataset_obj is None:
+        return False
+
+    current_dataset_dir = str(getattr(dataset_obj, "dataset_dir", "") or "")
+    current_anno_path = str(getattr(dataset_obj, "anno_path", "") or "")
+    current_image_dir = str(getattr(dataset_obj, "image_dir", "") or "")
+    changed = (
+        current_dataset_dir != dataset_dir
+        or current_anno_path != anno_path
+        or current_image_dir != ""
+    )
+
+    for attr, value in (
+        ("dataset_dir", dataset_dir),
+        ("anno_path", anno_path),
+        ("image_dir", ""),
+    ):
+        try:
+            setattr(dataset_obj, attr, value)
+        except Exception:
+            pass
+
+    for fn_name in ("check_or_download_dataset", "download_dataset"):
+        if hasattr(dataset_obj, fn_name):
+            try:
+                setattr(dataset_obj, fn_name, lambda *a, **kw: None)
+            except Exception:
+                pass
+
+    if changed and callable(getattr(dataset_obj, "parse_dataset", None)):
+        try:
+            dataset_obj.parse_dataset()
+        except Exception as e:
+            print(
+                f"[paddle_det] runtime dataset rebind failed: {type(e).__name__}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+    return changed
+
+
+def _rebind_trainer_datasets(trainer: Any, *, dataset_dir: str, train_json: Path, val_json: Path) -> None:
+    targets = (
+        (getattr(trainer, "dataset", None), str(train_json)),
+        (getattr(getattr(trainer, "loader", None), "dataset", None), str(train_json)),
+        (getattr(trainer, "_eval_dataset", None), str(val_json)),
+        (getattr(getattr(trainer, "_eval_loader", None), "dataset", None), str(val_json)),
+        (getattr(trainer, "_test_dataset", None), str(val_json)),
+        (getattr(getattr(trainer, "_test_loader", None), "dataset", None), str(val_json)),
+    )
+    seen_ids: set[int] = set()
+    for dataset_obj, anno_path in targets:
+        if dataset_obj is None:
+            continue
+        obj_id = id(dataset_obj)
+        if obj_id in seen_ids:
+            continue
+        seen_ids.add(obj_id)
+        _rebind_runtime_dataset(dataset_obj, dataset_dir=dataset_dir, anno_path=anno_path)
 
 
 def _apply_warmup_epochs_to_cfg(cfg: dict, warmup_epochs: int | None) -> bool:
@@ -614,6 +819,7 @@ class PaddleDetTrainer:
         if not train_images or not val_images:
             raise ValidationError("train/val image lists empty; please verify dataset split")
 
+        dataset_dir = str(ctx.dataset_path.resolve(strict=False))
         coco_dir = (ctx.run_dir / "coco").resolve(strict=False)
         coco_dir.mkdir(parents=True, exist_ok=True)
         train_json = _build_coco_from_yolo_list(
@@ -636,7 +842,7 @@ class PaddleDetTrainer:
             """Disable all ppdet dataset-download helpers."""
             _noop = lambda *a, **kw: None
             _true = lambda *a, **kw: True
-            _identity_dataset_path = lambda path, *a, **kw: path
+            _bound_dataset_path = lambda *a, **kw: dataset_dir
             for mod_name in ("ppdet.utils.download", "ppdet.core.workspace", "ppdet.data.source.dataset"):
                 try:
                     import importlib
@@ -655,7 +861,9 @@ class PaddleDetTrainer:
                         if fn_name == "_dataset_exists":
                             setattr(mod, fn_name, _true)
                         elif fn_name == "get_dataset_path":
-                            setattr(mod, fn_name, _identity_dataset_path)
+                            setattr(mod, fn_name, _bound_dataset_path)
+                        elif fn_name == "download_dataset":
+                            setattr(mod, fn_name, _bound_dataset_path)
                         else:
                             setattr(mod, fn_name, _noop)
 
@@ -664,6 +872,7 @@ class PaddleDetTrainer:
                 setattr(mod, fn_name, fn_ref)
 
         _apply_download_patches()
+        _patch_ppdet_training_stats()
 
         cfg = load_config(str(cfg_path))
 
@@ -681,7 +890,6 @@ class PaddleDetTrainer:
         }
 
         # Dataset paths
-        dataset_dir = str(ctx.dataset_path)
         overrides["TrainDataset.dataset_dir"] = dataset_dir
         overrides["TrainDataset.anno_path"] = str(train_json)
         overrides["TrainDataset.image_dir"] = ""  # file_name in COCO json is relative to dataset_dir
@@ -739,6 +947,12 @@ class PaddleDetTrainer:
         _apply_cfg_overrides(cfg, overrides)
         _apply_warmup_epochs_to_cfg(cfg, warmup_epochs)
         cfg["snapshot_epoch"] = int(max(1, eval_interval))
+        _bind_ppdet_dataset_cfg(
+            cfg,
+            dataset_dir=dataset_dir,
+            train_json=train_json,
+            val_json=val_json,
+        )
         if metrics_source == "hybrid":
             try:
                 import visualdl  # noqa: F401
@@ -747,15 +961,21 @@ class PaddleDetTrainer:
             except Exception:
                 pass
 
-        # Also directly set dataset paths on cfg dict (belt-and-suspenders).
-        for ds_key in ("TrainDataset", "EvalDataset", "TestDataset"):
-            if ds_key in cfg and isinstance(cfg[ds_key], dict):
-                cfg[ds_key]["dataset_dir"] = dataset_dir
-                cfg[ds_key]["image_dir"] = ""
-                if ds_key == "TrainDataset":
-                    cfg[ds_key]["anno_path"] = str(train_json)
-                else:
-                    cfg[ds_key]["anno_path"] = str(val_json)
+        # Emit the resolved dataset binding explicitly for worker logs.
+        print(
+            "[paddle_det] dataset binding "
+            f"dataset_dir={dataset_dir} "
+            f"train_json={train_json} "
+            f"val_json={val_json}",
+            flush=True,
+        )
+        print(
+            "[paddle_det] final dataset cfg "
+            f"train={json.dumps(_summarize_ppdet_dataset_cfg(cfg, 'TrainDataset'), ensure_ascii=False)} "
+            f"eval={json.dumps(_summarize_ppdet_dataset_cfg(cfg, 'EvalDataset'), ensure_ascii=False)} "
+            f"test={json.dumps(_summarize_ppdet_dataset_cfg(cfg, 'TestDataset'), ensure_ascii=False)}",
+            flush=True,
+        )
 
         # ---- Pretrained / resume ----
         resume_training = _coerce_bool(add.get("resume_training", False), False)
@@ -829,6 +1049,13 @@ class PaddleDetTrainer:
         finally:
             # Always restore monkey-patched functions even when trainer init fails.
             _restore_download_patches()
+
+        _rebind_trainer_datasets(
+            trainer,
+            dataset_dir=dataset_dir,
+            train_json=train_json,
+            val_json=val_json,
+        )
 
         # Load pretrained weights or resume
         if resume_checkpoint:

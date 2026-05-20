@@ -12,6 +12,11 @@ pycocotools
 typeguard
 visualdl>=2.2.0
 lap
+tqdm
+motmetrics
+pyclipper
+shapely
 terminaltables
 Cython
+numpy==1.23.5
 protobuf<=3.20.3
