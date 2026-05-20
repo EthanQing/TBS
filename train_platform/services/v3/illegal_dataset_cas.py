@@ -376,24 +376,17 @@ def guess_label_rel_path(image_rel_path: str | Path) -> str:
     return rel.with_suffix(".txt").as_posix()
 
 
-def read_yolo_boxes_from_manifest(
-    manifest: Mapping[str, Any],
-    image_rel_path: str | Path,
+def _parse_manifest_yolo_boxes(
+    lines: list[str],
     class_names: list[str],
-) -> tuple[int | None, int | None, list[dict[str, Any]]]:
-    rel = safe_manifest_rel(image_rel_path)
-    width, height = manifest_image_size(manifest, rel)
-    label_rel = guess_label_rel_path(rel)
-    if label_rel not in manifest_files(manifest):
-        return width, height, []
-    try:
-        lines = read_manifest_text(manifest, label_rel).splitlines()
-    except NotFoundError:
-        raise
-    except Exception:
-        return width, height, []
-
+    *,
+    width: int | None,
+    height: int | None,
+    include_boxes: bool,
+) -> tuple[list[dict[str, Any]], int, list[int]]:
     boxes: list[dict[str, Any]] = []
+    class_ids: set[int] = set()
+    object_count = 0
     for line in lines:
         parts = [p for p in line.strip().split() if p]
         if len(parts) < 5:
@@ -405,6 +398,10 @@ def read_yolo_boxes_from_manifest(
             w = float(parts[3])
             h = float(parts[4])
         except Exception:
+            continue
+        object_count += 1
+        class_ids.add(class_id)
+        if not include_boxes:
             continue
         if width and height:
             x1 = max(0.0, (xc - w / 2.0) * width)
@@ -426,7 +423,59 @@ def read_yolo_boxes_from_manifest(
                 "y2": float(round(y2, 4)),
             }
         )
+    return boxes, object_count, sorted(class_ids)
+
+
+def read_yolo_boxes_from_manifest(
+    manifest: Mapping[str, Any],
+    image_rel_path: str | Path,
+    class_names: list[str],
+) -> tuple[int | None, int | None, list[dict[str, Any]]]:
+    rel = safe_manifest_rel(image_rel_path)
+    width, height = manifest_image_size(manifest, rel)
+    label_rel = guess_label_rel_path(rel)
+    if label_rel not in manifest_files(manifest):
+        return width, height, []
+    try:
+        lines = read_manifest_text(manifest, label_rel).splitlines()
+    except NotFoundError:
+        raise
+    except Exception:
+        return width, height, []
+    boxes, _object_count, _class_ids = _parse_manifest_yolo_boxes(
+        lines,
+        class_names,
+        width=width,
+        height=height,
+        include_boxes=True,
+    )
     return width, height, boxes
+
+
+def read_yolo_box_summary_from_manifest(
+    manifest: Mapping[str, Any],
+    image_rel_path: str | Path,
+    class_names: list[str],
+) -> tuple[int | None, int | None, int, list[int]]:
+    rel = safe_manifest_rel(image_rel_path)
+    width, height = manifest_image_size(manifest, rel)
+    label_rel = guess_label_rel_path(rel)
+    if label_rel not in manifest_files(manifest):
+        return width, height, 0, []
+    try:
+        lines = read_manifest_text(manifest, label_rel).splitlines()
+    except NotFoundError:
+        raise
+    except Exception:
+        return width, height, 0, []
+    _boxes, object_count, class_ids = _parse_manifest_yolo_boxes(
+        lines,
+        class_names,
+        width=width,
+        height=height,
+        include_boxes=False,
+    )
+    return width, height, object_count, class_ids
 
 
 def scan_yolo_annotation_summary_from_manifest(manifest: Mapping[str, Any]) -> tuple[int, set[int]]:

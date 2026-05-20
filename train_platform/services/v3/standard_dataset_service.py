@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,21 +21,28 @@ from train_platform.services.v3.dataset_common import (
     build_annotations_payload,
     build_file_listing,
     build_statistics,
-    build_view_payload,
+    build_view_payload_from_index,
+    build_yolo_view_index,
     clear_directory,
     commit_refresh,
     copy_tree,
     count_tree,
     detect_split_from_relpath,
     iter_image_files,
+    load_cached_view_index,
     resolve_storage_token,
+    safe_extract_zip,
     static_dataset_url,
     dataset_thumbnail_url,
+    load_cached_statistics,
     to_storage_token,
     unpack_uploaded_archive,
     utcnow,
+    write_cached_statistics,
+    write_cached_view_index,
 )
 from train_platform.services.v3.file_service import FileService
+from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -66,7 +74,9 @@ class StandardDatasetService:
             raise ConflictError(f"Standard dataset '{name}' already exists")
 
     def _index_images(self, db: Session, dataset: StandardDataset) -> None:
-        root = self._root_path(dataset)
+        self._index_images_in_root(db, dataset, self._root_path(dataset))
+
+    def _index_images_in_root(self, db: Session, dataset: StandardDataset, root: Path) -> None:
         db.query(StandardDatasetImage).filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id)).delete()
         for image_path in iter_image_files(root):
             rel = image_path.relative_to(root).as_posix()
@@ -258,12 +268,64 @@ class StandardDatasetService:
         }
 
     def _build_dataset_statistics(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
+        root = self._root_path(dataset)
+        cached = load_cached_statistics(root)
+        if isinstance(cached, dict):
+            return cached
+        return self._refresh_dataset_statistics_cache(db, dataset)
+
+    def _refresh_dataset_statistics_cache(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
+        root = self._root_path(dataset)
         image_count = (
             db.query(StandardDatasetImage)
             .filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id))
             .count()
         )
-        return build_statistics(self._root_path(dataset), image_count=image_count)
+        stats = build_statistics(root, image_count=image_count)
+        write_cached_statistics(root, stats)
+        return stats
+
+    def _load_dataset_view_index(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
+        root = self._root_path(dataset)
+        cached = load_cached_view_index(root)
+        if isinstance(cached, dict):
+            return cached
+        return self._refresh_dataset_view_index_cache(db, dataset)
+
+    def _refresh_dataset_view_index_cache(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
+        root = self._root_path(dataset)
+        image_rows = (
+            db.query(StandardDatasetImage)
+            .filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id))
+            .order_by(StandardDatasetImage.path.asc())
+            .all()
+        )
+        view_index = build_yolo_view_index(root, image_rows, max_workers=settings.view_index_max_workers)
+        write_cached_view_index(root, view_index)
+        self._prewarm_dataset_thumbnails(root, int(dataset.standard_dataset_id), view_index)
+        return view_index
+
+    def _prewarm_dataset_thumbnails(self, root: Path, dataset_id: int, view_index: dict[str, Any]) -> None:
+        limit = max(0, int(settings.thumbnail_first_page_prewarm or 0))
+        if limit <= 0:
+            return
+        items = view_index.get("items") if isinstance(view_index, dict) else []
+        if not isinstance(items, list) or not items:
+            return
+        rel_paths = [str(item.get("path") or "") for item in items[:limit] if str(item.get("path") or "")]
+        if not rel_paths:
+            return
+        try:
+            ThumbnailService().pregenerate_for_dataset(
+                dataset_id=int(dataset_id),
+                dataset_root=root,
+                size=int(settings.thumbnail_size or 200),
+                max_workers=int(settings.thumbnail_max_workers or 4),
+                dataset_namespace="standard",
+                rel_paths=rel_paths,
+            )
+        except Exception:
+            pass
 
     def _dataset_with_statistics(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
         return {
@@ -368,6 +430,8 @@ class StandardDatasetService:
             if not any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
                 FileService()._create_yolo_data_yaml(root, root / "data.yaml")
             self._index_images(db, row)
+            self._refresh_dataset_statistics_cache(db, row)
+            self._refresh_dataset_view_index_cache(db, row)
             self._add_event(
                 db,
                 int(row.standard_dataset_id),
@@ -381,6 +445,74 @@ class StandardDatasetService:
             return row
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def import_archive_file(
+        self,
+        db: Session,
+        standard_dataset_id: int,
+        archive_path: Path,
+        *,
+        created_by: str | None = None,
+        filename: str | None = None,
+    ) -> StandardDataset:
+        staging = settings.dataset_staging_dir / "standard" / f"{int(standard_dataset_id)}-{uuid.uuid4().hex}"
+        extracted_dir = staging / "extracted"
+        try:
+            extracted_root = safe_extract_zip(Path(archive_path), extracted_dir)
+            return self.import_source_tree(
+                db,
+                standard_dataset_id,
+                extracted_root,
+                created_by=created_by,
+                filename=filename or Path(archive_path).name,
+            )
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def import_source_tree(
+        self,
+        db: Session,
+        standard_dataset_id: int,
+        source_root: Path,
+        *,
+        created_by: str | None = None,
+        filename: str | None = None,
+    ) -> StandardDataset:
+        row = self.get_dataset(db, standard_dataset_id)
+        root = self._root_path(row)
+        existing_files, _ = count_tree(root)
+        if existing_files > 0:
+            raise ConflictError("Standard dataset content is immutable after upload")
+        yolo_root = self._resolve_uploaded_yolo_root(Path(source_root))
+        if yolo_root is None:
+            raise ValidationError("Standard dataset upload only supports YOLO format")
+
+        staging_parent = settings.dataset_staging_dir / "standard"
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        materialized = staging_parent / f"{int(row.standard_dataset_id)}-materialized-{uuid.uuid4().hex}"
+        try:
+            copy_tree(yolo_root, materialized)
+            if not any((materialized / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
+                FileService()._create_yolo_data_yaml(materialized, materialized / "data.yaml")
+            self._index_images_in_root(db, row, materialized)
+            clear_directory(root)
+            for item in materialized.iterdir():
+                shutil.move(str(item), str(root / item.name))
+            self._refresh_dataset_statistics_cache(db, row)
+            self._refresh_dataset_view_index_cache(db, row)
+            self._add_event(
+                db,
+                int(row.standard_dataset_id),
+                "uploaded",
+                message="Standard dataset archive uploaded",
+                created_by=created_by,
+                data={"filename": str(filename or "")},
+            )
+            db.commit()
+            db.refresh(row)
+            return row
+        finally:
+            shutil.rmtree(materialized, ignore_errors=True)
 
     def split_dataset(
         self,
@@ -510,6 +642,8 @@ class StandardDatasetService:
         if not any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
             FileService()._create_yolo_data_yaml(root, root / "data.yaml")
         self._index_images(db, row)
+        self._refresh_dataset_statistics_cache(db, row)
+        self._refresh_dataset_view_index_cache(db, row)
         self._add_event(
             db,
             int(row.standard_dataset_id),
@@ -547,18 +681,13 @@ class StandardDatasetService:
 
     def get_view(self, db: Session, standard_dataset_id: int, *, page: int = 1, page_size: int = 50, class_id: int | None = None) -> dict[str, Any]:
         row = self.get_dataset(db, standard_dataset_id)
-        images = (
-            db.query(StandardDatasetImage)
-            .filter(StandardDatasetImage.standard_dataset_id == int(row.standard_dataset_id))
-            .order_by(StandardDatasetImage.path.asc())
-            .all()
-        )
-        payload = build_view_payload(
-            self._root_path(row),
-            row.storage_path,
-            images,
+        view_index = self._load_dataset_view_index(db, row)
+        return build_view_payload_from_index(
+            view_index,
             page=page,
             page_size=page_size,
+            class_id=class_id,
+            file_url_builder=lambda rel_path: static_dataset_url(row.storage_path, rel_path),
             thumbnail_url_builder=lambda rel_path: dataset_thumbnail_url(
                 "standard",
                 int(row.standard_dataset_id),
@@ -566,12 +695,6 @@ class StandardDatasetService:
                 size=320,
             ),
         )
-        if class_id is not None:
-            payload["items"] = [item for item in payload["items"] if int(class_id) in item.get("classes", [])]
-            total_items = len(payload["items"])
-            payload["meta"]["total_items"] = total_items
-            payload["meta"]["total_pages"] = 1
-        return payload
 
     def get_image_annotations(self, db: Session, standard_dataset_id: int, *, image_path: str) -> dict[str, Any]:
         row = self.get_dataset(db, standard_dataset_id)

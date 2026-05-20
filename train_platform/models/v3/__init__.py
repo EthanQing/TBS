@@ -20,6 +20,7 @@ from train_platform.models.v3.enums import (
     TaskType,
     TrainingRunStatus,
 )
+from train_platform.models.v3.dataset_upload import DatasetUploadSession, DatasetUploadTask
 from train_platform.models.v3.illegal_dataset import (
     IllegalDataset,
     IllegalDatasetEvent,
@@ -48,6 +49,8 @@ __all__ = [
     "AlarmAlert",
     "ModelArchitecture",
     "ChartConfig",
+    "DatasetUploadSession",
+    "DatasetUploadTask",
     "IllegalDataset",
     "IllegalDatasetVersion",
     "IllegalDatasetEvent",

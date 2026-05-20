@@ -172,8 +172,22 @@ Optional overrides:
 - `BASE_DATASETS_DIR`
 - `BASE_TRAINING_DIR`
 - `BASE_TEMP_DIR`
+- `BASE_UPLOAD_SESSIONS_DIR` (default: `BASE_DATASETS_DIR/.uploads`)
+- `BASE_DATASET_STAGING_DIR` (default: `BASE_DATASETS_DIR/.staging`)
+- `BASE_IMPORTS_DIR` (default: `TRAIN_PLATFORM_HOME/imports`)
 - `BASE_PRETRAIN_MODELS_DIR`
 - `PADDLE_DET_DIR`
+
+### Large Dataset Uploads
+
+Dataset ZIP uploads can use resumable chunk sessions under `/api/v3/standard-datasets/{id}/upload-sessions` and `/api/v3/illegal-datasets/{id}/upload-sessions`. `complete` merges uploaded chunks and returns a `task_id`; extraction, validation, indexing, and version updates continue in the background and can be queried with `GET /api/v3/dataset-upload-tasks/{task_id}`.
+
+For offline deployments, place large ZIP files or extracted dataset directories under `BASE_IMPORTS_DIR` and start the same background flow with `/api/v3/standard-datasets/{id}/import-from-path` or `/api/v3/illegal-datasets/{id}/import-from-path`. Recommended deployment knobs:
+
+- `UPLOAD_CHUNK_SIZE_MB` defaults to `64`.
+- `UPLOAD_SESSION_TTL_HOURS` defaults to `24`.
+- Mount `BASE_DATASETS_DIR`, `BASE_UPLOAD_SESSIONS_DIR`, `BASE_DATASET_STAGING_DIR`, and `BASE_IMPORTS_DIR` on large-capacity storage.
+- Configure Nginx upload routes with enough `proxy_read_timeout` / `proxy_send_timeout`, and keep request-body temp storage off the container overlay filesystem.
 
 ### Inference restrictions
 
@@ -225,6 +239,7 @@ See:
 ## Documentation
 
 - `docs/datasets_api.md`
+- `docs/large_dataset_upload_reliability_backend.md`
 - `docs/alarms_api.md`
 - `docs/framework_plugins_api.md`
 - `docs/paddle_local_dev.md`

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
@@ -21,11 +21,20 @@ from train_platform.schemas.v3.standard_datasets import (
     StandardDatasetOut,
     StandardDatasetUpdate,
 )
+from train_platform.schemas.v3.dataset_uploads import (
+    DatasetImportFromPathRequest,
+    DatasetUploadCompleteOut,
+    DatasetUploadPartOut,
+    DatasetUploadSessionCreate,
+    DatasetUploadSessionOut,
+)
+from train_platform.services.v3.dataset_upload_service import DatasetUploadService
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 
 
 router = APIRouter(prefix="/standard-datasets", tags=["standard-datasets"])
 svc = StandardDatasetService()
+upload_svc = DatasetUploadService()
 
 
 @router.post("", response_model=StandardDatasetOut, status_code=201)
@@ -77,7 +86,7 @@ def delete_standard_dataset(
     return DeleteResponse(ok=True, message="Standard dataset deleted")
 
 
-@router.post("/{standard_dataset_id}/upload", response_model=StandardDatasetOut, status_code=201)
+@router.post("/{standard_dataset_id}/upload", response_model=StandardDatasetOut, status_code=201, deprecated=True)
 def upload_standard_dataset_archive(
     standard_dataset_id: int,
     file: UploadFile = File(...),
@@ -85,6 +94,77 @@ def upload_standard_dataset_archive(
     db: Session = Depends(get_db),
 ):
     return svc.upload_archive(db, standard_dataset_id, file, created_by=created_by)
+
+
+@router.post("/{standard_dataset_id}/upload-sessions", response_model=DatasetUploadSessionOut, status_code=201)
+def create_standard_upload_session(
+    standard_dataset_id: int,
+    payload: DatasetUploadSessionCreate,
+    db: Session = Depends(get_db),
+):
+    return upload_svc.create_session(
+        db,
+        "standard",
+        standard_dataset_id,
+        filename=payload.filename,
+        total_size=payload.total_size,
+        chunk_size=payload.chunk_size,
+        mode=payload.mode,
+        created_by=payload.created_by,
+    )
+
+
+@router.put("/{standard_dataset_id}/upload-sessions/{session_id}/parts/{part_no}", response_model=DatasetUploadPartOut)
+def upload_standard_session_part(
+    standard_dataset_id: int,
+    session_id: str,
+    part_no: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    return upload_svc.save_part(db, "standard", standard_dataset_id, session_id, part_no, file)
+
+
+@router.get("/{standard_dataset_id}/upload-sessions/{session_id}", response_model=DatasetUploadSessionOut)
+def get_standard_upload_session(standard_dataset_id: int, session_id: str, db: Session = Depends(get_db)):
+    return upload_svc.get_session(db, "standard", standard_dataset_id, session_id)
+
+
+@router.post("/{standard_dataset_id}/upload-sessions/{session_id}/complete", response_model=DatasetUploadCompleteOut, status_code=202)
+def complete_standard_upload_session(
+    standard_dataset_id: int,
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    task = upload_svc.complete_session(db, "standard", standard_dataset_id, session_id)
+    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    return {"task_id": task.task_id, "session_id": session_id, "status": task.status}
+
+
+@router.delete("/{standard_dataset_id}/upload-sessions/{session_id}", response_model=DatasetUploadSessionOut)
+def cancel_standard_upload_session(standard_dataset_id: int, session_id: str, db: Session = Depends(get_db)):
+    return upload_svc.cancel_session(db, "standard", standard_dataset_id, session_id)
+
+
+@router.post("/{standard_dataset_id}/import-from-path", response_model=DatasetUploadCompleteOut, status_code=202)
+def import_standard_dataset_from_path(
+    standard_dataset_id: int,
+    payload: DatasetImportFromPathRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    task = upload_svc.create_import_task(
+        db,
+        "standard",
+        standard_dataset_id,
+        rel_path=payload.path,
+        mode=payload.mode,
+        created_by=payload.created_by,
+        message=payload.message,
+    )
+    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    return {"task_id": task.task_id, "session_id": None, "status": task.status}
 
 
 @router.post("/{standard_dataset_id}/split", response_model=DatasetSplitSummary)

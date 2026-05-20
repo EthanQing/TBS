@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import mimetypes
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -28,11 +28,20 @@ from train_platform.schemas.v3.illegal_datasets import (
     IllegalDatasetUpdate,
     IllegalDatasetVersionOut,
 )
+from train_platform.schemas.v3.dataset_uploads import (
+    DatasetImportFromPathRequest,
+    DatasetUploadCompleteOut,
+    DatasetUploadPartOut,
+    DatasetUploadSessionCreate,
+    DatasetUploadSessionOut,
+)
+from train_platform.services.v3.dataset_upload_service import DatasetUploadService
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 
 
 router = APIRouter(prefix="/illegal-datasets", tags=["illegal-datasets"])
 svc = IllegalDatasetService()
+upload_svc = DatasetUploadService()
 
 
 @router.post("", response_model=IllegalDatasetOut, status_code=201)
@@ -89,7 +98,7 @@ def delete_illegal_dataset(
     return DeleteResponse(ok=True, message="Illegal dataset deleted")
 
 
-@router.post("/{illegal_dataset_id}/upload", response_model=IllegalDatasetOut, status_code=201)
+@router.post("/{illegal_dataset_id}/upload", response_model=IllegalDatasetOut, status_code=201, deprecated=True)
 def upload_illegal_dataset_archive(
     illegal_dataset_id: int,
     file: UploadFile = File(...),
@@ -100,7 +109,7 @@ def upload_illegal_dataset_archive(
     return svc.upload_archive(db, illegal_dataset_id, file, message=message, created_by=created_by, append=False)
 
 
-@router.post("/{illegal_dataset_id}/append", response_model=IllegalDatasetOut, status_code=201)
+@router.post("/{illegal_dataset_id}/append", response_model=IllegalDatasetOut, status_code=201, deprecated=True)
 def append_illegal_dataset_archive(
     illegal_dataset_id: int,
     file: UploadFile = File(...),
@@ -109,6 +118,78 @@ def append_illegal_dataset_archive(
     db: Session = Depends(get_db),
 ):
     return svc.upload_archive(db, illegal_dataset_id, file, message=message, created_by=created_by, append=True)
+
+
+@router.post("/{illegal_dataset_id}/upload-sessions", response_model=DatasetUploadSessionOut, status_code=201)
+def create_illegal_upload_session(
+    illegal_dataset_id: int,
+    payload: DatasetUploadSessionCreate,
+    db: Session = Depends(get_db),
+):
+    return upload_svc.create_session(
+        db,
+        "illegal",
+        illegal_dataset_id,
+        filename=payload.filename,
+        total_size=payload.total_size,
+        chunk_size=payload.chunk_size,
+        mode=payload.mode,
+        created_by=payload.created_by,
+    )
+
+
+@router.put("/{illegal_dataset_id}/upload-sessions/{session_id}/parts/{part_no}", response_model=DatasetUploadPartOut)
+def upload_illegal_session_part(
+    illegal_dataset_id: int,
+    session_id: str,
+    part_no: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    return upload_svc.save_part(db, "illegal", illegal_dataset_id, session_id, part_no, file)
+
+
+@router.get("/{illegal_dataset_id}/upload-sessions/{session_id}", response_model=DatasetUploadSessionOut)
+def get_illegal_upload_session(illegal_dataset_id: int, session_id: str, db: Session = Depends(get_db)):
+    return upload_svc.get_session(db, "illegal", illegal_dataset_id, session_id)
+
+
+@router.post("/{illegal_dataset_id}/upload-sessions/{session_id}/complete", response_model=DatasetUploadCompleteOut, status_code=202)
+def complete_illegal_upload_session(
+    illegal_dataset_id: int,
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    message: str | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    task = upload_svc.complete_session(db, "illegal", illegal_dataset_id, session_id, message=message)
+    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    return {"task_id": task.task_id, "session_id": session_id, "status": task.status}
+
+
+@router.delete("/{illegal_dataset_id}/upload-sessions/{session_id}", response_model=DatasetUploadSessionOut)
+def cancel_illegal_upload_session(illegal_dataset_id: int, session_id: str, db: Session = Depends(get_db)):
+    return upload_svc.cancel_session(db, "illegal", illegal_dataset_id, session_id)
+
+
+@router.post("/{illegal_dataset_id}/import-from-path", response_model=DatasetUploadCompleteOut, status_code=202)
+def import_illegal_dataset_from_path(
+    illegal_dataset_id: int,
+    payload: DatasetImportFromPathRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    task = upload_svc.create_import_task(
+        db,
+        "illegal",
+        illegal_dataset_id,
+        rel_path=payload.path,
+        mode=payload.mode,
+        created_by=payload.created_by,
+        message=payload.message,
+    )
+    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    return {"task_id": task.task_id, "session_id": None, "status": task.status}
 
 
 @router.post("/{illegal_dataset_id}/uploads/images", response_model=DatasetImageUploadOut, status_code=201)

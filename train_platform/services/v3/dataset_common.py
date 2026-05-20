@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
 import stat
 import tempfile
+import threading
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -22,6 +25,11 @@ try:
     from PIL import Image
 except Exception:  # pragma: no cover
     Image = None
+
+
+_DATASET_INTERNAL_FILE_NAMES = {".dataset_stats.json", ".dataset_view_index.json"}
+_JSON_CACHE_LOCK = threading.Lock()
+_JSON_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def utcnow() -> datetime:
@@ -110,10 +118,43 @@ def unpack_uploaded_archive(upload, destination: Path) -> Path:
     return destination
 
 
+def safe_extract_zip(archive_path: Path, destination: Path) -> Path:
+    archive = Path(archive_path)
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    dest_root = destination.resolve(strict=False)
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            for info in zf.infolist():
+                raw_name = str(info.filename or "").replace("\\", "/")
+                if not raw_name or raw_name.startswith("/"):
+                    raise ValidationError("ZIP contains an unsafe absolute path")
+                rel = Path(raw_name)
+                if rel.is_absolute() or ".." in rel.parts or (len(rel.parts) > 0 and ":" in rel.parts[0]):
+                    raise ValidationError("ZIP contains an unsafe path")
+                target = (dest_root / rel).resolve(strict=False)
+                try:
+                    target.relative_to(dest_root)
+                except Exception as exc:
+                    raise ValidationError("ZIP contains a path outside destination") from exc
+            zf.extractall(dest_root)
+    except ValidationError:
+        raise
+    except Exception as exc:
+        raise ValidationError(f"Unsupported or invalid ZIP archive: {exc}") from exc
+
+    children = [p for p in destination.iterdir() if p.name not in ("__MACOSX",)]
+    files = [p for p in children if p.is_file()]
+    dirs = [p for p in children if p.is_dir()]
+    if not files and len(dirs) == 1:
+        return dirs[0]
+    return destination
+
+
 def iter_files(root: Path) -> Iterable[Path]:
     if not root.exists():
         return []
-    return (p for p in root.rglob("*") if p.is_file())
+    return (p for p in root.rglob("*") if p.is_file() and p.name not in _DATASET_INTERNAL_FILE_NAMES)
 
 
 def iter_image_files(root: Path) -> list[Path]:
@@ -130,6 +171,80 @@ def count_tree(root: Path) -> tuple[int, int]:
         except Exception:
             pass
     return total_files, total_size
+
+
+def _load_cached_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        mtime = float(path.stat().st_mtime)
+    except Exception:
+        return None
+    key = str(path.resolve(strict=False))
+    with _JSON_CACHE_LOCK:
+        cached = _JSON_CACHE.get(key)
+        if cached and float(cached[0]) == mtime:
+            return cached[1]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    with _JSON_CACHE_LOCK:
+        _JSON_CACHE[key] = (mtime, data)
+    return data
+
+
+def _write_cached_json(path: Path, data: dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    try:
+        mtime = float(path.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+    with _JSON_CACHE_LOCK:
+        _JSON_CACHE[str(path.resolve(strict=False))] = (mtime, data)
+    return path
+
+
+def load_cached_json_file(path: Path) -> dict[str, Any] | None:
+    return _load_cached_json(Path(path))
+
+
+def write_cached_json_file(path: Path, data: dict[str, Any]) -> Path:
+    return _write_cached_json(Path(path), data)
+
+
+def dataset_statistics_cache_path(root: Path) -> Path:
+    return Path(root) / ".dataset_stats.json"
+
+
+def load_cached_statistics(root: Path) -> dict[str, Any] | None:
+    return _load_cached_json(dataset_statistics_cache_path(root))
+
+
+def write_cached_statistics(root: Path, stats: dict[str, Any]) -> Path:
+    return _write_cached_json(dataset_statistics_cache_path(root), stats)
+
+
+def dataset_view_index_cache_path(root: Path) -> Path:
+    return Path(root) / ".dataset_view_index.json"
+
+
+def load_cached_view_index(root: Path) -> dict[str, Any] | None:
+    return _load_cached_json(dataset_view_index_cache_path(root))
+
+
+def write_cached_view_index(root: Path, view_index: dict[str, Any]) -> Path:
+    return _write_cached_json(dataset_view_index_cache_path(root), view_index)
 
 
 def maybe_find_data_yaml(root: Path) -> Path | None:
@@ -202,17 +317,17 @@ def guess_label_path(root: Path, image_rel_path: str | Path) -> Path:
     return root / rel.with_suffix(".txt")
 
 
-def read_yolo_boxes(root: Path, image_rel_path: str | Path, class_names: list[str]) -> tuple[int | None, int | None, list[dict[str, Any]]]:
-    image_path = root / Path(image_rel_path)
-    width, height = image_size(image_path)
-    label_path = guess_label_path(root, image_rel_path)
-    if not label_path.exists():
-        return width, height, []
+def _parse_yolo_boxes(
+    lines: list[str],
+    class_names: list[str],
+    *,
+    width: int | None,
+    height: int | None,
+    include_boxes: bool,
+) -> tuple[list[dict[str, Any]], int, list[int]]:
     boxes: list[dict[str, Any]] = []
-    try:
-        lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except Exception:
-        return width, height, []
+    class_ids: set[int] = set()
+    object_count = 0
     for line in lines:
         parts = [p for p in line.strip().split() if p]
         if len(parts) < 5:
@@ -224,6 +339,10 @@ def read_yolo_boxes(root: Path, image_rel_path: str | Path, class_names: list[st
             w = float(parts[3])
             h = float(parts[4])
         except Exception:
+            continue
+        object_count += 1
+        class_ids.add(class_id)
+        if not include_boxes:
             continue
         if width and height:
             x1 = max(0.0, (xc - w / 2.0) * width)
@@ -245,7 +364,47 @@ def read_yolo_boxes(root: Path, image_rel_path: str | Path, class_names: list[st
                 "y2": float(round(y2, 4)),
             }
         )
+    return boxes, object_count, sorted(class_ids)
+
+
+def read_yolo_boxes(root: Path, image_rel_path: str | Path, class_names: list[str]) -> tuple[int | None, int | None, list[dict[str, Any]]]:
+    image_path = root / Path(image_rel_path)
+    width, height = image_size(image_path)
+    label_path = guess_label_path(root, image_rel_path)
+    if not label_path.exists():
+        return width, height, []
+    try:
+        lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return width, height, []
+    boxes, _object_count, _class_ids = _parse_yolo_boxes(
+        lines,
+        class_names,
+        width=width,
+        height=height,
+        include_boxes=True,
+    )
     return width, height, boxes
+
+
+def read_yolo_box_summary(root: Path, image_rel_path: str | Path, class_names: list[str]) -> tuple[int | None, int | None, int, list[int]]:
+    image_path = root / Path(image_rel_path)
+    width, height = image_size(image_path)
+    label_path = guess_label_path(root, image_rel_path)
+    if not label_path.exists():
+        return width, height, 0, []
+    try:
+        lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return width, height, 0, []
+    _boxes, object_count, class_ids = _parse_yolo_boxes(
+        lines,
+        class_names,
+        width=width,
+        height=height,
+        include_boxes=False,
+    )
+    return width, height, object_count, class_ids
 
 
 def static_dataset_url(storage_token: str, rel_path: str | Path) -> str:
@@ -331,6 +490,132 @@ def build_view_payload(
             "page_size": int(page_size),
             "total_items": int(total_items),
             "total_pages": int(total_pages or 1),
+        },
+    }
+
+
+def build_yolo_view_index(root: Path, image_rows: list[Any], *, max_workers: int | None = None) -> dict[str, Any]:
+    root = Path(root).resolve(strict=False)
+    class_names = read_class_names(root)
+    entries: list[dict[str, Any]] = []
+    for idx, row in enumerate(image_rows, start=1):
+        if isinstance(row, dict):
+            rel_path = str(row.get("path") or "")
+            item_id = int(row.get("id") or row.get("image_id") or idx)
+        else:
+            rel_path = str(getattr(row, "path", "") or "")
+            item_id = int(getattr(row, "image_id", idx) or idx)
+        if not rel_path:
+            continue
+        entries.append(
+            {
+                "id": item_id,
+                "path": rel_path,
+                "name": Path(rel_path).name,
+            }
+        )
+
+    def _process(entry: dict[str, Any]) -> dict[str, Any]:
+        width, height, object_count, classes = read_yolo_box_summary(root, entry["path"], class_names)
+        return {
+            **entry,
+            "width": width,
+            "height": height,
+            "object_count": int(object_count),
+            "classes": [int(x) for x in classes],
+        }
+
+    workers = max(1, int(max_workers or settings.view_index_max_workers or 1))
+    if len(entries) <= 1 or workers <= 1:
+        items = [_process(entry) for entry in entries]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(workers, max(1, len(entries)))) as executor:
+            items = list(executor.map(_process, entries))
+
+    category_counts: dict[int, int] = {}
+    for item in items:
+        for class_id in item.get("classes", []):
+            category_counts[int(class_id)] = int(category_counts.get(int(class_id), 0)) + 1
+
+    categories = [
+        {
+            "class_id": int(class_id),
+            "name": class_names[class_id] if 0 <= int(class_id) < len(class_names) else str(class_id),
+            "count": int(count),
+        }
+        for class_id, count in sorted(category_counts.items())
+    ]
+    return {
+        "schema_version": 1,
+        "generated_at": utcnow().isoformat(),
+        "class_names": class_names,
+        "total_items": len(items),
+        "categories": categories,
+        "items": items,
+    }
+
+
+def build_view_payload_from_index(
+    view_index: dict[str, Any],
+    *,
+    page: int,
+    page_size: int,
+    file_url_builder: Callable[[str], str],
+    thumbnail_url_builder: Callable[[str], str],
+    class_id: int | None = None,
+) -> dict[str, Any]:
+    raw_items = view_index.get("items") if isinstance(view_index, dict) else []
+    if not isinstance(raw_items, list):
+        raw_items = []
+    class_id_value = int(class_id) if class_id is not None else None
+    if class_id_value is None:
+        filtered_items = raw_items
+    else:
+        filtered_items = [
+            item
+            for item in raw_items
+            if isinstance(item, dict) and class_id_value in (item.get("classes") or [])
+        ]
+
+    start = max(0, (int(page) - 1) * int(page_size))
+    end = start + int(page_size)
+    page_items = filtered_items[start:end]
+
+    items: list[dict[str, Any]] = []
+    for idx, item in enumerate(page_items, start=start + 1):
+        rel_path = str(item.get("path") or "")
+        classes = [int(x) for x in (item.get("classes") or [])]
+        items.append(
+            {
+                "id": int(item.get("id") or idx),
+                "name": str(item.get("name") or Path(rel_path).name),
+                "path": rel_path,
+                "url": file_url_builder(rel_path),
+                "thumbnail_url": thumbnail_url_builder(rel_path),
+                "width": item.get("width"),
+                "height": item.get("height"),
+                "object_count": int(item.get("object_count") or 0),
+                "classes": classes,
+            }
+        )
+
+    categories = view_index.get("categories") if isinstance(view_index, dict) else []
+    if not isinstance(categories, list):
+        categories = []
+    total_items = len(filtered_items)
+    total_pages = math.ceil(total_items / int(page_size)) if int(page_size) else 1
+    if total_pages <= 0:
+        total_pages = 1
+    return {
+        "categories": categories,
+        "items": items,
+        "meta": {
+            "page": int(page),
+            "page_size": int(page_size),
+            "total_items": int(total_items),
+            "total_pages": int(total_pages),
         },
     }
 

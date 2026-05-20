@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from train_platform.api.v3.alarms import router as alarms_router
 from train_platform.api.v3.architectures import router as architectures_router
 from train_platform.api.v3.chart_configs import router as chart_configs_router
+from train_platform.api.v3.dataset_upload_tasks import router as dataset_upload_tasks_router
 from train_platform.api.v3.dataset_augmentations import router as dataset_augmentations_router
 from train_platform.api.v3.deployment_runs import router as deployment_runs_router
 from train_platform.api.v3.deployments import router as deployments_router
@@ -30,6 +31,7 @@ router = APIRouter()
 router.include_router(alarms_router)
 router.include_router(illegal_datasets_router)
 router.include_router(standard_datasets_router)
+router.include_router(dataset_upload_tasks_router)
 router.include_router(dataset_augmentations_router)
 router.include_router(projects_router)
 router.include_router(architectures_router)
