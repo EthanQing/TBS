@@ -84,6 +84,43 @@ def selected_gpu_count(device_spec: Any) -> int:
     return len(extract_selected_gpu_ids(device_spec))
 
 
+def build_device_runtime(device_spec: Any) -> dict[str, str | None]:
+    """
+    Build per-process device runtime settings.
+
+    For explicit GPU selection we isolate the training subprocess with
+    `CUDA_VISIBLE_DEVICES=<requested ids>` and remap the device argument to the
+    local visible index space expected by deep learning runtimes.
+
+    Examples:
+      - "auto"   -> {"requested": "auto", "runtime_device": "auto", "cuda_visible_devices": None}
+      - "cpu"    -> {"requested": "cpu",  "runtime_device": "cpu",  "cuda_visible_devices": ""}
+      - "1"      -> {"requested": "1",    "runtime_device": "0",    "cuda_visible_devices": "1"}
+      - "2,5"    -> {"requested": "2,5",  "runtime_device": "0,1",  "cuda_visible_devices": "2,5"}
+    """
+    requested = normalize_device_spec(device_spec)
+    if requested == "cpu":
+        return {
+            "requested": "cpu",
+            "runtime_device": "cpu",
+            "cuda_visible_devices": "",
+        }
+
+    selected_gpu_ids = extract_selected_gpu_ids(requested)
+    if not selected_gpu_ids:
+        return {
+            "requested": requested,
+            "runtime_device": requested,
+            "cuda_visible_devices": None,
+        }
+
+    return {
+        "requested": requested,
+        "runtime_device": ",".join(str(idx) for idx in range(len(selected_gpu_ids))),
+        "cuda_visible_devices": ",".join(str(idx) for idx in selected_gpu_ids),
+    }
+
+
 def validate_training_params_for_engine(engine: str, params: dict[str, Any]) -> dict[str, Any]:
     """
     Normalize and validate training params for the selected backend engine.

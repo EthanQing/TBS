@@ -198,51 +198,10 @@ class SystemMetricsService:
         return gpu_metrics_list
 
     @classmethod
-    def _get_gpu_device_metrics_via_torch(cls) -> list[dict[str, Any]]:
-        try:
-            import torch
-        except Exception:
-            return []
-
-        try:
-            if not torch.cuda.is_available():
-                return []
-            gpu_count = int(torch.cuda.device_count())
-        except Exception as e:
-            logger.debug("torch cuda probe failed while fetching GPU metrics: %s", e)
-            return []
-
-        gpu_metrics_list: list[dict[str, Any]] = []
-        for gpu_index in range(gpu_count):
-            name = f"GPU {gpu_index}"
-            total_memory_mb = None
-            try:
-                name = str(torch.cuda.get_device_name(gpu_index))
-            except Exception:
-                pass
-            try:
-                props = torch.cuda.get_device_properties(gpu_index)
-                total_memory_mb = float(props.total_memory) / 1024.0 / 1024.0
-            except Exception:
-                total_memory_mb = None
-            gpu_metrics_list.append(
-                cls._build_gpu_metric(
-                    gpu_index=gpu_index,
-                    name=name,
-                    uuid=None,
-                    utilization_percent=None,
-                    memory_used_mb=None,
-                    memory_total_mb=total_memory_mb,
-                )
-            )
-        return gpu_metrics_list
-
-    @classmethod
     def get_gpu_device_metrics(cls) -> list[dict[str, Any]]:
         for getter in (
             cls._get_gpu_device_metrics_via_nvml,
             cls._get_gpu_device_metrics_via_nvidia_smi,
-            cls._get_gpu_device_metrics_via_torch,
         ):
             metrics = getter()
             if metrics:

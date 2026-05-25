@@ -328,6 +328,7 @@ class StandardDatasetService:
             pass
 
     def _dataset_with_statistics(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
+        statistics = self._build_dataset_statistics(db, dataset)
         return {
             "standard_dataset_id": int(dataset.standard_dataset_id),
             "name": dataset.name,
@@ -339,8 +340,36 @@ class StandardDatasetService:
             "publish_config": dataset.publish_config,
             "created_at": dataset.created_at,
             "updated_at": dataset.updated_at,
-            "statistics": self._build_dataset_statistics(db, dataset),
+            "statistics": statistics,
+            "preview_image_url": self._first_image_preview_url(db, dataset, statistics=statistics),
         }
+
+    def _first_image_preview_url(
+        self,
+        db: Session,
+        dataset: StandardDataset,
+        *,
+        statistics: dict[str, Any] | None = None,
+    ) -> str | None:
+        if statistics is not None and int(
+            statistics.get("num_images") or statistics.get("total_images") or statistics.get("image_count") or 0
+        ) <= 0:
+            return None
+        row = (
+            db.query(StandardDatasetImage)
+            .filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id))
+            .order_by(StandardDatasetImage.image_id.asc())
+            .first()
+        )
+        rel_path = str(getattr(row, "path", "") or "").strip() if row else ""
+        if not rel_path:
+            return None
+        return dataset_thumbnail_url(
+            "standard",
+            int(dataset.standard_dataset_id),
+            rel_path,
+            size=int(settings.thumbnail_size or 200),
+        )
 
     def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[dict[str, Any]]:
         q = db.query(StandardDataset)

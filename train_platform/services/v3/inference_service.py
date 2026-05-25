@@ -322,13 +322,6 @@ class InferenceService:
     def _run_ultralytics_yolo(self, weights_path: Path, image_path: Path, *, conf: float, iou: float) -> Dict[str, Any]:
         worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
         timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "120"))
-        fallback_local = str(os.getenv("INFERENCE_FALLBACK_LOCAL", "1")).strip().lower() not in (
-            "",
-            "0",
-            "false",
-            "no",
-            "off",
-        )
         payload = {
             "weights_path": str(weights_path),
             "image_path": str(image_path),
@@ -364,20 +357,7 @@ class InferenceService:
         except Exception as e:
             worker_error = f"{type(e).__name__}: {e}"
 
-        if not fallback_local:
-            raise RuntimeError(worker_error or "Inference worker request failed")
-
-        try:
-            from train_platform.workers.inference_worker import _run_ultralytics_yolo as _local_infer
-
-            return _local_infer(weights_path, image_path, conf=float(conf), iou=float(iou))
-        except Exception as e:
-            fallback_error = f"{type(e).__name__}: {e}"
-            if worker_error:
-                raise RuntimeError(
-                    f"Inference worker failed ({worker_error}); local fallback failed ({fallback_error})"
-                ) from e
-            raise RuntimeError(f"Local inference fallback failed: {fallback_error}") from e
+        raise RuntimeError(worker_error or "Inference worker request failed")
 
     def _run_paddle_det(
         self,
@@ -395,13 +375,6 @@ class InferenceService:
 
         worker_url = os.getenv("PADDLE_INFERENCE_WORKER_URL", "http://127.0.0.1:18003").rstrip("/")
         timeout = float(os.getenv("PADDLE_INFERENCE_WORKER_TIMEOUT", "240"))
-        fallback_local = str(os.getenv("INFERENCE_FALLBACK_LOCAL", "1")).strip().lower() not in (
-            "",
-            "0",
-            "false",
-            "no",
-            "off",
-        )
         payload = {
             "config_path": str(config_path),
             "weights_path": str(weights_path),
@@ -434,17 +407,4 @@ class InferenceService:
         except Exception as e:
             worker_error = f"{type(e).__name__}: {e}"
 
-        if not fallback_local:
-            raise RuntimeError(worker_error or "Paddle inference worker request failed")
-
-        try:
-            from train_platform.workers.paddle_inference_worker import _run_paddle_det as _local_paddle_infer
-
-            return _local_paddle_infer(config_path, weights_path, image_path, conf=float(conf), iou=float(iou))
-        except Exception as e:
-            fallback_error = f"{type(e).__name__}: {e}"
-            if worker_error:
-                raise RuntimeError(
-                    f"Paddle worker failed ({worker_error}); local fallback failed ({fallback_error})"
-                ) from e
-            raise RuntimeError(f"Local paddle inference fallback failed: {fallback_error}") from e
+        raise RuntimeError(worker_error or "Paddle inference worker request failed")

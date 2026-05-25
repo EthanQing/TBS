@@ -106,6 +106,7 @@ class DatasetStatisticsOut(BaseModel):
 
 class IllegalDatasetListOut(IllegalDatasetOut):
     statistics: Optional[DatasetStatisticsOut] = None
+    preview_image_url: Optional[str] = None
 
 
 class DatasetImageUploadOut(BaseModel):
@@ -226,6 +227,34 @@ class IllegalDatasetPublishOut(BaseModel):
     source_illegal_dataset_id: int
     source_illegal_version_id: int
     publish_config: Dict[str, Any] = Field(default_factory=dict)
+
+
+IllegalDatasetPublishJobStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
+IllegalDatasetPublishJobPhase = Literal["queued", "preparing", "materializing", "converting", "publishing", "done", "failed", "cancelled"]
+
+
+class IllegalDatasetPublishJobRequestSummary(BaseModel):
+    name: str
+    version_id: Optional[int] = None
+    label_mapping_overrides_count: int = 0
+    label_filters_count: int = 0
+
+
+class IllegalDatasetPublishJobOut(BaseModel):
+    job_id: str
+    illegal_dataset_id: int
+    status: IllegalDatasetPublishJobStatus
+    phase: Optional[IllegalDatasetPublishJobPhase] = None
+    progress: int = 0
+    processed: int = 0
+    total: int = 0
+    seq: int = 0
+    request: Optional[IllegalDatasetPublishJobRequestSummary] = None
+    result: Optional[IllegalDatasetPublishOut] = None
+    logs: list[str] = Field(default_factory=list)
+    error_message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class IllegalDatasetDetailOut(BaseModel):

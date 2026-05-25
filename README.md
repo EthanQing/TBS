@@ -125,6 +125,10 @@ YOLO worker:
 python -m train_platform.workers.yolo_worker
 ```
 
+The YOLO worker also polls queued model-conversion jobs from
+`temp/model_conversions` and runs PT/PTH -> ONNX conversion locally in the
+worker process.
+
 Paddle training worker:
 
 ```bash

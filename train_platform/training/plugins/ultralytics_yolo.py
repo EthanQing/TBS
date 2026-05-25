@@ -346,21 +346,30 @@ class UltralyticsYOLOTrainer:
                 run_data_yaml = data_yaml
 
             batch_size = int(getattr(job.parameters, "batch_size", 16) or 16)
-            device_value = normalize_device_spec(getattr(job.parameters, "device", "auto") or "auto")
+            requested_device_value = normalize_device_spec(getattr(job.parameters, "device", "auto") or "auto")
+            device_value = normalize_device_spec(os.getenv("TRAIN_PLATFORM_DEVICE_RUNTIME") or requested_device_value)
             selected_gpu_ids = extract_selected_gpu_ids(device_value)
             multi_gpu = len(selected_gpu_ids) > 1
+
+            logger.info(
+                "Resolved Ultralytics device run_id=%s requested=%s runtime=%s visible=%s",
+                ctx.job_id,
+                requested_device_value,
+                device_value,
+                os.getenv("CUDA_VISIBLE_DEVICES", "<inherit>"),
+            )
 
             if selected_gpu_ids:
                 if not torch.cuda.is_available():
                     raise RuntimeError(
-                        f"GPU device(s) requested ({device_value}) but CUDA is not available on this worker"
+                        f"GPU device(s) requested ({requested_device_value}) but CUDA is not available on this worker"
                     )
                 available_gpu_count = int(torch.cuda.device_count())
                 missing_gpu_ids = [idx for idx in selected_gpu_ids if idx >= available_gpu_count]
                 if missing_gpu_ids:
                     raise RuntimeError(
-                        f"Requested GPU device(s) {missing_gpu_ids} but this worker only has "
-                        f"{available_gpu_count} visible CUDA device(s)"
+                        f"Requested GPU device(s) {requested_device_value} but this training process only has "
+                        f"{available_gpu_count} visible CUDA device(s) after runtime binding"
                     )
 
             if multi_gpu and batch_size == AUTO_BATCH_SIZE:

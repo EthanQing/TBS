@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
 import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, File, UploadFile
+import requests
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
@@ -18,7 +20,6 @@ from train_platform.schemas.v3.inference import (
     InferenceRunCreate,
     InferenceRunOut,
     InferenceUploadOut,
-    VideoFrameResult,
     VideoInferenceCreate,
     VideoInferenceOut,
 )
@@ -120,71 +121,43 @@ def video_inference(payload: VideoInferenceCreate, db: Session = Depends(get_db)
     Run inference on a video file, extracting frames at the given interval.
     """
     svc = InferenceService()
+    ctx = svc.resolve_model_context(db, model_version_id=int(payload.model_version_id))
+    engine = str(ctx.get("engine") or "ultralytics-yolo").strip().lower()
+    if engine == "paddle-det":
+        worker_url = os.getenv("PADDLE_INFERENCE_WORKER_URL", "http://127.0.0.1:18003").rstrip("/")
+        timeout = float(os.getenv("PADDLE_INFERENCE_WORKER_TIMEOUT", "240"))
+    else:
+        worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
+        timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "120"))
 
-    # Resolve video path
-    from train_platform.utils.path_utils import resolve_temp_path
-    video_path = resolve_temp_path(payload.video_token)
-    if not video_path.exists() or not video_path.is_file():
-        raise ValidationError(f"Video file not found: {payload.video_token}")
-
-    # Extract frames using OpenCV
+    headers = {}
+    token = str(settings.internal_api_token or "").strip()
+    if token:
+        headers["X-Internal-Token"] = token
+    worker_payload: Dict[str, Any] = {
+        "weights_path": str(ctx.get("weights_path") or ""),
+        "video_token": payload.video_token,
+        "frame_interval": int(payload.frame_interval),
+        "conf": float(payload.conf),
+        "iou": float(payload.iou),
+    }
+    if engine == "paddle-det":
+        worker_payload["config_path"] = str(ctx.get("config_path") or "")
     try:
-        import cv2
-    except ImportError:
-        raise ValidationError("OpenCV (cv2) is not installed — required for video inference")
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise ValidationError(f"Failed to open video: {payload.video_token}")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    interval = max(1, int(payload.frame_interval))
-
-    # Create temp dir for extracted frames
-    frames_dir = settings.temp_dir / "inference_video_frames" / uuid.uuid4().hex
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
-    results: List[VideoFrameResult] = []
-    total_start = time.time()
-    frame_idx = 0
-    processed = 0
+        resp = requests.post(
+            f"{worker_url}/internal/inference/video-frames",
+            json=worker_payload,
+            timeout=timeout,
+            headers=headers,
+        )
+    except Exception as e:
+        raise ValidationError(f"Failed to call inference worker: {type(e).__name__}: {e}") from e
 
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if frame_idx % interval == 0:
-                # Save frame as image
-                frame_path = frames_dir / f"frame_{frame_idx:06d}.jpg"
-                cv2.imwrite(str(frame_path), frame)
-
-                result = VideoFrameResult(frame_index=frame_idx)
-                try:
-                    run = svc.run_inference(
-                        db,
-                        model_version_id=int(payload.model_version_id),
-                        input_path=str(frame_path),
-                        conf=float(payload.conf),
-                        iou=float(payload.iou),
-                    )
-                    result.output = run.output
-                    result.error_message = run.error_message
-                except Exception as e:
-                    result.error_message = f"{type(e).__name__}: {e}"
-
-                results.append(result)
-                processed += 1
-
-            frame_idx += 1
-    finally:
-        cap.release()
-
-    total_time_ms = round((time.time() - total_start) * 1000, 1)
-    return VideoInferenceOut(
-        results=results,
-        total_frames=total_frames,
-        processed_frames=processed,
-        total_time_ms=total_time_ms,
-    )
+        data = resp.json()
+    except Exception as e:
+        raise ValidationError(f"Inference worker returned non-JSON response: {type(e).__name__}: {e}") from e
+    if resp.status_code != 200:
+        detail = data.get("detail") if isinstance(data, dict) else None
+        raise ValidationError(str(detail or f"Inference worker error {resp.status_code}: {resp.text}"))
+    return VideoInferenceOut.model_validate(data)

@@ -9,10 +9,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import requests
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.db.session import SessionLocal
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import ModelStage, TrainingRunStatus
 from train_platform.models.v3.model_registry import ModelVersion
@@ -25,7 +25,6 @@ from train_platform.schemas.v3.inference_jobs import (
 from train_platform.services.v3.inference_service import InferenceService
 from train_platform.services.v3.model_version_service import ModelVersionService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
-from train_platform.utils.path_utils import resolve_temp_path
 
 _LOCKS_GUARD = threading.Lock()
 _JOB_LOCKS: Dict[str, threading.Lock] = {}
@@ -373,6 +372,57 @@ class InferenceJobService:
             tokens = tokens[:1]
         return tokens, None
 
+    def _worker_url_for_engine(self, engine: str) -> str:
+        e = str(engine or "").strip().lower()
+        if e == "paddle-det":
+            return os.getenv("PADDLE_INFERENCE_WORKER_URL", "http://127.0.0.1:18003").rstrip("/")
+        return os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
+
+    def _internal_request_headers(self) -> Dict[str, str]:
+        token = str(settings.internal_api_token or "").strip()
+        if not token:
+            return {}
+        return {"X-Internal-Token": token}
+
+    def _dispatch_job_to_worker(self, job_id: str, *, status: Dict[str, Any], ctx: Dict[str, Any]) -> None:
+        engine = str(ctx.get("engine") or status.get("engine") or "ultralytics-yolo").strip().lower()
+        worker_url = self._worker_url_for_engine(engine)
+        timeout = float(os.getenv("INFERENCE_JOB_WORKER_DISPATCH_TIMEOUT", "10"))
+
+        payload: Dict[str, Any] = {
+            "job_id": job_id,
+            "mode": str(status.get("mode") or "image"),
+            "weights_path": str(ctx.get("weights_path") or ""),
+            "input_tokens": list(status.get("input_tokens") or []),
+            "video_token": status.get("video_token"),
+            "conf": float(status.get("conf") or 0.5),
+            "iou": float(status.get("iou") or 0.45),
+            "show_labels": bool(status.get("show_labels", True)),
+            "show_confidence": bool(status.get("show_confidence", True)),
+        }
+        if engine == "paddle-det":
+            payload["config_path"] = str(ctx.get("config_path") or "")
+
+        resp = requests.post(
+            f"{worker_url}/internal/inference-jobs/run",
+            json=payload,
+            timeout=timeout,
+            headers=self._internal_request_headers(),
+        )
+        try:
+            data = resp.json() if resp.content else {}
+        except Exception:
+            data = {}
+        if resp.status_code != 200:
+            msg = ""
+            if isinstance(data, dict):
+                msg = str(data.get("error") or data.get("detail") or "").strip()
+            raise RuntimeError(msg or f"Inference worker error {resp.status_code}: {resp.text}")
+        worker_status = str((data or {}).get("status") or "").strip().lower()
+        worker_error = str((data or {}).get("error") or "").strip()
+        if worker_status not in {"started", "ok"}:
+            raise RuntimeError(worker_error or f"Inference worker returned status={worker_status or 'unknown'}")
+
     def create_job(self, db: Session, payload: InferenceJobCreate) -> InferenceJobOut:
         with _CREATE_JOB_PROCESS_LOCK:
             self._acquire_create_job_lock(self.CREATE_JOB_LOCK_TIMEOUT_SEC)
@@ -392,7 +442,7 @@ class InferenceJobService:
                 mode = str(payload.mode)
                 total = len(tokens)
                 if mode == "video":
-                    total = self._probe_total_frames(video_token)
+                    total = 0
 
                 job_id = self._new_job_id()
                 self.job_dir(job_id)
@@ -428,29 +478,20 @@ class InferenceJobService:
             finally:
                 self._release_create_job_lock()
 
-        t = threading.Thread(target=self._run_job, args=(job_id,), daemon=True)
-        t.start()
+        try:
+            self._dispatch_job_to_worker(job_id, status=status, ctx=ctx)
+        except Exception as e:
+            self._update_status(
+                job_id,
+                {
+                    "status": "failed",
+                    "phase": "failed",
+                    "progress": 100,
+                    "error_message": f"Failed to dispatch inference job to worker: {type(e).__name__}: {e}",
+                },
+                bump_seq=True,
+            )
         return self.get_job(job_id, include_items=False)
-
-    def _probe_total_frames(self, video_token: str | None) -> int:
-        raw = str(video_token or "").strip()
-        if not raw:
-            return 0
-        try:
-            import cv2
-        except Exception:
-            return 0
-        path = resolve_temp_path(raw)
-        if not path.exists():
-            return 0
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            return 0
-        try:
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            return max(0, total)
-        finally:
-            cap.release()
 
     def _read_status(self, job_id: str) -> Dict[str, Any]:
         return _read_json(self.status_path(job_id))
@@ -533,394 +574,6 @@ class InferenceJobService:
         payload = dict(st)
         payload["result"] = result
         return InferenceJobOut.model_validate(payload)
-
-    def _run_job(self, job_id: str) -> None:
-        db = SessionLocal()
-        try:
-            st = self._update_status(
-                job_id,
-                {"status": "running", "phase": "preparing", "progress": 0, "error_message": None},
-                bump_seq=True,
-            )
-            if self._is_cancel_requested(job_id):
-                self._update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
-                return
-
-            mode = str(st.get("mode") or "")
-            if mode in {"image", "batch"}:
-                self._run_image_job(db, job_id)
-            elif mode == "video":
-                self._run_video_job(db, job_id)
-            else:
-                raise ValidationError(f"Unsupported mode: {mode}")
-
-            fin = self._read_status(job_id)
-            if str(fin.get("status")) == "running":
-                self._update_status(
-                    job_id,
-                    {"status": "completed", "phase": "done", "progress": 100, "error_message": None},
-                    bump_seq=True,
-                )
-        except Exception as e:
-            self._update_status(
-                job_id,
-                {
-                    "status": "failed",
-                    "phase": "failed",
-                    "progress": 100,
-                    "error_message": f"{type(e).__name__}: {e}",
-                },
-                bump_seq=True,
-            )
-        finally:
-            db.close()
-
-    def _static_temp_url(self, path: Path) -> Optional[str]:
-        try:
-            rel = path.resolve(strict=False).relative_to(settings.temp_dir.resolve())
-            return f"/static/temp/{rel.as_posix()}"
-        except Exception:
-            return None
-
-    def _draw_predictions(
-        self,
-        image: Any,
-        predictions: List[Dict[str, Any]],
-        *,
-        show_labels: bool,
-        show_confidence: bool,
-    ) -> None:
-        try:
-            import cv2
-        except Exception:
-            return
-
-        for pred in predictions:
-            box = pred.get("xyxy")
-            if not isinstance(box, list) or len(box) != 4:
-                continue
-            try:
-                x1, y1, x2, y2 = [int(round(float(x))) for x in box]
-            except Exception:
-                continue
-            cls_id = int(pred.get("class_id") or -1)
-            color = (
-                int((37 * (cls_id + 3)) % 255),
-                int((17 * (cls_id + 7)) % 255),
-                int((29 * (cls_id + 11)) % 255),
-            )
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-
-            if not show_labels and not show_confidence:
-                continue
-            parts = []
-            if show_labels:
-                parts.append(str(pred.get("class_name") or pred.get("class_id") or "obj"))
-            if show_confidence:
-                try:
-                    parts.append(f"{float(pred.get('confidence') or 0):.3f}")
-                except Exception:
-                    pass
-            if not parts:
-                continue
-            text = " ".join(parts)
-            cv2.putText(
-                image,
-                text,
-                (max(0, x1), max(0, y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2,
-                lineType=cv2.LINE_AA,
-            )
-
-    def _render_image_result(
-        self,
-        job_id: str,
-        *,
-        source_path: Path,
-        predictions: List[Dict[str, Any]],
-        show_labels: bool,
-        show_confidence: bool,
-    ) -> Optional[str]:
-        try:
-            import cv2
-        except Exception:
-            return None
-        img = cv2.imread(str(source_path))
-        if img is None:
-            return None
-        self._draw_predictions(
-            img,
-            predictions,
-            show_labels=show_labels,
-            show_confidence=show_confidence,
-        )
-
-        out_dir = self.job_dir(job_id) / "output" / "images"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        stem = source_path.stem or "image"
-        name = f"{stem}_{int(time.time() * 1000)}.jpg"
-        out_path = out_dir / name
-        ok = cv2.imwrite(str(out_path), img)
-        if not ok:
-            return None
-        return self._static_temp_url(out_path)
-
-    def _run_image_job(self, db: Session, job_id: str) -> None:
-        st = self._read_status(job_id)
-        tokens = [str(x).strip() for x in (st.get("input_tokens") or []) if str(x).strip()]
-        total = len(tokens)
-        show_labels = bool(st.get("show_labels", True))
-        show_conf = bool(st.get("show_confidence", True))
-        mv_id = int(st.get("model_version_id"))
-        conf = float(st.get("conf") or 0.5)
-        iou = float(st.get("iou") or 0.45)
-
-        self._update_status(job_id, {"phase": "inferring", "total": total, "processed": 0, "progress": 0}, bump_seq=True)
-
-        for idx, token in enumerate(tokens, start=1):
-            if self._is_cancel_requested(job_id):
-                self._update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
-                return
-
-            info = self._infer.run_inference_output(
-                db,
-                model_version_id=mv_id,
-                input_path=token,
-                conf=conf,
-                iou=iou,
-            )
-            output = info.get("output") if isinstance(info.get("output"), dict) else {}
-            err = info.get("error_message")
-            preds = output.get("predictions") if isinstance(output, dict) else []
-            predictions = preds if isinstance(preds, list) else []
-
-            src_path = resolve_temp_path(token)
-            src_url = self._static_temp_url(src_path) if src_path.exists() else None
-            out_url = None
-            if src_path.exists() and predictions:
-                out_url = self._render_image_result(
-                    job_id,
-                    source_path=src_path,
-                    predictions=predictions,
-                    show_labels=show_labels,
-                    show_confidence=show_conf,
-                )
-
-            item = {
-                "filename": Path(token).name,
-                "token": token,
-                "status": "failed" if err else "success",
-                "detections": int(len(predictions)),
-                "inference_time_ms": info.get("inference_time_ms"),
-                "source_url": src_url,
-                "output_url": out_url,
-                "output": output if output else None,
-                "error_message": str(err) if err else None,
-            }
-            self._append_item(job_id, item)
-
-            progress = int((idx / total) * 100) if total > 0 else 100
-            self._update_status(
-                job_id,
-                {
-                    "processed": idx,
-                    "total": total,
-                    "progress": progress,
-                    "phase": "inferring" if idx < total else "finalizing",
-                },
-                bump_seq=True,
-            )
-
-        self._update_status(
-            job_id,
-            {"result": {"mode": st.get("mode"), "items": []}, "phase": "finalizing"},
-            bump_seq=True,
-        )
-
-    def _run_video_job(self, db: Session, job_id: str) -> None:
-        st = self._read_status(job_id)
-        video_token = str(st.get("video_token") or "").strip()
-        mv_id = int(st.get("model_version_id"))
-        conf = float(st.get("conf") or 0.5)
-        iou = float(st.get("iou") or 0.45)
-        show_labels = bool(st.get("show_labels", True))
-        show_conf = bool(st.get("show_confidence", True))
-
-        if not video_token:
-            raise ValidationError("Missing video token")
-
-        video_path = resolve_temp_path(video_token)
-        if not video_path.exists() or not video_path.is_file():
-            raise ValidationError(f"Video file not found: {video_token}")
-
-        try:
-            import cv2
-        except Exception as e:
-            raise ValidationError(f"OpenCV is required for video inference: {e}") from e
-
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise ValidationError(f"Failed to open video: {video_token}")
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        if fps <= 0:
-            fps = 25.0
-        first_frame = None
-        if width <= 0 or height <= 0:
-            ok0, frame0 = cap.read()
-            if not ok0:
-                cap.release()
-                raise ValidationError("Video has no readable frames")
-            first_frame = frame0
-            h0, w0 = frame0.shape[:2]
-            width, height = int(w0), int(h0)
-
-        out_dir = self.job_dir(job_id) / "output"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_video = out_dir / "output.mp4"
-        tmp_dir = self.job_dir(job_id) / "work"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        frame_tmp = tmp_dir / "frame.jpg"
-
-        writer = cv2.VideoWriter(
-            str(out_video),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (max(1, width), max(1, height)),
-        )
-        if not writer.isOpened():
-            cap.release()
-            raise ValidationError("Failed to create output video writer")
-
-        start_t = time.perf_counter()
-        processed = 0
-        self._update_status(
-            job_id,
-            {"phase": "inferring", "total": max(0, total_frames), "processed": 0, "progress": 0},
-            bump_seq=True,
-        )
-
-        try:
-            if first_frame is not None:
-                cv2.imwrite(str(frame_tmp), first_frame)
-                info0 = self._infer.run_inference_output(
-                    db,
-                    model_version_id=mv_id,
-                    input_path=str(frame_tmp),
-                    conf=conf,
-                    iou=iou,
-                )
-                output0 = info0.get("output") if isinstance(info0.get("output"), dict) else {}
-                preds0 = output0.get("predictions") if isinstance(output0, dict) else []
-                pred_list0 = preds0 if isinstance(preds0, list) else []
-                if pred_list0:
-                    self._draw_predictions(
-                        first_frame,
-                        pred_list0,
-                        show_labels=show_labels,
-                        show_confidence=show_conf,
-                    )
-                writer.write(first_frame)
-                processed += 1
-                progress0 = int((processed / total_frames) * 100) if total_frames > 0 else 0
-                self._update_status(
-                    job_id,
-                    {
-                        "processed": processed,
-                        "total": max(total_frames, processed),
-                        "progress": max(0, min(99, progress0)),
-                        "phase": "inferring",
-                    },
-                    bump_seq=True,
-                )
-
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                if self._is_cancel_requested(job_id):
-                    self._update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
-                    return
-
-                cv2.imwrite(str(frame_tmp), frame)
-                info = self._infer.run_inference_output(
-                    db,
-                    model_version_id=mv_id,
-                    input_path=str(frame_tmp),
-                    conf=conf,
-                    iou=iou,
-                )
-                output = info.get("output") if isinstance(info.get("output"), dict) else {}
-                preds = output.get("predictions") if isinstance(output, dict) else []
-                predictions = preds if isinstance(preds, list) else []
-                if predictions:
-                    self._draw_predictions(
-                        frame,
-                        predictions,
-                        show_labels=show_labels,
-                        show_confidence=show_conf,
-                    )
-                writer.write(frame)
-
-                processed += 1
-                progress = int((processed / total_frames) * 100) if total_frames > 0 else 0
-                self._update_status(
-                    job_id,
-                    {
-                        "processed": processed,
-                        "total": max(total_frames, processed),
-                        "progress": max(0, min(99, progress)),
-                        "phase": "inferring",
-                    },
-                    bump_seq=True,
-                )
-        finally:
-            cap.release()
-            writer.release()
-            try:
-                frame_tmp.unlink(missing_ok=True)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-
-        if self._is_cancel_requested(job_id):
-            self._update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
-            return
-
-        elapsed_ms = round((time.perf_counter() - start_t) * 1000.0, 2)
-        video_url = self._static_temp_url(out_video)
-        if not video_url:
-            raise ValidationError("Failed to resolve output video URL")
-        if not out_video.exists() or out_video.stat().st_size <= 0:
-            raise ValidationError("Output video was not generated")
-
-        self._update_status(
-            job_id,
-            {
-                "phase": "finalizing",
-                "progress": 100,
-                "processed": processed,
-                "total": max(total_frames, processed),
-                "result": {
-                    "mode": "video",
-                    "video": {
-                        "output_url": video_url,
-                        "total_frames": max(total_frames, processed),
-                        "processed_frames": processed,
-                        "fps": round(float(fps), 3),
-                        "width": int(width) if width > 0 else None,
-                        "height": int(height) if height > 0 else None,
-                        "total_time_ms": elapsed_ms,
-                    },
-                },
-            },
-            bump_seq=True,
-        )
 
     def list_jobs_for_debug(self) -> List[Dict[str, Any]]:
         out = []

@@ -7,7 +7,7 @@ import random
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import rasterio
@@ -1078,6 +1078,7 @@ class IllegalDatasetPublishService:
         label_filters: Optional[list[str]] = None,
         publish_config: Optional[dict] = None,
         split_config: Optional[dict] = None,
+        progress_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
     ) -> dict[str, Any]:
         source_root = Path(source_root).expanduser().resolve(strict=False)
         output_root = Path(output_root).expanduser().resolve(strict=False)
@@ -1091,9 +1092,21 @@ class IllegalDatasetPublishService:
         pairs, warnings = self._collect_pairs(source_root)
         if not pairs:
             raise ValidationError("No image/json pairs found for illegal dataset publish")
+        if callable(progress_callback):
+            progress_callback(
+                "converting",
+                {
+                    "message": f"已匹配 {len(pairs)} 组图片和标注，开始转换",
+                    "processed": 0,
+                    "completed": 0,
+                    "total": len(pairs),
+                    "skipped": 0,
+                },
+            )
 
         global_label_map: Dict[str, int] = {}
         processed = 0
+        completed = 0
         skipped_files: List[str] = []
         successful_labels: set[str] = set()
         aggregate_stats = {"images": 0, "slices": 0, "labels": 0, "empty_slices": 0}
@@ -1113,13 +1126,39 @@ class IllegalDatasetPublishService:
             except ValidationError as exc:
                 skipped_files.append(f"{json_path.name}: {exc}")
                 warnings.append(f"Skipped {json_path.name}: {exc}")
+                completed += 1
+                if callable(progress_callback):
+                    progress_callback(
+                        "converting",
+                        {
+                            "message": f"跳过 {json_path.name}: {exc}",
+                            "processed": processed,
+                            "completed": completed,
+                            "total": len(pairs),
+                            "skipped": len(skipped_files),
+                            "current_file": json_path.name,
+                        },
+                    )
                 continue
 
             processed += 1
+            completed += 1
             aggregate_stats["images"] += 1
             aggregate_stats["slices"] += int(stats.get("total", 0))
             aggregate_stats["labels"] += int(stats.get("total_labels", 0))
             aggregate_stats["empty_slices"] += int(stats.get("empty", 0))
+            if callable(progress_callback):
+                progress_callback(
+                    "converting",
+                    {
+                        "message": f"已转换 {processed}/{len(pairs)} 组数据",
+                        "processed": processed,
+                        "completed": completed,
+                        "total": len(pairs),
+                        "skipped": len(skipped_files),
+                        "current_file": json_path.name,
+                    },
+                )
 
             try:
                 raw_bboxes, _ = parse_annotations({**cfg, "label_map": dict(global_label_map)})
@@ -1135,6 +1174,17 @@ class IllegalDatasetPublishService:
         if aggregate_stats["slices"] <= 0:
             raise ValidationError("No valid YOLO samples were generated during publish conversion")
 
+        if callable(progress_callback):
+            progress_callback(
+                "converting",
+                {
+                    "message": "转换完成，正在整理切分与类别信息",
+                    "processed": processed,
+                    "completed": completed,
+                    "total": len(pairs),
+                    "skipped": len(skipped_files),
+                },
+            )
         split_summary = self.apply_split(output_root, split_config=split_config)
         class_names = self._write_class_files(output_root, global_label_map, successful_labels, split_summary)
 

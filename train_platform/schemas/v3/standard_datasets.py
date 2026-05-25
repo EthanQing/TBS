@@ -97,6 +97,7 @@ class DatasetStatisticsOut(BaseModel):
 
 class StandardDatasetListOut(StandardDatasetOut):
     statistics: Optional[DatasetStatisticsOut] = None
+    preview_image_url: Optional[str] = None
 
 
 class CategoryInfo(BaseModel):

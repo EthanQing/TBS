@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import requests
 import shutil
 import statistics
 import time
@@ -499,27 +500,40 @@ class TrainingRunService:
         if run.status not in (TrainingRunStatus.CANCELLED, TrainingRunStatus.FAILED):
             raise ConflictError(f"Run status is {run.status}; must be CANCELLED or FAILED to resume")
 
-        # 2. Check for weights
+        # 2. Check whether a resumable Ultralytics checkpoint exists.
+        # If it does not, we fall back to a fresh restart with the saved parameters.
         weights_path = settings.training_dir / str(run_id) / "weights" / "last.pt"
-        if not weights_path.exists():
-            raise ConflictError("Cannot resume: 'last.pt' weights not found in run directory")
+        has_resume_checkpoint = weights_path.exists()
 
         # 3. Update parameters to enable resume
         if run.parameters:
             add = run.parameters.additional_params or {}
-            if isinstance(add, dict):
-                add["resume_training"] = True
-                add["resume_job_id"] = None # Clear this to force self-resume
-                run.parameters.additional_params = add
-                db.add(run.parameters)
-        
+            if not isinstance(add, dict):
+                add = {}
+            add["resume_training"] = bool(has_resume_checkpoint)
+            add["resume_job_id"] = None  # Clear this to force self-resume semantics for Ultralytics
+            run.parameters.additional_params = add
+            db.add(run.parameters)
+
         # 4. Reset status flags
         run.cancel_requested_at = None
         run.cancel_reason = None
         run.error_message = None
         run.finished_at = None
+        run.worker_id = None
+        run.claimed_at = None
+        run.pid = None
+        run.heartbeat_at = None
+        if not has_resume_checkpoint:
+            run.current_epoch = 0
+            run.progress = 0
         
-        db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="resumed", message="Run resume requested"))
+        resume_message = (
+            "Run resume requested using weights/last.pt"
+            if has_resume_checkpoint
+            else "No weights/last.pt found; queued run to restart with saved parameters"
+        )
+        db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="resumed", message=resume_message))
         db.commit()
 
         # 5. Queue it
@@ -825,6 +839,16 @@ class TrainingRunService:
             return value
         return None
 
+    @staticmethod
+    def _run_image_size(run: TrainingRun) -> int:
+        params = getattr(run, "parameters", None)
+        raw = getattr(params, "image_size", None) if params is not None else None
+        try:
+            value = int(float(raw))
+        except Exception:
+            return 640
+        return value if value > 0 else 640
+
     def _ensure_report_metric_snapshots(self, db: Session, run: TrainingRun) -> TrainingRunResult | None:
         result = run.result
         best_present = bool(result and isinstance(result.best_metrics, dict) and result.best_metrics)
@@ -849,6 +873,108 @@ class TrainingRunService:
         db.refresh(result)
         return result
 
+    def _measure_run_yolo_stats(self, run: TrainingRun, result: TrainingRunResult) -> Dict[str, Any]:
+        arch = run.architecture
+        engine = str(getattr(arch, "engine", "") or "ultralytics-yolo").strip().lower()
+        if engine != "ultralytics-yolo":
+            return {}
+
+        weights_rel = str(result.best_weights_path or result.last_weights_path or "").strip()
+        if not weights_rel:
+            return {}
+        weights_path = resolve_training_path(weights_rel)
+        if not weights_path.exists() or not weights_path.is_file():
+            return {}
+
+        worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
+        timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "120"))
+        payload = {
+            "weights_path": str(weights_path),
+            "image_path": str(self._ensure_benchmark_image()),
+            "imgsz": self._run_image_size(run),
+            "conf": 0.25,
+            "iou": 0.45,
+            "warmup": 1,
+            "iters": 5,
+        }
+        resp = requests.post(
+            f"{worker_url}/internal/model-stats/yolo",
+            json=payload,
+            timeout=timeout,
+            headers=InferenceService()._internal_request_headers(),
+        )
+        if resp.status_code != 200:
+            return {}
+
+        data = resp.json()
+        if data.get("error"):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _ensure_report_artifacts(self, db: Session, run: TrainingRun) -> TrainingRunResult | None:
+        result = run.result
+        needs_index = result is None
+        if result is not None:
+            needs_index = any(
+                value is None
+                for value in (
+                    result.best_weights_path,
+                    result.last_weights_path,
+                    result.model_size_mb,
+                )
+            )
+        if needs_index:
+            try:
+                index_completion_artifacts(db, str(run.run_id))
+                db.commit()
+                db.refresh(run)
+                result = run.result
+            except Exception:
+                db.rollback()
+                result = run.result
+
+        needs_flops = result is not None and (self._as_number(result.flops) in (None, 0))
+        needs_latency = result is not None and (self._as_number(result.inference_time_ms) in (None, 0))
+        if result is not None and (needs_flops or needs_latency):
+            try:
+                stats = self._measure_run_yolo_stats(run, result)
+                changed = False
+                flops = self._as_number(stats.get("flops"))
+                if needs_flops and flops and flops > 0:
+                    result.flops = int(flops)
+                    changed = True
+                latency = self._as_number(stats.get("inference_time_ms"))
+                if needs_latency and latency and latency > 0:
+                    result.inference_time_ms = latency
+                    changed = True
+                if changed:
+                    db.add(result)
+                    db.commit()
+                    db.refresh(result)
+            except Exception:
+                db.rollback()
+
+        engine = str(getattr(run.architecture, "engine", "") or "ultralytics-yolo").strip().lower()
+        if result is not None and engine != "ultralytics-yolo" and (self._as_number(result.inference_time_ms) in (None, 0)):
+            try:
+                measured = self._measure_run_inference_latency(
+                    db,
+                    run=run,
+                    benchmark_image=self._ensure_benchmark_image(),
+                    conf=0.25,
+                    iou=0.45,
+                    warmup=1,
+                    iters=5,
+                )
+                result.inference_time_ms = measured
+                db.add(result)
+                db.commit()
+                db.refresh(result)
+            except Exception:
+                db.rollback()
+
+        return result
+
     def build_report(self, db: Session, run_id: str) -> Dict[str, Any]:
         run = self.get_run(db, run_id)
         if run.status != TrainingRunStatus.COMPLETED:
@@ -857,6 +983,7 @@ class TrainingRunService:
         result = self._ensure_report_metric_snapshots(db, run)
         if result is None:
             result = run.result
+        result = self._ensure_report_artifacts(db, run) or result
 
         arch = run.architecture
         if arch is None:
@@ -893,6 +1020,10 @@ class TrainingRunService:
 
         model_size_mb = self._as_number(getattr(result, "model_size_mb", None) if result else None)
         inference_time_ms = self._as_number(getattr(result, "inference_time_ms", None) if result else None)
+        if inference_time_ms is not None and inference_time_ms <= 0:
+            inference_time_ms = None
+        flops = self._as_number(getattr(result, "flops", None) if result else None)
+        flops_out = int(flops) if flops is not None and flops > 0 else None
 
         return {
             "basic": {
@@ -946,7 +1077,7 @@ class TrainingRunService:
                 "last_weights_path": result.last_weights_path if result else None,
                 "model_size_mb": model_size_mb,
                 "inference_time_ms": inference_time_ms,
-                "flops": int(result.flops) if result and result.flops is not None else None,
+                "flops": flops_out,
             },
         }
 
@@ -1063,7 +1194,7 @@ class TrainingRunService:
                     continue
 
                 cached = self._as_number(getattr(run.result, "inference_time_ms", None) if run.result else None)
-                if cached is not None and not force:
+                if cached is not None and cached > 0 and not force:
                     items.append(
                         {
                             "run_id": str(run.run_id),
@@ -1075,19 +1206,35 @@ class TrainingRunService:
                     )
                     continue
 
-                measured = self._measure_run_inference_latency(
-                    db,
-                    run=run,
-                    benchmark_image=benchmark_image,
-                    conf=0.25,
-                    iou=0.45,
-                    warmup=1,
-                    iters=5,
-                )
-
                 if run.result is None:
                     run.result = TrainingRunResult(run_id=str(run.run_id))
                     db.add(run.result)
+                    db.flush()
+
+                engine_norm = str(engine or "ultralytics-yolo").strip().lower()
+                if engine_norm == "ultralytics-yolo":
+                    if not run.result.best_weights_path and not run.result.last_weights_path:
+                        index_completion_artifacts(db, str(run.run_id))
+                        db.flush()
+                        db.refresh(run)
+                    stats = self._measure_run_yolo_stats(run, run.result)
+                    measured = self._as_number(stats.get("inference_time_ms"))
+                    if measured is None:
+                        raise RuntimeError("YOLO worker did not return inference_time_ms")
+                    flops = self._as_number(stats.get("flops"))
+                    if flops and flops > 0:
+                        run.result.flops = int(flops)
+                else:
+                    measured = self._measure_run_inference_latency(
+                        db,
+                        run=run,
+                        benchmark_image=benchmark_image,
+                        conf=0.25,
+                        iou=0.45,
+                        warmup=1,
+                        iters=5,
+                    )
+
                 run.result.inference_time_ms = measured
                 db.add(run)
                 db.commit()
@@ -1176,6 +1323,8 @@ class TrainingRunService:
                     model_size_mb = None
                 try:
                     inference_time_ms = float(run.result.inference_time_ms) if run.result.inference_time_ms is not None else None
+                    if inference_time_ms is not None and inference_time_ms <= 0:
+                        inference_time_ms = None
                 except Exception:
                     inference_time_ms = None
             metric_summary = self._build_metric_summary(db, run)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ from train_platform.training.registry import get_trainer
 from train_platform.utils.path_utils import resolve_dataset_path
 from train_platform.utils.mlflow_utils import init_mlflow_logger
 from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
+from train_platform.utils.training_params import build_device_runtime
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
 
@@ -212,6 +214,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[train_entry] cancel requested before start run_id={run_id}", file=sys.stderr, flush=True)
             exit_code = 0
             return exit_code
+
+        device_runtime = build_device_runtime(getattr(run.parameters, "device", "auto") or "auto")
+        requested_device = str(device_runtime.get("requested") or "auto")
+        runtime_device = str(device_runtime.get("runtime_device") or requested_device)
+        visible_devices = device_runtime.get("cuda_visible_devices")
+        if visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_devices)
+        os.environ["TRAIN_PLATFORM_DEVICE_REQUEST"] = requested_device
+        os.environ["TRAIN_PLATFORM_DEVICE_RUNTIME"] = runtime_device
+        print(
+            "[train_entry] device binding "
+            f"run_id={run_id} "
+            f"requested={requested_device} "
+            f"runtime={runtime_device} "
+            f"cuda_visible_devices={os.getenv('CUDA_VISIBLE_DEVICES', '<inherit>')}",
+            flush=True,
+        )
 
         engine = str(getattr(run.architecture, "engine", "") or "")
         family = str(getattr(run.architecture, "family", "") or "")

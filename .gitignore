@@ -27,6 +27,7 @@ datasets/
 training_runs/
 temp/
 runs/
+PaddleDetection/
 *.log
 *.json
 

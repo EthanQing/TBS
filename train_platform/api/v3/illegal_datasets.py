@@ -22,6 +22,7 @@ from train_platform.schemas.v3.illegal_datasets import (
     IllegalDatasetLabelMappingsUpdate,
     IllegalDatasetListOut,
     IllegalDatasetOut,
+    IllegalDatasetPublishJobOut,
     IllegalDatasetPublishOut,
     IllegalDatasetPublishRequest,
     IllegalDatasetRawLabelsOut,
@@ -36,12 +37,14 @@ from train_platform.schemas.v3.dataset_uploads import (
     DatasetUploadSessionOut,
 )
 from train_platform.services.v3.dataset_upload_service import DatasetUploadService
+from train_platform.services.v3.illegal_dataset_publish_job_service import IllegalDatasetPublishJobService
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 
 
 router = APIRouter(prefix="/illegal-datasets", tags=["illegal-datasets"])
 svc = IllegalDatasetService()
 upload_svc = DatasetUploadService()
+publish_job_svc = IllegalDatasetPublishJobService()
 
 
 @router.post("", response_model=IllegalDatasetOut, status_code=201)
@@ -295,6 +298,22 @@ def publish_standard_dataset(
     db: Session = Depends(get_db),
 ):
     return svc.publish_standard_dataset(db, illegal_dataset_id, obj=payload.model_dump())
+
+
+@router.post("/{illegal_dataset_id}/publish-jobs", response_model=IllegalDatasetPublishJobOut, status_code=202)
+def create_illegal_dataset_publish_job(
+    illegal_dataset_id: int,
+    payload: IllegalDatasetPublishRequest,
+    db: Session = Depends(get_db),
+):
+    job = publish_job_svc.create_job(db, int(illegal_dataset_id), payload)
+    publish_job_svc.start_job(int(illegal_dataset_id), str(job.job_id))
+    return job
+
+
+@router.get("/{illegal_dataset_id}/publish-jobs/{job_id}", response_model=IllegalDatasetPublishJobOut)
+def get_illegal_dataset_publish_job(illegal_dataset_id: int, job_id: str):
+    return publish_job_svc.get_job(int(illegal_dataset_id), str(job_id))
 
 
 @router.get("/{illegal_dataset_id}/view", response_model=DatasetViewOut)

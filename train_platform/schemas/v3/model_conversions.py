@@ -14,6 +14,7 @@ class ModelConversionPerfItem(BaseModel):
 
 class ModelConversionPerfOut(BaseModel):
     device: Optional[str] = None
+    onnx_provider: Optional[str] = None
     imgsz: Optional[int] = None
     pt: Optional[ModelConversionPerfItem] = None
     onnx: Optional[ModelConversionPerfItem] = None

@@ -6,7 +6,7 @@ import math
 import threading
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -569,6 +569,7 @@ class IllegalDatasetService:
         return stats
 
     def _dataset_with_statistics(self, db: Session, dataset: IllegalDataset) -> dict[str, Any]:
+        statistics = self._build_dataset_statistics(db, dataset)
         return {
             "illegal_dataset_id": int(dataset.illegal_dataset_id),
             "name": dataset.name,
@@ -579,8 +580,58 @@ class IllegalDatasetService:
             "active_version_id": dataset.active_version_id,
             "created_at": dataset.created_at,
             "updated_at": dataset.updated_at,
-            "statistics": self._build_dataset_statistics(db, dataset),
+            "statistics": statistics,
+            "preview_image_url": self._first_image_preview_url(db, dataset, statistics=statistics),
         }
+
+    def _first_image_preview_url(
+        self,
+        db: Session,
+        dataset: IllegalDataset,
+        *,
+        statistics: dict[str, Any] | None = None,
+    ) -> str | None:
+        if statistics is not None and int(
+            statistics.get("num_images") or statistics.get("total_images") or statistics.get("image_count") or 0
+        ) <= 0:
+            return None
+        version = self._active_version(db, dataset)
+        if not version:
+            return None
+
+        row = (
+            db.query(IllegalDatasetImage)
+            .filter(IllegalDatasetImage.version_id == int(version.version_id))
+            .order_by(IllegalDatasetImage.image_id.asc())
+            .first()
+        )
+        rel_path = str(getattr(row, "path", "") or "").strip() if row else ""
+
+        if not rel_path:
+            manifest = load_version_manifest(version)
+            if manifest:
+                paths = image_rel_paths_from_manifest(manifest)
+                rel_path = str(paths[0]).strip() if paths else ""
+
+        if not rel_path:
+            try:
+                snapshot_root = self._legacy_snapshot_root(version)
+                images = iter_image_files(snapshot_root)
+                first_image = images[0] if images else None
+                if first_image:
+                    rel_path = first_image.relative_to(snapshot_root).as_posix()
+            except Exception:
+                rel_path = ""
+
+        if not rel_path:
+            return None
+        return dataset_thumbnail_url(
+            "illegal",
+            int(dataset.illegal_dataset_id),
+            rel_path,
+            version_id=int(version.version_id),
+            size=int(settings.thumbnail_size or 200),
+        )
 
     def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[dict[str, Any]]:
         q = db.query(IllegalDataset)
@@ -1160,7 +1211,14 @@ class IllegalDatasetService:
         db.refresh(row)
         return row
 
-    def publish_standard_dataset(self, db: Session, illegal_dataset_id: int, *, obj: dict) -> dict[str, Any]:
+    def publish_standard_dataset(
+        self,
+        db: Session,
+        illegal_dataset_id: int,
+        *,
+        obj: dict,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         row = self.get_dataset(db, illegal_dataset_id)
         version = self._selected_version(db, row, version_id=obj.get("version_id"))
         mapping_rows = self.get_label_mappings(db, int(row.illegal_dataset_id))
@@ -1196,12 +1254,26 @@ class IllegalDatasetService:
         source_root = temp_dir / "illegal_source"
         processed_root = temp_dir / "standard_publish"
         try:
+            if callable(progress_callback):
+                progress_callback(
+                    "materializing",
+                    {
+                        "message": f"正在准备原始数据集版本 v{int(version.version)}",
+                    },
+                )
             manifest = load_version_manifest(version)
             if manifest:
                 materialize_manifest_to_dir(manifest, source_root, replace=True)
             else:
                 snapshot_root = self._legacy_snapshot_root(version)
                 materialize_snapshot_to_dir(snapshot_root, source_root, replace=True)
+            if callable(progress_callback):
+                progress_callback(
+                    "converting",
+                    {
+                        "message": "原始数据已准备完成，开始执行格式转换",
+                    },
+                )
             publish_result = IllegalDatasetPublishService().convert_dataset(
                 source_root,
                 processed_root,
@@ -1209,6 +1281,7 @@ class IllegalDatasetService:
                 label_filters=label_filters,
                 publish_config=obj.get("publish_config") or {},
                 split_config=obj.get("split") or {},
+                progress_callback=progress_callback,
             )
             publish_config["conversion_result"] = {
                 "pairs_total": int(publish_result.get("pairs_total", 0)),
@@ -1220,6 +1293,17 @@ class IllegalDatasetService:
                 "normalized_slice_config": publish_result.get("normalized_slice_config") or {},
             }
 
+            if callable(progress_callback):
+                progress_callback(
+                    "publishing",
+                    {
+                        "message": "转换完成，正在生成标准数据集",
+                        "processed": int(publish_result.get("pairs_processed", 0)),
+                        "completed": int(publish_result.get("pairs_total", 0)),
+                        "total": int(publish_result.get("pairs_total", 0)),
+                        "skipped": int(publish_result.get("pairs_skipped", 0)),
+                    },
+                )
             standard = StandardDatasetService().materialize_from_source_tree(
                 db,
                 name=str(obj.get("name") or "").strip(),

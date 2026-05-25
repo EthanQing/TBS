@@ -28,6 +28,33 @@ class InferenceResponse(BaseModel):
     inference_time_ms: Optional[float] = None
 
 
+class InferenceJobRequest(BaseModel):
+    job_id: str = Field(..., min_length=1)
+    mode: str = Field("image", min_length=1)
+    config_path: str = Field(..., min_length=1)
+    weights_path: str = Field(..., min_length=1)
+    input_tokens: list[str] = Field(default_factory=list)
+    video_token: Optional[str] = None
+    conf: float = 0.5
+    iou: float = 0.45
+    show_labels: bool = True
+    show_confidence: bool = True
+
+
+class VideoFrameSamplingRequest(BaseModel):
+    config_path: str = Field(..., min_length=1)
+    weights_path: str = Field(..., min_length=1)
+    video_token: str = Field(..., min_length=1)
+    frame_interval: int = Field(1, ge=1)
+    conf: float = 0.5
+    iou: float = 0.45
+
+
+class WorkerStatusResponse(BaseModel):
+    status: str
+    error: Optional[str] = None
+
+
 _CACHE_LOCK = threading.Lock()
 _INFER_LOCK = threading.Lock()
 _MODEL_CACHE: Dict[str, Tuple[Any, Dict[int, str]]] = {}
@@ -69,7 +96,9 @@ def _load_trainer(config_path: Path, weights_path: Path) -> Tuple[Any, Dict[int,
 
     cfg = load_config(str(config_path))
     try:
-        use_gpu = bool(getattr(paddle, "is_compiled_with_cuda", lambda: False)())
+        device_count = int(getattr(paddle.device.cuda, "device_count", lambda: 0)())
+        use_gpu = bool(getattr(paddle, "is_compiled_with_cuda", lambda: False)() and device_count > 0)
+        paddle.set_device("gpu:0" if use_gpu else "cpu")
         if isinstance(cfg, dict):
             cfg["use_gpu"] = use_gpu
         elif hasattr(cfg, "use_gpu"):
@@ -183,6 +212,87 @@ def run_inference(
         return InferenceResponse(error=f"{type(e).__name__}: {e}")
     dt_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     return InferenceResponse(output=output, inference_time_ms=dt_ms)
+
+
+@app.post("/internal/inference-jobs/run", response_model=WorkerStatusResponse)
+def start_inference_job(
+    req: InferenceJobRequest,
+    _: None = Depends(_verify_internal_auth),
+) -> WorkerStatusResponse:
+    status_path = settings.temp_dir / "inference_jobs" / str(req.job_id) / "status.json"
+    if not status_path.exists():
+        return WorkerStatusResponse(
+            status="error",
+            error=f"Job status is not visible to paddle inference worker: {status_path}",
+        )
+
+    config_path = Path(req.config_path)
+    if not config_path.exists() or not config_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Config not found: {config_path}")
+
+    weights_path = Path(req.weights_path)
+    if not weights_path.exists() or not weights_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Weights not found: {weights_path}")
+
+    try:
+        from train_platform.workers.inference_job_task import run_inference_job
+    except Exception as e:
+        return WorkerStatusResponse(status="error", error=f"Failed to import inference job runner: {type(e).__name__}: {e}")
+
+    def _infer_image(image_path: Path) -> Dict[str, Any]:
+        return _run_paddle_det(
+            config_path=config_path,
+            weights_path=weights_path,
+            image_path=image_path,
+            conf=float(req.conf),
+            iou=float(req.iou),
+        )
+
+    def _runner() -> None:
+        run_inference_job(
+            req.job_id,
+            mode=req.mode,
+            input_tokens=list(req.input_tokens or []),
+            video_token=req.video_token,
+            infer_image=_infer_image,
+            show_labels=bool(req.show_labels),
+            show_confidence=bool(req.show_confidence),
+        )
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    return WorkerStatusResponse(status="started")
+
+
+@app.post("/internal/inference/video-frames")
+def run_video_frame_sampling(
+    req: VideoFrameSamplingRequest,
+    _: None = Depends(_verify_internal_auth),
+) -> Dict[str, Any]:
+    config_path = Path(req.config_path)
+    if not config_path.exists() or not config_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Config not found: {config_path}")
+
+    weights_path = Path(req.weights_path)
+    if not weights_path.exists() or not weights_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Weights not found: {weights_path}")
+
+    from train_platform.workers.inference_job_task import run_video_frame_sampling as _run_sampling
+
+    def _infer_image(image_path: Path) -> Dict[str, Any]:
+        return _run_paddle_det(
+            config_path=config_path,
+            weights_path=weights_path,
+            image_path=image_path,
+            conf=float(req.conf),
+            iou=float(req.iou),
+        )
+
+    return _run_sampling(
+        video_token=req.video_token,
+        frame_interval=int(req.frame_interval),
+        infer_image=_infer_image,
+    )
 
 
 if __name__ == "__main__":

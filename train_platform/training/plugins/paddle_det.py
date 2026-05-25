@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import time
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
@@ -27,6 +28,7 @@ from train_platform.training.plugins.base import TrainContext
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
+from train_platform.utils.training_params import extract_selected_gpu_ids, normalize_device_spec
 
 
 # ---------------------------------------------------------------------------
@@ -267,16 +269,41 @@ def _patch_ppdet_training_stats() -> None:
         smoothed_value_cls.update = _safe_smoothed_update
 
     if training_stats_cls is not None and callable(getattr(training_stats_cls, "update", None)):
-        original_training_update = training_stats_cls.update
-
         def _safe_training_update(self: Any, stats: Any) -> Any:
             if not isinstance(stats, dict):
-                return original_training_update(self, stats)
-            normalized: Dict[str, Any] = {}
+                return None
+
+            meters = getattr(self, "meters", None)
+            if not isinstance(meters, dict):
+                window_size = int(getattr(self, "window_size", 20) or 20)
+                meters = {
+                    str(k): smoothed_value_cls(window_size)
+                    for k in stats.keys()
+                } if smoothed_value_cls is not None else {}
+                self.meters = meters
+
             for key, value in stats.items():
+                key_str = str(key)
+                meter = meters.get(key_str)
+                if meter is None and smoothed_value_cls is not None:
+                    meter = smoothed_value_cls(int(getattr(self, "window_size", 20) or 20))
+                    meters[key_str] = meter
+                if meter is None:
+                    continue
+
                 scalar = _coerce_metric_scalar(value)
-                normalized[key] = scalar if scalar is not None else value
-            return original_training_update(self, normalized)
+                if scalar is not None:
+                    meter.update(scalar)
+                    continue
+
+                try:
+                    meter.update(value.numpy())
+                except Exception:
+                    try:
+                        meter.update(value)
+                    except Exception:
+                        continue
+            return None
 
         training_stats_cls.update = _safe_training_update
 
@@ -310,6 +337,64 @@ def _patch_ppdet_training_stats() -> None:
         training_stats_cls.get = _safe_training_get
 
     ppdet_stats._train_platform_safe_stats_patch = True
+
+
+def _patch_ppdet_assigner_label_dtype() -> None:
+    """
+    Patch PaddleDetection assigners to avoid int32/int64 promotion crashes.
+
+    Some Paddle 2.6 + PaddleDetection 2.6 combinations yield `gt_labels` as
+    int32, while assigner internals produce int64 indices via `argmax()`.
+    A later `assigned_gt_index + batch_ind * num_max_boxes` then fails with a
+    type-promotion error. Casting `gt_labels` to int64 before calling the
+    original assigner forward keeps the downstream math consistent.
+    """
+    try:
+        import paddle
+        from ppdet.modeling.assigners import (
+            atss_assigner,
+            fcosr_assigner,
+            rotated_task_aligned_assigner,
+            task_aligned_assigner,
+            task_aligned_assigner_cr,
+        )
+    except Exception:
+        return
+
+    targets = [
+        getattr(atss_assigner, "ATSSAssigner", None),
+        getattr(fcosr_assigner, "FCOSRAssigner", None),
+        getattr(rotated_task_aligned_assigner, "RotatedTaskAlignedAssigner", None),
+        getattr(task_aligned_assigner, "TaskAlignedAssigner", None),
+        getattr(task_aligned_assigner_cr, "TaskAlignedAssigner_CR", None),
+    ]
+
+    def _needs_cast(tensor: Any) -> bool:
+        dtype = getattr(tensor, "dtype", None)
+        return dtype is not None and str(dtype).lower().endswith("int32")
+
+    for cls in targets:
+        if cls is None or getattr(cls, "_train_platform_safe_label_dtype_patch", False):
+            continue
+        original_forward = getattr(cls, "forward", None)
+        if not callable(original_forward):
+            continue
+
+        @wraps(original_forward)
+        def _safe_forward(self: Any, *args: Any, __orig=original_forward, **kwargs: Any) -> Any:
+            if "gt_labels" in kwargs and _needs_cast(kwargs.get("gt_labels")):
+                kwargs = {**kwargs, "gt_labels": paddle.cast(kwargs["gt_labels"], "int64")}
+                return __orig(self, *args, **kwargs)
+
+            if len(args) >= 3 and _needs_cast(args[2]):
+                new_args = list(args)
+                new_args[2] = paddle.cast(new_args[2], "int64")
+                return __orig(self, *tuple(new_args), **kwargs)
+
+            return __orig(self, *args, **kwargs)
+
+        cls.forward = _safe_forward
+        cls._train_platform_safe_label_dtype_patch = True
 
 
 def _bind_ppdet_dataset_cfg(cfg: dict, *, dataset_dir: str, train_json: Path, val_json: Path) -> None:
@@ -796,7 +881,12 @@ class PaddleDetTrainer:
                     cfg_path = (Path.cwd() / cfg_path).resolve(strict=False)
 
         if not cfg_path.exists():
-            raise ValidationError(f"PaddleDetection config not found: {cfg_path}")
+            raise ValidationError(
+                f"PaddleDetection config not found: {cfg_path}. "
+                f"The installed `paddledet` package does not bundle the official YAML config tree. "
+                f"Please clone PaddleDetection v2.6.x and set PADDLE_DET_DIR, "
+                f"or place the `configs/` directory under {settings.paddle_det_dir}."
+            )
 
         # ---- Dataset: YOLO → COCO ----
         data_yaml = find_yolo_dataset_yaml(ctx.dataset_path)
@@ -873,6 +963,7 @@ class PaddleDetTrainer:
 
         _apply_download_patches()
         _patch_ppdet_training_stats()
+        _patch_ppdet_assigner_label_dtype()
 
         cfg = load_config(str(cfg_path))
 
@@ -1021,13 +1112,13 @@ class PaddleDetTrainer:
                 pretrain_weights = str(pretrained_model_path)
 
         # ---- Device ----
-        device_value = str(getattr(job.parameters, "device", "auto") or "auto").strip().lower()
+        requested_device_value = normalize_device_spec(getattr(job.parameters, "device", "auto") or "auto")
+        device_value = normalize_device_spec(os.getenv("TRAIN_PLATFORM_DEVICE_RUNTIME") or requested_device_value)
+        selected_gpu_ids = extract_selected_gpu_ids(device_value)
         use_gpu = True
         if device_value == "cpu":
             use_gpu = False
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        elif device_value not in ("auto", "", "default"):
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_value.replace("cuda:", "")
 
         try:
             if use_gpu and not paddle.is_compiled_with_cuda():
@@ -1039,7 +1130,18 @@ class PaddleDetTrainer:
 
         # Also set device via paddle API (more reliable in newer versions)
         try:
-            paddle.set_device("gpu" if use_gpu else "cpu")
+            paddle_device = "cpu"
+            if use_gpu:
+                paddle_device = f"gpu:{selected_gpu_ids[0]}" if selected_gpu_ids else "gpu"
+            paddle.set_device(paddle_device)
+            print(
+                "[paddle_det] runtime device "
+                f"requested={requested_device_value} "
+                f"runtime={device_value} "
+                f"paddle_device={paddle_device} "
+                f"cuda_visible_devices={os.getenv('CUDA_VISIBLE_DEVICES', '<inherit>')}",
+                flush=True,
+            )
         except Exception:
             pass
 

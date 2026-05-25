@@ -21,6 +21,8 @@ def _enum_value(value: Any) -> str:
 
 
 def _as_number(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
     try:
         n = float(value)
     except Exception:

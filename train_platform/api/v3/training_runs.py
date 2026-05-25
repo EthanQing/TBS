@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, Query, HTTPException
 from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 import requests
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -271,8 +272,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
         raise ValidationError("Weights not found")
 
     if fmt == "pt":
-        rel = src_weights.relative_to(settings.training_dir).as_posix()
-        url = f"/static/training/{rel}"
+        url = f"/api/v3/training-runs/{run.run_id}/export/download?format=pt&weights={weights}"
         return TrainingRunExportOut(run_id=str(run.run_id), format=fmt, weights=weights, download_url=url, artifact=None)
 
     # fmt == onnx
@@ -350,13 +350,44 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
     db.commit()
     db.refresh(art)
 
-    url = f"/static/training/{rel}"
+    url = f"/api/v3/training-runs/{run.run_id}/export/download?format=onnx&weights={weights}"
     return TrainingRunExportOut(
         run_id=str(run.run_id),
         format=fmt,
         weights=weights,
         download_url=url,
         artifact=TrainingRunArtifactOut.model_validate(art),
+    )
+
+
+@router.get("/{run_id}/export/download")
+def download_training_run_export(
+    run_id: str,
+    format: str = Query("pt", description="pt | onnx"),
+    weights: str = Query("best", description="best | last"),
+    db: Session = Depends(get_db),
+):
+    run = TrainingRunService().get_run(db, run_id)
+
+    fmt = str(format or "pt").strip().lower()
+    weights_key = str(weights or "best").strip().lower()
+    if fmt not in ("pt", "onnx"):
+        raise ValidationError("Unsupported export format")
+    if weights_key not in ("best", "last"):
+        raise ValidationError("weights must be 'best' or 'last'")
+
+    weights_dir = (settings.training_dir / str(run.run_id) / "weights").resolve(strict=False)
+    ext = "onnx" if fmt == "onnx" else "pt"
+    out_path = (weights_dir / f"{weights_key}.{ext}").resolve(strict=False)
+    if settings.training_dir.resolve() not in out_path.parents:
+        raise ValidationError("Unsafe export path")
+    if not out_path.exists() or not out_path.is_file():
+        raise NotFoundError(f"Export file not found: {out_path.name}")
+
+    return FileResponse(
+        path=str(out_path),
+        filename=out_path.name,
+        media_type="application/octet-stream",
     )
 
 
