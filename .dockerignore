@@ -35,5 +35,8 @@ htmlcov/
 *.tmp
 .env
 .env.*
+license/
+secrets/
+.tmp_*/
 *.md
 !README.md

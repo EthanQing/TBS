@@ -7,6 +7,8 @@
 .env.local
 *.key
 *.pem
+license/*.dat
+secrets/
 
 # --- Python 基础 ---
 **/__pycache__/
@@ -30,6 +32,7 @@ runs/
 PaddleDetection/
 *.log
 *.json
+.tmp_*/
 
 # --- IDE 配置 (个人配置不应提交) ---
 .vscode/

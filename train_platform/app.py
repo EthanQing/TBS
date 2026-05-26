@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from train_platform.api.v3 import router as api_router
 from train_platform.core.config import settings
+from train_platform.core.license import assert_valid_license
 from train_platform.db.init_db import init_db
 from train_platform.db.session import SessionLocal
 from train_platform.services.v3.dataset_upload_service import DatasetUploadService
@@ -23,6 +24,7 @@ logger = logging.getLogger("train_platform")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.ensure_dirs()
+    assert_valid_license()
     try:
         init_db()
     except Exception as e:

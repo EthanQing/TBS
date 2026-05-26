@@ -1,5 +1,36 @@
+# syntax=docker/dockerfile:1.7
+
+# Build protected runtime sources. API/schema/migration code remains readable for
+# framework reflection; services/workers are protected by PyArmor by default.
+FROM python:3.10-slim-bookworm AS source-protector
+
+ARG SOURCE_PROTECTION_MODE=pyarmor
+ARG PYARMOR_VERSION=8.5.12
+ARG PYARMOR_PLATFORM=
+ARG ALLOW_SOURCE_PROTECTION_FALLBACK=1
+
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /build
+
+RUN if [ "$SOURCE_PROTECTION_MODE" = "pyarmor" ]; then \
+        pip install --no-cache-dir "pyarmor==${PYARMOR_VERSION}"; \
+    fi
+
+COPY train_platform/ ./train_platform/
+
+RUN --mount=type=secret,id=pyarmor_reg,required=false \
+    set -eux; \
+    if [ "$SOURCE_PROTECTION_MODE" = "pyarmor" ] && [ -f /run/secrets/pyarmor_reg ]; then \
+        pyarmor reg /run/secrets/pyarmor_reg; \
+    fi; \
+    python -m train_platform.core.build_protected_runtime \
+        --output /protected-runtime \
+        --mode "$SOURCE_PROTECTION_MODE" \
+        --pyarmor-platform "$PYARMOR_PLATFORM" \
+        --allow-fallback "$ALLOW_SOURCE_PROTECTION_FALLBACK"
+
 # YOLO training/inference worker image (PyTorch + Ultralytics).
-# The application source is copied directly; no Cython build/encryption step is used.
 FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -7,6 +38,8 @@ ENV PYTHONUNBUFFERED=1
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV PYTHONUTF8=1
+ENV TRAIN_PLATFORM_LICENSE_REQUIRED=1
+ENV TRAIN_PLATFORM_LICENSE_PATH=/app/license/license.dat
 
 RUN set -eux; \
     apt-get update; \
@@ -18,10 +51,15 @@ WORKDIR /app
 COPY requirements/ ./requirements/
 RUN pip install --no-cache-dir -r requirements/worker.yolo.txt
 
-COPY train_platform/ ./train_platform/
+COPY --from=source-protector /protected-runtime/ ./
 COPY alembic.ini .
 
 RUN mkdir -p /app/datasets /app/datasets/.uploads /app/datasets/.staging /app/imports /app/training_runs /app/temp
+RUN --mount=type=secret,id=train_platform_license,required=false \
+    mkdir -p /app/license && \
+    if [ -f /run/secrets/train_platform_license ]; then \
+        cp /run/secrets/train_platform_license /app/license/license.dat; \
+    fi
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

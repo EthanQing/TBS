@@ -5,6 +5,9 @@ echo "======================================"
 echo "  Train Platform Backend starting..."
 echo "======================================"
 
+echo "Checking offline license..."
+python3 -c "from train_platform.core.license import assert_valid_license; assert_valid_license()"
+
 # Wait for MySQL to be ready when MYSQL_HOST is configured.
 if [ -n "$MYSQL_HOST" ]; then
     echo "Waiting for MySQL ($MYSQL_HOST:${MYSQL_PORT:-3306})..."
