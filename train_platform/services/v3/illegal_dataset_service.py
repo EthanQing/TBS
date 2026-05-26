@@ -65,6 +65,7 @@ from train_platform.services.v3.illegal_dataset_cas import (
     write_manifest,
 )
 from train_platform.services.v3.illegal_dataset_publish_service import IllegalDatasetPublishService
+from train_platform.services.v3.mounted_dataset_service import load_mounted_manifest, link_source_tree, resolve_dataset_file
 from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
@@ -211,7 +212,11 @@ class IllegalDatasetService:
             image_paths = image_rel_paths_from_manifest(manifest)
         else:
             root = resolve_storage_token(str(version.snapshot_path or dataset.storage_path))
-            image_paths = [image_path.relative_to(root).as_posix() for image_path in iter_image_files(root)]
+            mounted = load_mounted_manifest(root)
+            if mounted and isinstance(mounted.get("image_paths"), list):
+                image_paths = [str(item).strip().replace("\\", "/").strip("/") for item in mounted.get("image_paths") or [] if str(item).strip()]
+            else:
+                image_paths = [image_path.relative_to(root).as_posix() for image_path in iter_image_files(root)]
         for rel in image_paths:
             db.add(
                 IllegalDatasetImage(
@@ -800,6 +805,79 @@ class IllegalDatasetService:
             db.refresh(row)
             return row
 
+    def import_mounted_source_tree(
+        self,
+        db: Session,
+        illegal_dataset_id: int,
+        source_root: Path,
+        *,
+        message: str | None = None,
+        created_by: str | None = None,
+        append: bool = False,
+        filename: str | None = None,
+    ) -> IllegalDataset:
+        row = self.get_dataset(db, illegal_dataset_id)
+        with self._dataset_lock(int(row.illegal_dataset_id)):
+            latest = self.version_repo.get_latest(db, int(row.illegal_dataset_id))
+            version_no = int(latest.version) + 1 if latest else 1
+            parent_version_id = int(latest.version_id) if latest and append else None
+            version_root = self._version_root(int(row.illegal_dataset_id), version_no)
+            active_root = self._root_path(row)
+            try:
+                remove_tree(version_root)
+            except Exception:
+                pass
+            version_root.mkdir(parents=True, exist_ok=True)
+            manifest = link_source_tree(version_root, Path(source_root), prefer_yolo=True)
+            stats = build_statistics(version_root, image_count=int(manifest.get("image_count") or 0))
+            version_row = IllegalDatasetVersion(
+                illegal_dataset_id=int(row.illegal_dataset_id),
+                version=version_no,
+                parent_version_id=parent_version_id,
+                status=DatasetVersionStatus.FINALIZED,
+                message=message,
+                snapshot_path=to_storage_token(version_root),
+                manifest_path=None,
+                file_count=int(stats.get("total_files") or 0),
+                size_bytes=int(stats.get("total_size_bytes") or 0),
+                meta={
+                    "source_type": "mounted_dir_link",
+                    "source_root": str(Path(source_root).resolve(strict=False)),
+                    "format": manifest.get("format"),
+                    "link_type": manifest.get("link_type"),
+                    "image_count": int(manifest.get("image_count") or 0),
+                    "filename": str(filename or ""),
+                    "append": bool(append),
+                    "append_semantics": "new_mounted_version",
+                },
+                created_by=created_by,
+            )
+            db.add(version_row)
+            db.flush()
+            row.active_version_id = int(version_row.version_id)
+            try:
+                remove_tree(active_root)
+            except Exception:
+                pass
+            active_root.mkdir(parents=True, exist_ok=True)
+            link_source_tree(active_root, Path(source_root), prefer_yolo=True)
+            self._index_version_images(db, row, version_row)
+            self._refresh_version_raw_labels_cache(row, version_row, root=version_root)
+            self._refresh_version_statistics_cache(db, row, version_row, root=version_root)
+            self._refresh_version_view_index_cache(db, row, version_row, snapshot_root=version_root)
+            self._add_event(
+                db,
+                int(row.illegal_dataset_id),
+                "mounted_appended" if append else "mounted_imported",
+                version_id=int(version_row.version_id),
+                message="Illegal dataset imported from mounted directory",
+                created_by=created_by,
+                data={**(version_row.meta or {}), "version": version_no},
+            )
+            db.commit()
+            db.refresh(row)
+            return row
+
     def activate_version(self, db: Session, illegal_dataset_id: int, version_id: int) -> IllegalDataset:
         row = self.get_dataset(db, illegal_dataset_id)
         with self._dataset_lock(int(row.illegal_dataset_id)):
@@ -814,7 +892,17 @@ class IllegalDatasetService:
                 replace_dir_from_manifest(manifest, self._root_path(row))
             else:
                 snapshot_root = self._legacy_snapshot_root(version)
-                replace_dir_from_snapshot(snapshot_root, self._root_path(row))
+                if str((version.meta or {}).get("source_type") or "") == "mounted_dir_link":
+                    source_root = Path(str((version.meta or {}).get("source_root") or ""))
+                    active_root = self._root_path(row)
+                    try:
+                        remove_tree(active_root)
+                    except Exception:
+                        pass
+                    active_root.mkdir(parents=True, exist_ok=True)
+                    link_source_tree(active_root, source_root, prefer_yolo=True)
+                else:
+                    replace_dir_from_snapshot(snapshot_root, self._root_path(row))
             row.active_version_id = int(version.version_id)
             self._add_event(
                 db,
@@ -1075,6 +1163,8 @@ class IllegalDatasetService:
         if manifest:
             return manifest_cas_file_path(manifest, file_path, required=True)
         snapshot_root = self._legacy_snapshot_root(version)
+        if str((version.meta or {}).get("source_type") or "") == "mounted_dir_link":
+            return resolve_dataset_file(snapshot_root, file_path)
         return legacy_snapshot_file_path(snapshot_root, file_path)
 
     def upload_images(

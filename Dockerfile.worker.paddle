@@ -4,6 +4,9 @@ FROM paddlepaddle/paddle:2.6.2-gpu-cuda11.7-cudnn8.4-trt8.4
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONUTF8=1
 
 RUN set -eux; \
     apt-get update; \

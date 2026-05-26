@@ -4,6 +4,9 @@ FROM python:3.10-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONUTF8=1
 
 # Runtime deps: mysql client for health/entrypoint checks.
 # (Retry to tolerate occasional transient 5xx responses from Debian mirrors.)

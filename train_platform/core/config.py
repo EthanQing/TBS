@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -21,6 +22,33 @@ def _csv_env(name: str, default: str = "") -> Tuple[str, ...]:
         return tuple()
     items = [x.strip() for x in str(raw).split(",")]
     return tuple(x for x in items if x)
+
+
+def _path_list_env(name: str) -> Tuple[str, ...]:
+    raw = os.getenv(name, "")
+    if raw is None:
+        return tuple()
+    # Use comma / semicolon separators. Avoid splitting on ":" because Windows
+    # drive names use it.
+    normalized = str(raw).replace("\n", ";")
+    for sep in (",", ";"):
+        normalized = normalized.replace(sep, ";")
+    return tuple(x.strip() for x in normalized.split(";") if x.strip())
+
+
+def _ensure_mysql_charset(url: str) -> str:
+    value = str(url or "")
+    if not value.lower().startswith("mysql"):
+        return value
+    try:
+        parts = urlsplit(value)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        if "charset" not in {key.lower(): key for key in query}:
+            query["charset"] = "utf8mb4"
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    except Exception:
+        joiner = "&" if "?" in value else "?"
+        return f"{value}{joiner}charset=utf8mb4"
 
 
 @dataclass(frozen=True)
@@ -62,6 +90,18 @@ class Settings:
     standard_dataset_id_start: int = max(1, int(os.getenv("STANDARD_DATASET_ID_START", "2000000") or "2000000"))
 
     @property
+    def dataset_import_roots(self) -> Tuple[Path, ...]:
+        roots: list[Path] = [self.imports_dir.resolve()]
+        for raw in _path_list_env("DATASET_IMPORT_ROOTS"):
+            try:
+                root = Path(raw).expanduser().resolve(strict=False)
+            except Exception:
+                continue
+            if root not in roots:
+                roots.append(root)
+        return tuple(roots)
+
+    @property
     def thumbnails_dir(self) -> Path:
         # Keep thumbnails under the datasets root so they can be managed together.
         return (self.datasets_dir / ".thumbnails").resolve()
@@ -69,8 +109,8 @@ class Settings:
     @property
     def database_url(self) -> str:
         if self.database_url_override:
-            return str(self.database_url_override)
-        return (
+            return _ensure_mysql_charset(str(self.database_url_override))
+        return _ensure_mysql_charset(
             f"mysql+pymysql://{self.mysql_user}:{self.mysql_password}"
             f"@{self.mysql_host}:{self.mysql_port}/{self.mysql_database}"
         )

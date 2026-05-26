@@ -8,6 +8,7 @@ from train_platform.api.deps import get_db
 from train_platform.models.v3.illegal_dataset import IllegalDatasetVersion
 from train_platform.services.v3.illegal_dataset_cas import load_version_manifest, manifest_cas_file_path
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
+from train_platform.services.v3.mounted_dataset_service import resolve_mounted_file
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.exceptions import NotFoundError
@@ -53,9 +54,13 @@ def get_thumbnail(
             elif ver.snapshot_path:
                 root_token = ver.snapshot_path
                 cache_prefix = f"v{int(ver.version_id)}"
+                dataset_root = resolve_dataset_path(root_token).resolve(strict=False)
+                source_path = resolve_mounted_file(dataset_root, file_path)
     elif kind == "standard":
         ds = StandardDatasetService().get_dataset(db, int(dataset_id))
         root_token = ds.storage_path
+        dataset_root = resolve_dataset_path(root_token).resolve(strict=False)
+        source_path = resolve_mounted_file(dataset_root, file_path)
     else:
         raise NotFoundError("Unknown dataset kind")
 

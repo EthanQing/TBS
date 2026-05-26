@@ -20,6 +20,7 @@ from train_platform.core.config import settings
 from train_platform.models.v3.enums import DatasetSplit
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.utils.zip_encoding import safe_zip_member_relpath
 
 try:
     from PIL import Image
@@ -104,6 +105,8 @@ def unpack_uploaded_archive(upload, destination: Path) -> Path:
     temp_archive = save_upload_to_temp(upload, suffix=suffix)
     destination.mkdir(parents=True, exist_ok=True)
     try:
+        if suffix.lower() == ".zip":
+            return safe_extract_zip(temp_archive, destination)
         shutil.unpack_archive(str(temp_archive), str(destination))
     except Exception as exc:
         raise ValidationError(f"Unsupported or invalid archive: {exc}") from exc
@@ -125,19 +128,29 @@ def safe_extract_zip(archive_path: Path, destination: Path) -> Path:
     dest_root = destination.resolve(strict=False)
     try:
         with zipfile.ZipFile(archive) as zf:
+            members: list[tuple[zipfile.ZipInfo, Path]] = []
+            seen: set[str] = set()
             for info in zf.infolist():
-                raw_name = str(info.filename or "").replace("\\", "/")
-                if not raw_name or raw_name.startswith("/"):
-                    raise ValidationError("ZIP contains an unsafe absolute path")
-                rel = Path(raw_name)
-                if rel.is_absolute() or ".." in rel.parts or (len(rel.parts) > 0 and ":" in rel.parts[0]):
-                    raise ValidationError("ZIP contains an unsafe path")
+                rel = safe_zip_member_relpath(info)
+                key = rel.as_posix().lower() if os.name == "nt" else rel.as_posix()
+                if key in seen and not info.is_dir():
+                    raise ValidationError("ZIP contains duplicate file paths")
+                seen.add(key)
                 target = (dest_root / rel).resolve(strict=False)
                 try:
                     target.relative_to(dest_root)
                 except Exception as exc:
                     raise ValidationError("ZIP contains a path outside destination") from exc
-            zf.extractall(dest_root)
+                members.append((info, rel))
+
+            for info, rel in members:
+                target = (dest_root / rel).resolve(strict=False)
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
     except ValidationError:
         raise
     except Exception as exc:

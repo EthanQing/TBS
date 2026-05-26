@@ -6,6 +6,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 import yaml
 from sqlalchemy import func
@@ -42,6 +43,11 @@ from train_platform.services.v3.dataset_common import (
     write_cached_view_index,
 )
 from train_platform.services.v3.file_service import FileService
+from train_platform.services.v3.mounted_dataset_service import (
+    load_mounted_manifest,
+    link_source_tree,
+    resolve_dataset_file,
+)
 from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
@@ -80,6 +86,25 @@ class StandardDatasetService:
         db.query(StandardDatasetImage).filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id)).delete()
         for image_path in iter_image_files(root):
             rel = image_path.relative_to(root).as_posix()
+            db.add(
+                StandardDatasetImage(
+                    standard_dataset_id=int(dataset.standard_dataset_id),
+                    path=rel,
+                    split=detect_split_from_relpath(rel),
+                )
+            )
+        db.flush()
+
+    def _index_mounted_images(self, db: Session, dataset: StandardDataset, root: Path) -> None:
+        manifest = load_mounted_manifest(root) or {}
+        rel_paths = manifest.get("image_paths") if isinstance(manifest, dict) else []
+        if not isinstance(rel_paths, list):
+            rel_paths = []
+        db.query(StandardDatasetImage).filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id)).delete()
+        for raw_rel in rel_paths:
+            rel = str(raw_rel or "").strip().replace("\\", "/").strip("/")
+            if not rel:
+                continue
             db.add(
                 StandardDatasetImage(
                     standard_dataset_id=int(dataset.standard_dataset_id),
@@ -216,12 +241,12 @@ class StandardDatasetService:
                         rel = str(row[0] or "").strip().replace("\\", "/").lstrip("/")
                         if not rel:
                             continue
-                        abs_path = (dataset_root / rel).resolve(strict=False)
-                        if abs_path != dataset_root and dataset_root not in abs_path.parents:
+                        virtual_path = dataset_root / rel
+                        try:
+                            resolve_dataset_file(dataset_root, rel)
+                        except Exception:
                             continue
-                        if not abs_path.exists():
-                            continue
-                        f.write(abs_path.as_posix() + "\n")
+                        f.write(virtual_path.as_posix() + "\n")
                         count += 1
                 tmp_path.replace(out_path)
             finally:
@@ -543,6 +568,61 @@ class StandardDatasetService:
         finally:
             shutil.rmtree(materialized, ignore_errors=True)
 
+    def import_mounted_source_tree(
+        self,
+        db: Session,
+        standard_dataset_id: int,
+        source_root: Path,
+        *,
+        created_by: str | None = None,
+        filename: str | None = None,
+    ) -> StandardDataset:
+        row = self.get_dataset(db, standard_dataset_id)
+        root = self._root_path(row)
+        existing_files, _ = count_tree(root)
+        if existing_files > 0:
+            raise ConflictError("Standard dataset content is immutable after upload")
+
+        yolo_root = self._resolve_uploaded_yolo_root(Path(source_root))
+        linked_source = yolo_root if yolo_root is not None else Path(source_root)
+        staging_parent = settings.dataset_staging_dir / "standard"
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        materialized = staging_parent / f"{int(row.standard_dataset_id)}-linked-{uuid.uuid4().hex}"
+        try:
+            materialized.mkdir(parents=True, exist_ok=True)
+            manifest = link_source_tree(materialized, linked_source, prefer_yolo=yolo_root is not None)
+            clear_directory(root)
+            for item in materialized.iterdir():
+                shutil.move(str(item), str(root / item.name))
+            row.source_type = "mounted_dir_link"
+            row.publish_config = {
+                **(row.publish_config or {}),
+                "mounted_import": {
+                    "source_root": str(Path(source_root).resolve(strict=False)),
+                    "linked_source": str(Path(linked_source).resolve(strict=False)),
+                    "format": manifest.get("format"),
+                    "link_type": manifest.get("link_type"),
+                    "image_count": int(manifest.get("image_count") or 0),
+                    "filename": str(filename or ""),
+                },
+            }
+            self._index_mounted_images(db, row, root)
+            self._refresh_dataset_statistics_cache(db, row)
+            self._refresh_dataset_view_index_cache(db, row)
+            self._add_event(
+                db,
+                int(row.standard_dataset_id),
+                "mounted_imported",
+                message="Standard dataset imported from mounted directory",
+                created_by=created_by,
+                data=row.publish_config.get("mounted_import"),
+            )
+            db.commit()
+            db.refresh(row)
+            return row
+        finally:
+            shutil.rmtree(materialized, ignore_errors=True)
+
     def split_dataset(
         self,
         db: Session,
@@ -716,7 +796,9 @@ class StandardDatasetService:
             page=page,
             page_size=page_size,
             class_id=class_id,
-            file_url_builder=lambda rel_path: static_dataset_url(row.storage_path, rel_path),
+            file_url_builder=lambda rel_path: (
+                f"/api/v3/standard-datasets/{int(row.standard_dataset_id)}/file/{quote(str(rel_path).replace(chr(92), '/'), safe='/')}"
+            ),
             thumbnail_url_builder=lambda rel_path: dataset_thumbnail_url(
                 "standard",
                 int(row.standard_dataset_id),
@@ -728,6 +810,10 @@ class StandardDatasetService:
     def get_image_annotations(self, db: Session, standard_dataset_id: int, *, image_path: str) -> dict[str, Any]:
         row = self.get_dataset(db, standard_dataset_id)
         return build_annotations_payload(self._root_path(row), row.storage_path, image_path)
+
+    def get_file_path(self, db: Session, standard_dataset_id: int, file_path: str) -> Path:
+        row = self.get_dataset(db, standard_dataset_id)
+        return resolve_dataset_file(self._root_path(row), file_path)
 
     def list_files(self, db: Session, standard_dataset_id: int, *, page: int = 1, page_size: int = 100) -> tuple[list[dict[str, Any]], int]:
         row = self.get_dataset(db, standard_dataset_id)

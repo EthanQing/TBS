@@ -16,7 +16,9 @@ class DatasetUploadSessionCreate(BaseModel):
 
 class DatasetImportFromPathRequest(BaseModel):
     path: str
+    root_id: str = "default"
     mode: str = "upload"
+    storage_strategy: str = "copy"
     created_by: str | None = None
     message: str | None = None
 

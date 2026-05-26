@@ -18,6 +18,7 @@ from train_platform.models.v3.enums import DatasetType
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.image_exts import IMAGE_EXTS
 from train_platform.utils.exceptions import ConflictError, ValidationError
+from train_platform.utils.zip_encoding import safe_zip_member_relpath
 
 
 class FileService:
@@ -414,16 +415,11 @@ class FileService:
         # Pre-validate and detect duplicates (case-insensitive on Windows).
         seen: dict[str, str] = {}
         dir_rels: set[Path] = set()
-        file_names: list[str] = []
+        file_members: list[tuple[zipfile.ZipInfo, Path]] = []
+        target_root = target_dir.resolve(strict=False)
 
         for info in infos:
-            name = str(info.filename or "")
-            if not name:
-                continue
-
-            rel = Path(name.replace("\\", "/"))
-            if rel.is_absolute() or ".." in rel.parts:
-                raise ValidationError("Unsafe zip content path.")
+            rel = safe_zip_member_relpath(info)
 
             key = rel.as_posix()
             if is_windows:
@@ -436,8 +432,8 @@ class FileService:
                 raise ConflictError(f"Duplicate path in zip: {rel.as_posix()}")
             seen[key] = cur_type
 
-            dest = (target_dir / rel).resolve(strict=False)
-            if target_dir not in dest.parents and dest != target_dir:
+            dest = (target_root / rel).resolve(strict=False)
+            if target_root not in dest.parents and dest != target_root:
                 raise ValidationError("Unsafe zip extraction path.")
 
             if info.is_dir():
@@ -446,7 +442,7 @@ class FileService:
 
             if rel.parent and str(rel.parent) not in (".", ""):
                 dir_rels.add(rel.parent)
-            file_names.append(name)
+            file_members.append((info, rel))
 
         # Batch mkdir to reduce repeated directory creation work.
         for drel in sorted(dir_rels, key=lambda p: (len(p.parts), p.as_posix())):
@@ -454,7 +450,7 @@ class FileService:
                 continue
             (target_dir / drel).mkdir(parents=True, exist_ok=True)
 
-        total = len(file_names)
+        total = len(file_members)
         if total <= 0:
             return
 
@@ -483,16 +479,14 @@ class FileService:
             and Path(zip_path_str).exists()
         )
 
-        def _chunks(seq: list[str], n: int) -> list[list[str]]:
+        def _chunks(seq: list[tuple[zipfile.ZipInfo, Path]], n: int) -> list[list[tuple[zipfile.ZipInfo, Path]]]:
             if n <= 0:
                 return [seq]
             return [seq[i : i + n] for i in range(0, len(seq), n)]
 
         if not can_parallel:
-            for name in file_names:
-                info = zip_ref.getinfo(name)
-                rel = Path(str(info.filename or "").replace("\\", "/"))
-                dest = (target_dir / rel).resolve(strict=False)
+            for info, rel in file_members:
+                dest = (target_root / rel).resolve(strict=False)
                 if dest.exists():
                     raise ConflictError(f"Duplicate file path in zip: {rel.as_posix()}")
                 with zip_ref.open(info) as src, open(dest, "wb") as dst:
@@ -502,20 +496,18 @@ class FileService:
         chunk_size = int(os.getenv("ZIP_EXTRACT_CHUNK_SIZE", "128"))
         chunk_size = max(16, min(chunk_size, 2048))
 
-        def _extract_chunk(names: list[str]) -> int:
+        def _extract_chunk(members: list[tuple[zipfile.ZipInfo, Path]]) -> int:
             assert isinstance(zip_path_str, str)  # for mypy
             with zipfile.ZipFile(zip_path_str, "r") as zf:
-                for name in names:
-                    info = zf.getinfo(name)
-                    rel = Path(str(info.filename or "").replace("\\", "/"))
-                    dest = (target_dir / rel).resolve(strict=False)
+                for info, rel in members:
+                    dest = (target_root / rel).resolve(strict=False)
                     if dest.exists():
                         raise ConflictError(f"Duplicate file path in zip: {rel.as_posix()}")
                     with zf.open(info) as src, open(dest, "wb") as dst:
                         shutil.copyfileobj(src, dst, length=bufsize)
-            return len(names)
+            return len(members)
 
-        chunks = _chunks(file_names, chunk_size)
+        chunks = _chunks(file_members, chunk_size)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [ex.submit(_extract_chunk, c) for c in chunks]
             for fut in concurrent.futures.as_completed(futures):

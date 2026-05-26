@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
 from train_platform.models.v3.dataset_upload import DatasetUploadSession, DatasetUploadTask
+from train_platform.services.v3.dataset_import_service import DatasetImportService
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
@@ -300,27 +301,29 @@ class DatasetUploadService:
         dataset_kind: str,
         dataset_id: int,
         *,
+        root_id: str = "default",
         rel_path: str,
         mode: str = "upload",
+        storage_strategy: str = "copy",
         created_by: str | None = None,
         message: str | None = None,
     ) -> DatasetUploadTask:
         kind = self._validate_kind(dataset_kind)
         mode = self._validate_mode(kind, mode)
         self._ensure_dataset_exists(db, kind, int(dataset_id))
-        raw_rel = Path(str(rel_path or "").replace("\\", "/"))
-        if not str(raw_rel) or raw_rel.is_absolute() or ".." in raw_rel.parts:
-            raise ValidationError("Invalid import path")
-        source = (settings.imports_dir / raw_rel).resolve(strict=False)
-        try:
-            source.relative_to(settings.imports_dir.resolve())
-        except Exception as exc:
-            raise ValidationError("Import path must be inside imports directory") from exc
+        strategy = str(storage_strategy or "copy").strip().lower()
+        if strategy not in {"copy", "link"}:
+            raise ValidationError("storage_strategy must be copy or link")
+        _root_key, _root, source, _root_out = DatasetImportService().resolve_path(root_id, rel_path)
         if not source.exists():
             raise NotFoundError("Import path not found")
         source_type = "dir" if source.is_dir() else "zip"
         if source_type == "zip" and source.suffix.lower() != ".zip":
             raise ValidationError("Import file must be a ZIP archive or a directory")
+        if strategy == "link":
+            if source_type != "dir":
+                raise ValidationError("Linked import only supports directories")
+            source_type = "dir_link"
         task = self._create_task(
             db,
             dataset_kind=kind,
@@ -351,7 +354,16 @@ class DatasetUploadService:
                 logger.info("Dataset upload task started task_id=%s session_id=%s", task.task_id, task.session_id)
                 if task.dataset_kind == "standard":
                     service = StandardDatasetService()
-                    if task.source_type == "dir":
+                    if task.source_type == "dir_link":
+                        self._update_task(db, task, status="linking", stage="linking", progress=30)
+                        service.import_mounted_source_tree(
+                            db,
+                            int(task.dataset_id),
+                            source,
+                            created_by=task.created_by,
+                            filename=source.name,
+                        )
+                    elif task.source_type == "dir":
                         self._update_task(db, task, status="validating", stage="validating", progress=30)
                         service.import_source_tree(
                             db,
@@ -370,7 +382,18 @@ class DatasetUploadService:
                         )
                 else:
                     service = IllegalDatasetService()
-                    if task.source_type == "dir":
+                    if task.source_type == "dir_link":
+                        self._update_task(db, task, status="linking", stage="linking", progress=30)
+                        service.import_mounted_source_tree(
+                            db,
+                            int(task.dataset_id),
+                            source,
+                            message=task.message,
+                            created_by=task.created_by,
+                            append=(task.mode == "append"),
+                            filename=source.name,
+                        )
+                    elif task.source_type == "dir":
                         self._update_task(db, task, status="validating", stage="validating", progress=30)
                         service.import_source_tree(
                             db,

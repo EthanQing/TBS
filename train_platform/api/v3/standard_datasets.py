@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import mimetypes
+
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
@@ -158,8 +161,10 @@ def import_standard_dataset_from_path(
         db,
         "standard",
         standard_dataset_id,
+        root_id=payload.root_id,
         rel_path=payload.path,
         mode=payload.mode,
+        storage_strategy=payload.storage_strategy,
         created_by=payload.created_by,
         message=payload.message,
     )
@@ -235,6 +240,17 @@ def get_standard_dataset_image_annotations(
 @router.get("/{standard_dataset_id}/statistics", response_model=DatasetStatisticsOut)
 def get_standard_dataset_statistics(standard_dataset_id: int, db: Session = Depends(get_db)):
     return svc.get_statistics(db, standard_dataset_id)
+
+
+@router.get("/{standard_dataset_id}/file/{file_path:path}")
+def get_standard_dataset_file(
+    standard_dataset_id: int,
+    file_path: str,
+    db: Session = Depends(get_db),
+):
+    path = svc.get_file_path(db, standard_dataset_id, file_path)
+    media_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    return FileResponse(path=str(path), media_type=media_type)
 
 
 @router.get("/{standard_dataset_id}/files", response_model=Page[DatasetFileOut])

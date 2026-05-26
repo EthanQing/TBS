@@ -186,8 +186,10 @@ def import_illegal_dataset_from_path(
         db,
         "illegal",
         illegal_dataset_id,
+        root_id=payload.root_id,
         rel_path=payload.path,
         mode=payload.mode,
+        storage_strategy=payload.storage_strategy,
         created_by=payload.created_by,
         message=payload.message,
     )
