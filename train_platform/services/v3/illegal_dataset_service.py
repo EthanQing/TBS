@@ -1377,6 +1377,8 @@ class IllegalDatasetService:
                 "pairs_total": int(publish_result.get("pairs_total", 0)),
                 "pairs_processed": int(publish_result.get("pairs_processed", 0)),
                 "pairs_skipped": int(publish_result.get("pairs_skipped", 0)),
+                "skipped_details": publish_result.get("skipped_details") or [],
+                "warnings": publish_result.get("warnings") or [],
                 "class_names": publish_result.get("class_names") or [],
                 "stats": publish_result.get("stats") or {},
                 "split_summary": publish_result.get("split_summary"),

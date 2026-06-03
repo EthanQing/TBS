@@ -715,6 +715,14 @@ class IllegalDatasetPublishService:
     }
 
     _skip_dirs = {"labels", ".versions", ".thumbnails", "__macosx"}
+    _pair_prefix_aliases = {"image", "images", "annotation", "annotations", "json", "labels"}
+
+    def _pair_key(self, root: Path, path: Path) -> str:
+        rel = Path(path).relative_to(root).with_suffix("")
+        parts = list(rel.parts)
+        if parts and parts[0].lower() in self._pair_prefix_aliases:
+            parts = parts[1:]
+        return "/".join(parts).lower()
 
     def extract_dataset_labels(self, root: Path) -> list[str]:
         labels: set[str] = set()
@@ -749,7 +757,7 @@ class IllegalDatasetPublishService:
                         labels.add(label)
         return sorted(labels)
 
-    def _collect_pairs(self, root: Path) -> tuple[list[tuple[Path, Path]], list[str]]:
+    def _collect_pairs(self, root: Path) -> tuple[list[tuple[Path, Path]], list[str], list[str]]:
         image_by_relkey: Dict[str, Path] = {}
         json_by_relkey: Dict[str, Path] = {}
         image_exts = {ext.lower() for ext in IMAGE_EXTS}
@@ -764,7 +772,7 @@ class IllegalDatasetPublishService:
 
             for fname in filenames:
                 p = cur_p / fname
-                rel_key = str(p.relative_to(root).with_suffix(""))
+                rel_key = self._pair_key(root, p)
                 ext = p.suffix.lower()
                 if ext in image_exts:
                     image_by_relkey.setdefault(rel_key, p)
@@ -775,13 +783,18 @@ class IllegalDatasetPublishService:
         pairs = [(image_by_relkey[key], json_by_relkey[key]) for key in common]
 
         warnings: list[str] = []
+        unmatched_details: list[str] = []
         extra_imgs = sorted(set(image_by_relkey.keys()) - set(json_by_relkey.keys()))
         extra_json = sorted(set(json_by_relkey.keys()) - set(image_by_relkey.keys()))
         if extra_imgs:
             warnings.append(f"Unmatched images: {len(extra_imgs)}")
+            unmatched_details.extend(f"{image_by_relkey[key].name}: missing json annotation" for key in extra_imgs[:50])
         if extra_json:
             warnings.append(f"Unmatched json: {len(extra_json)}")
-        return pairs, warnings
+            unmatched_details.extend(f"{json_by_relkey[key].name}: missing image file" for key in extra_json[:50])
+        if unmatched_details:
+            warnings.extend(f"Skipped {item}" for item in unmatched_details[:50])
+        return pairs, warnings, unmatched_details
 
     def _normalize_slice_config(self, publish_config: Optional[dict]) -> dict:
         cfg = dict(self.DEFAULT_CONFIG)
@@ -1089,9 +1102,11 @@ class IllegalDatasetPublishService:
         effective_mapping = self._build_effective_mapping(label_mapping, label_filters)
         slice_config = self._normalize_slice_config(publish_config)
 
-        pairs, warnings = self._collect_pairs(source_root)
+        pairs, warnings, unmatched_files = self._collect_pairs(source_root)
         if not pairs:
-            raise ValidationError("No image/json pairs found for illegal dataset publish")
+            detail = "; ".join(unmatched_files[:5])
+            suffix = f". Skipped unmatched files: {detail}" if detail else ""
+            raise ValidationError(f"No image/json pairs found for illegal dataset publish{suffix}")
         if callable(progress_callback):
             progress_callback(
                 "converting",
@@ -1100,14 +1115,14 @@ class IllegalDatasetPublishService:
                     "processed": 0,
                     "completed": 0,
                     "total": len(pairs),
-                    "skipped": 0,
+                    "skipped": len(unmatched_files),
                 },
             )
 
         global_label_map: Dict[str, int] = {}
         processed = 0
         completed = 0
-        skipped_files: List[str] = []
+        skipped_files: List[str] = list(unmatched_files)
         successful_labels: set[str] = set()
         aggregate_stats = {"images": 0, "slices": 0, "labels": 0, "empty_slices": 0}
 
