@@ -715,6 +715,7 @@ class IllegalDatasetPublishService:
     }
 
     _skip_dirs = {"labels", ".versions", ".thumbnails", "__macosx"}
+    _skip_files = {".dataset_stats.json", ".dataset_view_index.json", ".mounted_manifest.json"}
     _pair_prefix_aliases = {"image", "images", "annotation", "annotations", "json", "labels"}
 
     def _pair_key(self, root: Path, path: Path) -> str:
@@ -734,6 +735,8 @@ class IllegalDatasetPublishService:
                 continue
             dirnames[:] = [d for d in dirnames if d.lower() not in self._skip_dirs]
             for fname in filenames:
+                if fname.lower() in self._skip_files:
+                    continue
                 if not fname.lower().endswith(".json"):
                     continue
                 json_path = cur_p / fname
@@ -771,6 +774,8 @@ class IllegalDatasetPublishService:
             dirnames[:] = [d for d in dirnames if d.lower() not in self._skip_dirs]
 
             for fname in filenames:
+                if fname.lower() in self._skip_files:
+                    continue
                 p = cur_p / fname
                 rel_key = self._pair_key(root, p)
                 ext = p.suffix.lower()

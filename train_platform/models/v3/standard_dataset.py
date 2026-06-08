@@ -31,6 +31,7 @@ class StandardDataset(V3Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+        index=True,
     )
 
     events = relationship("StandardDatasetEvent", back_populates="standard_dataset", cascade="all, delete-orphan")

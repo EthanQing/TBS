@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,8 @@ from train_platform.utils.exceptions import NotFoundError
 
 class IllegalDatasetPublishJobService:
     def __init__(self) -> None:
-        self._locks: dict[str, threading.Lock] = {}
+        self._locks: dict[str, threading.RLock] = {}
+        self._locks_guard = threading.Lock()
         self._svc = IllegalDatasetService()
 
     @staticmethod
@@ -41,16 +43,55 @@ class IllegalDatasetPublishJobService:
     def request_path(self, illegal_dataset_id: int, job_id: str) -> Path:
         return self.job_dir(illegal_dataset_id, job_id) / "request.json"
 
-    def _lock(self, illegal_dataset_id: int, job_id: str) -> threading.Lock:
+    def _lock(self, illegal_dataset_id: int, job_id: str) -> threading.RLock:
         key = f"{int(illegal_dataset_id)}:{str(job_id)}"
-        self._locks.setdefault(key, threading.Lock())
-        return self._locks[key]
+        with self._locks_guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._locks[key] = lock
+            return lock
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
-        tmp.replace(path)
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+        last_exc: Exception | None = None
+        for attempt in range(8):
+            try:
+                tmp.write_text(text, encoding="utf-8")
+                tmp.replace(path)
+                return
+            except PermissionError as exc:
+                last_exc = exc
+                time.sleep(0.03 * (attempt + 1))
+            finally:
+                if tmp.exists() and attempt >= 7:
+                    try:
+                        tmp.unlink()
+                    except Exception:
+                        pass
+        if last_exc:
+            raise last_exc
+
+    def _read_json_retry(self, path: Path, *, missing_message: str) -> dict[str, Any]:
+        last_exc: Exception | None = None
+        for attempt in range(8):
+            try:
+                if not path.exists():
+                    raise NotFoundError(missing_message)
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise NotFoundError(missing_message)
+                return data
+            except NotFoundError:
+                raise
+            except (PermissionError, OSError, json.JSONDecodeError) as exc:
+                last_exc = exc
+                time.sleep(0.03 * (attempt + 1))
+        if last_exc:
+            raise last_exc
+        raise NotFoundError(missing_message)
 
     def _write_status(self, illegal_dataset_id: int, job_id: str, payload: dict[str, Any]) -> None:
         data = dict(payload or {})
@@ -58,22 +99,18 @@ class IllegalDatasetPublishJobService:
         self._write_json_atomic(self.status_path(illegal_dataset_id, job_id), data)
 
     def _read_status(self, illegal_dataset_id: int, job_id: str) -> dict[str, Any]:
-        path = self.status_path(illegal_dataset_id, job_id)
-        if not path.exists():
-            raise NotFoundError("Illegal dataset publish job not found")
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise NotFoundError("Illegal dataset publish job not found")
-        return data
+        with self._lock(illegal_dataset_id, job_id):
+            return self._read_json_retry(
+                self.status_path(illegal_dataset_id, job_id),
+                missing_message="Illegal dataset publish job not found",
+            )
 
     def _read_request(self, illegal_dataset_id: int, job_id: str) -> dict[str, Any]:
-        path = self.request_path(illegal_dataset_id, job_id)
-        if not path.exists():
-            raise NotFoundError("Illegal dataset publish request not found")
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise NotFoundError("Illegal dataset publish request not found")
-        return data
+        with self._lock(illegal_dataset_id, job_id):
+            return self._read_json_retry(
+                self.request_path(illegal_dataset_id, job_id),
+                missing_message="Illegal dataset publish request not found",
+            )
 
     def _append_log(self, payload: dict[str, Any], message: str) -> None:
         msg = str(message or "").strip()

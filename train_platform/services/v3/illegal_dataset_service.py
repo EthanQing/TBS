@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from sqlalchemy import func
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
@@ -101,6 +102,15 @@ class IllegalDatasetService:
         if normalized in {LABEL_MAPPING_STATUS_DELETE, "discard", "drop", "remove", "删除", "丢弃", "忽略"}:
             return LABEL_MAPPING_STATUS_DELETE
         return LABEL_MAPPING_STATUS_KEEP
+
+    def _normalize_label_mapping_key(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value)
+        text = text.replace("\uFF05", "%").replace("\u3000", " ")
+        for char in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+            text = text.replace(char, "")
+        return text.strip().casefold()
 
     def _effective_label_mapping_value(self, mapping: IllegalDatasetLabelMapping) -> str:
         status = self._normalize_label_mapping_status(
@@ -303,6 +313,37 @@ class IllegalDatasetService:
             return cached
         return self._refresh_version_statistics_cache(db, dataset, version, root=root)
 
+    def _mounted_publish_source_root(self, version: IllegalDatasetVersion) -> Path | None:
+        meta = version.meta if isinstance(version.meta, dict) else {}
+        if str(meta.get("source_type") or "") != "mounted_dir_link":
+            return None
+        if str(meta.get("format") or "").lower().strip() != "json":
+            return None
+        raw_source_root = str(meta.get("source_root") or "").strip()
+        if not raw_source_root:
+            raise ValidationError("Mounted illegal dataset source root is missing")
+        try:
+            source_root = Path(raw_source_root).expanduser().resolve(strict=False)
+        except Exception as exc:
+            raise ValidationError("Invalid mounted illegal dataset source root") from exc
+        if not source_root.exists() or not source_root.is_dir():
+            raise NotFoundError("Mounted illegal dataset source directory is no longer available")
+
+        from train_platform.services.v3.dataset_import_service import DatasetImportService
+
+        allowed_roots = DatasetImportService().allowed_roots()
+        if not any(self._is_relative_to(source_root, allowed.resolve(strict=False)) for allowed in allowed_roots):
+            raise ValidationError("Mounted illegal dataset source directory is not under an allowed import root")
+        return source_root
+
+    @staticmethod
+    def _is_relative_to(path: Path, base: Path) -> bool:
+        try:
+            Path(path).resolve(strict=False).relative_to(Path(base).resolve(strict=False))
+            return True
+        except Exception:
+            return False
+
     def _refresh_version_view_index_cache(
         self,
         db: Session,
@@ -458,8 +499,7 @@ class IllegalDatasetService:
         event_message: str | None = None,
         event_data: dict[str, Any] | None = None,
     ) -> IllegalDatasetVersion:
-        latest = self.version_repo.get_latest(db, int(dataset.illegal_dataset_id))
-        version_no = int(latest.version) + 1 if latest else 1
+        version_no = self._next_version_no(db, dataset)
         parent_version_id = int(parent_version.version_id) if parent_version else None
         inherited_files = base_files or {}
         files = scan_tree_to_cas_files(source_root, base_files=inherited_files)
@@ -676,6 +716,25 @@ class IllegalDatasetService:
             raise NotFoundError("Illegal dataset not found")
         return row
 
+    def _lock_dataset_for_version_create(self, db: Session, dataset: IllegalDataset) -> IllegalDataset:
+        row = (
+            db.query(IllegalDataset)
+            .filter(IllegalDataset.illegal_dataset_id == int(dataset.illegal_dataset_id))
+            .with_for_update()
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Illegal dataset not found")
+        return row
+
+    def _next_version_no(self, db: Session, dataset: IllegalDataset) -> int:
+        latest_version = (
+            db.query(func.max(IllegalDatasetVersion.version))
+            .filter(IllegalDatasetVersion.illegal_dataset_id == int(dataset.illegal_dataset_id))
+            .scalar()
+        )
+        return int(latest_version or 0) + 1
+
     def update_dataset(self, db: Session, illegal_dataset_id: int, *, patch: dict) -> IllegalDataset:
         row = self.get_dataset(db, illegal_dataset_id)
         if "name" in patch and patch["name"] is not None:
@@ -718,6 +777,7 @@ class IllegalDatasetService:
     ) -> IllegalDataset:
         row = self.get_dataset(db, illegal_dataset_id)
         with self._dataset_lock(int(row.illegal_dataset_id)):
+            row = self._lock_dataset_for_version_create(db, row)
             temp_dir = Path(tempfile.mkdtemp(dir=illegal_dataset_temp_root()))
             try:
                 extracted_root = unpack_uploaded_archive(upload, temp_dir)
@@ -754,11 +814,12 @@ class IllegalDatasetService:
         created_by: str | None = None,
         append: bool = False,
         filename: str | None = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> IllegalDataset:
         staging = illegal_dataset_temp_root() / f"import-{int(illegal_dataset_id)}-{uuid.uuid4().hex}"
         extracted_dir = staging / "extracted"
         try:
-            extracted_root = safe_extract_zip(Path(archive_path), extracted_dir)
+            extracted_root = safe_extract_zip(Path(archive_path), extracted_dir, progress_callback=progress_callback)
             return self.import_source_tree(
                 db,
                 illegal_dataset_id,
@@ -787,6 +848,7 @@ class IllegalDatasetService:
     ) -> IllegalDataset:
         row = self.get_dataset(db, illegal_dataset_id)
         with self._dataset_lock(int(row.illegal_dataset_id)):
+            row = self._lock_dataset_for_version_create(db, row)
             parent_version = self._active_version(db, row) if append else self.version_repo.get_latest(db, int(row.illegal_dataset_id))
             inherited_files = self._version_files_for_inheritance(parent_version) if append and parent_version else {}
             self._create_version_from_tree(
@@ -818,8 +880,9 @@ class IllegalDatasetService:
     ) -> IllegalDataset:
         row = self.get_dataset(db, illegal_dataset_id)
         with self._dataset_lock(int(row.illegal_dataset_id)):
+            row = self._lock_dataset_for_version_create(db, row)
             latest = self.version_repo.get_latest(db, int(row.illegal_dataset_id))
-            version_no = int(latest.version) + 1 if latest else 1
+            version_no = self._next_version_no(db, row)
             parent_version_id = int(latest.version_id) if latest and append else None
             version_root = self._version_root(int(row.illegal_dataset_id), version_no)
             active_root = self._root_path(row)
@@ -1179,6 +1242,7 @@ class IllegalDatasetService:
     ) -> dict[str, Any]:
         row = self.get_dataset(db, illegal_dataset_id)
         with self._dataset_lock(int(row.illegal_dataset_id)):
+            row = self._lock_dataset_for_version_create(db, row)
             temp_dir = Path(tempfile.mkdtemp(dir=illegal_dataset_temp_root()))
             try:
                 from train_platform.services.v3.dataset_common import ensure_safe_relative_path
@@ -1256,50 +1320,68 @@ class IllegalDatasetService:
         )
 
     def update_label_mappings(self, db: Session, illegal_dataset_id: int, *, items: list[dict[str, Any]]) -> IllegalDataset:
-        row = self.get_dataset(db, illegal_dataset_id)
-        existing = {
-            str(item.raw_label): item
-            for item in db.query(IllegalDatasetLabelMapping).filter(IllegalDatasetLabelMapping.illegal_dataset_id == int(row.illegal_dataset_id)).all()
-        }
-        seen: set[str] = set()
-        delete_count = 0
-        for item in items:
-            raw_label = str(item.get("raw_label") or "").strip()
-            mapped_label = str(item.get("mapped_label") or "").strip()
-            status = self._normalize_label_mapping_status(item.get("status"), mapped_label)
-            if not raw_label:
-                continue
-            if status == LABEL_MAPPING_STATUS_DELETE:
-                delete_count += 1
-                mapped_label = ""
-            elif not mapped_label:
-                continue
-            seen.add(raw_label)
-            if raw_label in existing:
-                existing[raw_label].mapped_label = mapped_label
-                existing[raw_label].status = status
-            else:
-                db.add(
-                    IllegalDatasetLabelMapping(
+        with self._dataset_lock(illegal_dataset_id):
+            row = self.get_dataset(db, illegal_dataset_id)
+            normalized_items: dict[str, dict[str, str]] = {}
+            for item in items:
+                raw_label = str(item.get("raw_label") or "").strip()
+                raw_key = self._normalize_label_mapping_key(raw_label)
+                if not raw_key:
+                    continue
+                mapped_label = str(item.get("mapped_label") or "").strip()
+                status = self._normalize_label_mapping_status(item.get("status"), mapped_label)
+                if status == LABEL_MAPPING_STATUS_DELETE:
+                    mapped_label = ""
+                elif not mapped_label:
+                    continue
+                normalized_items[raw_key] = {
+                    "raw_label": raw_label,
+                    "mapped_label": mapped_label,
+                    "status": status,
+                }
+
+            db.query(IllegalDatasetLabelMapping).filter(
+                IllegalDatasetLabelMapping.illegal_dataset_id == int(row.illegal_dataset_id)
+            ).delete(synchronize_session="fetch")
+
+            delete_count = sum(1 for item in normalized_items.values() if item["status"] == LABEL_MAPPING_STATUS_DELETE)
+            bind = db.get_bind()
+            if bind.dialect.name == "mysql":
+                for item in normalized_items.values():
+                    stmt = mysql_insert(IllegalDatasetLabelMapping.__table__).values(
                         illegal_dataset_id=int(row.illegal_dataset_id),
-                        raw_label=raw_label,
-                        mapped_label=mapped_label,
-                        status=status,
+                        raw_label=item["raw_label"],
+                        mapped_label=item["mapped_label"],
+                        status=item["status"],
                     )
-                )
-        for raw_label, record in existing.items():
-            if raw_label not in seen:
-                db.delete(record)
-        self._add_event(
-            db,
-            int(row.illegal_dataset_id),
-            "label_mappings_updated",
-            message="Illegal dataset label mappings updated",
-            data={"count": len(seen), "delete_count": delete_count},
-        )
-        db.commit()
-        db.refresh(row)
-        return row
+                    db.execute(
+                        stmt.on_duplicate_key_update(
+                            mapped_label=stmt.inserted.mapped_label,
+                            status=stmt.inserted.status,
+                            updated_at=func.now(),
+                        )
+                    )
+            else:
+                for item in normalized_items.values():
+                    db.add(
+                        IllegalDatasetLabelMapping(
+                            illegal_dataset_id=int(row.illegal_dataset_id),
+                            raw_label=item["raw_label"],
+                            mapped_label=item["mapped_label"],
+                            status=item["status"],
+                        )
+                    )
+
+            self._add_event(
+                db,
+                int(row.illegal_dataset_id),
+                "label_mappings_updated",
+                message="Illegal dataset label mappings updated",
+                data={"count": len(normalized_items), "delete_count": delete_count},
+            )
+            db.commit()
+            db.refresh(row)
+            return row
 
     def publish_standard_dataset(
         self,
@@ -1351,12 +1433,16 @@ class IllegalDatasetService:
                         "message": f"正在准备原始数据集版本 v{int(version.version)}",
                     },
                 )
-            manifest = load_version_manifest(version)
-            if manifest:
-                materialize_manifest_to_dir(manifest, source_root, replace=True)
+            mounted_publish_root = self._mounted_publish_source_root(version)
+            if mounted_publish_root is not None:
+                source_root = mounted_publish_root
             else:
-                snapshot_root = self._legacy_snapshot_root(version)
-                materialize_snapshot_to_dir(snapshot_root, source_root, replace=True)
+                manifest = load_version_manifest(version)
+                if manifest:
+                    materialize_manifest_to_dir(manifest, source_root, replace=True)
+                else:
+                    snapshot_root = self._legacy_snapshot_root(version)
+                    materialize_snapshot_to_dir(snapshot_root, source_root, replace=True)
             if callable(progress_callback):
                 progress_callback(
                     "converting",

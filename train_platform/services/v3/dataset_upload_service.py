@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
 from train_platform.models.v3.dataset_upload import DatasetUploadSession, DatasetUploadTask
+from train_platform.services.v3.dataset_common import safe_extract_zip
 from train_platform.services.v3.dataset_import_service import DatasetImportService
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
@@ -373,13 +374,18 @@ class DatasetUploadService:
                             filename=source.name,
                         )
                     else:
-                        service.import_archive_file(
-                            db,
-                            int(task.dataset_id),
-                            source,
-                            created_by=task.created_by,
-                            filename=source.name,
-                        )
+                        extracted_root, staging = self._extract_archive_for_task(db, task, source)
+                        try:
+                            self._update_task(db, task, status="validating", stage="validating", progress=75)
+                            service.import_source_tree(
+                                db,
+                                int(task.dataset_id),
+                                extracted_root,
+                                created_by=task.created_by,
+                                filename=source.name,
+                            )
+                        finally:
+                            shutil.rmtree(staging, ignore_errors=True)
                 else:
                     service = IllegalDatasetService()
                     if task.source_type == "dir_link":
@@ -405,15 +411,20 @@ class DatasetUploadService:
                             filename=source.name,
                         )
                     else:
-                        service.import_archive_file(
-                            db,
-                            int(task.dataset_id),
-                            source,
-                            message=task.message,
-                            created_by=task.created_by,
-                            append=(task.mode == "append"),
-                            filename=source.name,
-                        )
+                        extracted_root, staging = self._extract_archive_for_task(db, task, source)
+                        try:
+                            self._update_task(db, task, status="validating", stage="validating", progress=75)
+                            service.import_source_tree(
+                                db,
+                                int(task.dataset_id),
+                                extracted_root,
+                                message=task.message,
+                                created_by=task.created_by,
+                                append=(task.mode == "append"),
+                                filename=source.name,
+                            )
+                        finally:
+                            shutil.rmtree(staging, ignore_errors=True)
                 task = self.get_task(db, task_id)
                 self._update_task(db, task, status="done", stage="done", progress=100, finished=True)
                 self._cleanup_task_source(task)
@@ -442,6 +453,51 @@ class DatasetUploadService:
         if finished:
             task.finished_at = _utcnow()
         db.commit()
+
+    def _extract_archive_for_task(self, db: Session, task: DatasetUploadTask, source: Path) -> tuple[Path, Path]:
+        staging = settings.dataset_staging_dir / "upload-tasks" / str(task.task_id)
+        extracted_dir = staging / "extracted"
+        shutil.rmtree(staging, ignore_errors=True)
+        self._update_task(db, task, status="extracting", stage="extracting", progress=10)
+        try:
+            extracted_root = safe_extract_zip(
+                Path(source),
+                extracted_dir,
+                progress_callback=self._make_extract_progress_callback(db, task, start=10, end=70),
+            )
+            self._update_task(db, task, status="extracting", stage="extracting", progress=70)
+            return extracted_root, staging
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    def _make_extract_progress_callback(
+        self,
+        db: Session,
+        task: DatasetUploadTask,
+        *,
+        start: int,
+        end: int,
+    ):
+        start = max(0, min(100, int(start)))
+        end = max(start, min(100, int(end)))
+        last_progress = {"value": start}
+
+        def _callback(extracted_files: int, total_files: int, _rel_path: str) -> None:
+            total = max(0, int(total_files or 0))
+            done = max(0, int(extracted_files or 0))
+            if total <= 0:
+                progress = end
+            else:
+                ratio = min(1.0, done / max(1, total))
+                progress = start + int(round((end - start) * ratio))
+            progress = max(start, min(end, progress))
+            if progress <= int(last_progress["value"]):
+                return
+            last_progress["value"] = progress
+            self._update_task(db, task, status="extracting", stage="extracting", progress=progress)
+
+        return _callback
 
     def _cleanup_task_source(self, task: DatasetUploadTask) -> None:
         if task.session_id:

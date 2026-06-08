@@ -121,7 +121,11 @@ def unpack_uploaded_archive(upload, destination: Path) -> Path:
     return destination
 
 
-def safe_extract_zip(archive_path: Path, destination: Path) -> Path:
+def safe_extract_zip(
+    archive_path: Path,
+    destination: Path,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> Path:
     archive = Path(archive_path)
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
@@ -143,6 +147,11 @@ def safe_extract_zip(archive_path: Path, destination: Path) -> Path:
                     raise ValidationError("ZIP contains a path outside destination") from exc
                 members.append((info, rel))
 
+            total_files = sum(1 for info, _rel in members if not info.is_dir())
+            extracted_files = 0
+            if progress_callback and total_files <= 0:
+                progress_callback(0, 0, "")
+
             for info, rel in members:
                 target = (dest_root / rel).resolve(strict=False)
                 if info.is_dir():
@@ -151,6 +160,9 @@ def safe_extract_zip(archive_path: Path, destination: Path) -> Path:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as src, target.open("wb") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
+                extracted_files += 1
+                if progress_callback:
+                    progress_callback(extracted_files, total_files, rel.as_posix())
     except ValidationError:
         raise
     except Exception as exc:

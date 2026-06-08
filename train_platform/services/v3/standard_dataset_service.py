@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 import yaml
@@ -50,6 +50,7 @@ from train_platform.services.v3.mounted_dataset_service import (
 )
 from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
+from train_platform.utils.image_exts import IMAGE_EXTS
 
 
 class StandardDatasetService:
@@ -81,6 +82,32 @@ class StandardDatasetService:
 
     def _index_images(self, db: Session, dataset: StandardDataset) -> None:
         self._index_images_in_root(db, dataset, self._root_path(dataset))
+
+    def _indexed_image_count(self, db: Session, dataset: StandardDataset) -> int:
+        return int(
+            db.query(StandardDatasetImage)
+            .filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id))
+            .count()
+        )
+
+    def _has_filesystem_images(self, root: Path) -> bool:
+        if not root.exists() or not root.is_dir():
+            return False
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTS:
+                return True
+        return False
+
+    def _ensure_image_index(self, db: Session, dataset: StandardDataset, *, commit: bool = False) -> bool:
+        if self._indexed_image_count(db, dataset) > 0:
+            return False
+        root = self._root_path(dataset)
+        if not self._has_filesystem_images(root):
+            return False
+        self._index_images(db, dataset)
+        if commit:
+            db.commit()
+        return True
 
     def _index_images_in_root(self, db: Session, dataset: StandardDataset, root: Path) -> None:
         db.query(StandardDatasetImage).filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id)).delete()
@@ -296,16 +323,18 @@ class StandardDatasetService:
         root = self._root_path(dataset)
         cached = load_cached_statistics(root)
         if isinstance(cached, dict):
+            cached_images = int(cached.get("num_images") or cached.get("total_images") or cached.get("image_count") or 0)
+            if cached_images > 0:
+                return cached
+            if self._indexed_image_count(db, dataset) > 0 or self._ensure_image_index(db, dataset, commit=True):
+                return self._refresh_dataset_statistics_cache(db, dataset)
             return cached
         return self._refresh_dataset_statistics_cache(db, dataset)
 
     def _refresh_dataset_statistics_cache(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
         root = self._root_path(dataset)
-        image_count = (
-            db.query(StandardDatasetImage)
-            .filter(StandardDatasetImage.standard_dataset_id == int(dataset.standard_dataset_id))
-            .count()
-        )
+        self._ensure_image_index(db, dataset, commit=True)
+        image_count = self._indexed_image_count(db, dataset)
         stats = build_statistics(root, image_count=image_count)
         write_cached_statistics(root, stats)
         return stats
@@ -313,8 +342,9 @@ class StandardDatasetService:
     def _load_dataset_view_index(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
         root = self._root_path(dataset)
         cached = load_cached_view_index(root)
-        if isinstance(cached, dict):
+        if isinstance(cached, dict) and int(cached.get("total_items") or 0) > 0:
             return cached
+        self._ensure_image_index(db, dataset, commit=True)
         return self._refresh_dataset_view_index_cache(db, dataset)
 
     def _refresh_dataset_view_index_cache(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
@@ -403,7 +433,7 @@ class StandardDatasetService:
         rows = q.order_by(StandardDataset.updated_at.desc()).offset(skip).limit(limit).all()
         return [self._dataset_with_statistics(db, row) for row in rows]
 
-    def create_dataset(self, db: Session, *, obj: dict) -> StandardDataset:
+    def create_dataset(self, db: Session, *, obj: dict, commit: bool = True) -> StandardDataset:
         name = str(obj.get("name") or "").strip()
         if not name:
             raise ValidationError("name is required")
@@ -427,8 +457,9 @@ class StandardDatasetService:
         root = self._root_path(row)
         root.mkdir(parents=True, exist_ok=True)
         self._add_event(db, int(row.standard_dataset_id), "created", message="Standard dataset created")
-        db.commit()
-        db.refresh(row)
+        if commit:
+            db.commit()
+            db.refresh(row)
         return row
 
     def get_dataset(self, db: Session, standard_dataset_id: int) -> StandardDataset:
@@ -508,11 +539,12 @@ class StandardDatasetService:
         *,
         created_by: str | None = None,
         filename: str | None = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> StandardDataset:
         staging = settings.dataset_staging_dir / "standard" / f"{int(standard_dataset_id)}-{uuid.uuid4().hex}"
         extracted_dir = staging / "extracted"
         try:
-            extracted_root = safe_extract_zip(Path(archive_path), extracted_dir)
+            extracted_root = safe_extract_zip(Path(archive_path), extracted_dir, progress_callback=progress_callback)
             return self.import_source_tree(
                 db,
                 standard_dataset_id,
@@ -745,6 +777,7 @@ class StandardDatasetService:
                 "source_type": source_type,
                 "publish_config": publish_config,
             },
+            commit=False,
         )
         root = self._root_path(row)
         copy_tree(source_root, root)
