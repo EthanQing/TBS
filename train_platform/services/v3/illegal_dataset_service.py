@@ -24,49 +24,39 @@ from train_platform.models.v3.enums import DatasetVersionStatus
 from train_platform.repositories.v3.illegal_dataset_repo import IllegalDatasetRepository
 from train_platform.repositories.v3.illegal_dataset_version_repo import IllegalDatasetVersionRepository
 from train_platform.services.v3.dataset_common import (
-    build_annotations_payload,
-    build_file_listing,
-    build_statistics,
     build_view_payload_from_index,
-    build_yolo_view_index,
     detect_split_from_relpath,
-    iter_image_files,
     load_cached_json_file,
-    read_class_names,
     resolve_storage_token,
     safe_extract_zip,
     dataset_thumbnail_url,
     to_storage_token,
-    unpack_uploaded_archive,
     write_cached_json_file,
 )
 from train_platform.services.v3.illegal_dataset_cas import (
     build_manifest,
-    cas_path_for_hash,
     extract_json_labels_from_manifest,
     image_rel_paths_from_manifest,
     illegal_dataset_file_url,
     illegal_dataset_temp_root,
     illegal_manifest_path,
-    legacy_snapshot_file_path,
     load_version_manifest,
-    manifest_cas_file_path,
     manifest_entry,
+    manifest_file_path,
     manifest_files,
     manifest_stats_to_dataset_statistics,
     materialize_manifest_to_dir,
-    materialize_snapshot_to_dir,
+    mounted_file_entry,
     read_class_names_from_manifest,
     read_yolo_box_summary_from_manifest,
     read_yolo_boxes_from_manifest,
     remove_tree,
     replace_dir_from_manifest,
-    replace_dir_from_snapshot,
     scan_tree_to_cas_files,
     write_manifest,
 )
 from train_platform.services.v3.illegal_dataset_publish_service import IllegalDatasetPublishService
-from train_platform.services.v3.mounted_dataset_service import load_mounted_manifest, link_source_tree, resolve_dataset_file
+from train_platform.services.v3.mounted_dataset_service import link_source_tree
 from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
@@ -173,6 +163,11 @@ class IllegalDatasetService:
         root.parent.mkdir(parents=True, exist_ok=True)
         return root.with_suffix(".stats.json")
 
+    def _version_file_listing_cache_path(self, dataset: IllegalDataset, version: IllegalDatasetVersion) -> Path:
+        root = self._version_root(int(dataset.illegal_dataset_id), int(version.version))
+        root.parent.mkdir(parents=True, exist_ok=True)
+        return root.with_suffix(".files.json")
+
     def _ensure_name_available(self, db: Session, name: str, *, exclude_id: int | None = None) -> None:
         row = self.repo.get_by_name(db, str(name).strip())
         if row and (exclude_id is None or int(row.illegal_dataset_id) != int(exclude_id)):
@@ -182,15 +177,6 @@ class IllegalDatasetService:
         if dataset.active_version_id is None:
             return None
         return db.query(IllegalDatasetVersion).filter(IllegalDatasetVersion.version_id == int(dataset.active_version_id)).first()
-
-    def _legacy_snapshot_root(self, version: IllegalDatasetVersion) -> Path:
-        token = str(version.snapshot_path or "").strip()
-        if not token:
-            raise NotFoundError("Illegal dataset version has no manifest or snapshot path")
-        root = resolve_storage_token(token)
-        if not root.exists() or not root.is_dir():
-            raise NotFoundError("Illegal dataset snapshot path not found")
-        return root
 
     def _add_event(
         self,
@@ -218,15 +204,7 @@ class IllegalDatasetService:
     def _index_version_images(self, db: Session, dataset: IllegalDataset, version: IllegalDatasetVersion) -> None:
         db.query(IllegalDatasetImage).filter(IllegalDatasetImage.version_id == int(version.version_id)).delete()
         manifest = load_version_manifest(version)
-        if manifest:
-            image_paths = image_rel_paths_from_manifest(manifest)
-        else:
-            root = resolve_storage_token(str(version.snapshot_path or dataset.storage_path))
-            mounted = load_mounted_manifest(root)
-            if mounted and isinstance(mounted.get("image_paths"), list):
-                image_paths = [str(item).strip().replace("\\", "/").strip("/") for item in mounted.get("image_paths") or [] if str(item).strip()]
-            else:
-                image_paths = [image_path.relative_to(root).as_posix() for image_path in iter_image_files(root)]
+        image_paths = image_rel_paths_from_manifest(manifest)
         for rel in image_paths:
             db.add(
                 IllegalDatasetImage(
@@ -244,19 +222,11 @@ class IllegalDatasetService:
         version: IllegalDatasetVersion,
         *,
         manifest: dict[str, Any] | None = None,
-        root: Path | None = None,
     ) -> list[str]:
         labels: set[str] = set()
         if manifest is not None:
             labels.update(str(label).strip() for label in read_class_names_from_manifest(manifest) if str(label).strip())
             labels.update(str(label).strip() for label in extract_json_labels_from_manifest(manifest) if str(label).strip())
-        elif root is not None:
-            labels.update(str(label).strip() for label in read_class_names(root) if str(label).strip())
-            labels.update(
-                str(label).strip()
-                for label in IllegalDatasetPublishService().extract_dataset_labels(root)
-                if str(label).strip()
-            )
         payload = {"labels": sorted(label for label in labels if label)}
         write_cached_json_file(self._version_raw_labels_cache_path(dataset, version), payload)
         return list(payload["labels"])
@@ -267,51 +237,13 @@ class IllegalDatasetService:
         version: IllegalDatasetVersion,
         *,
         manifest: dict[str, Any] | None = None,
-        root: Path | None = None,
     ) -> list[str]:
         cached = load_cached_json_file(self._version_raw_labels_cache_path(dataset, version))
         if isinstance(cached, dict):
             labels = cached.get("labels")
             if isinstance(labels, list):
                 return [str(label).strip() for label in labels if str(label).strip()]
-        return self._refresh_version_raw_labels_cache(dataset, version, manifest=manifest, root=root)
-
-    def _refresh_version_statistics_cache(
-        self,
-        db: Session,
-        dataset: IllegalDataset,
-        version: IllegalDatasetVersion,
-        *,
-        root: Path,
-    ) -> dict[str, Any]:
-        image_count = (
-            db.query(IllegalDatasetImage)
-            .filter(IllegalDatasetImage.version_id == int(version.version_id))
-            .count()
-        )
-        total_files = int(version.file_count) if version.file_count is not None else None
-        total_size_bytes = int(version.size_bytes) if version.size_bytes is not None else None
-        stats = build_statistics(
-            root,
-            image_count=image_count,
-            total_files=total_files,
-            total_size_bytes=total_size_bytes,
-        )
-        write_cached_json_file(self._version_statistics_cache_path(dataset, version), stats)
-        return stats
-
-    def _load_version_statistics(
-        self,
-        db: Session,
-        dataset: IllegalDataset,
-        version: IllegalDatasetVersion,
-        *,
-        root: Path,
-    ) -> dict[str, Any]:
-        cached = load_cached_json_file(self._version_statistics_cache_path(dataset, version))
-        if isinstance(cached, dict):
-            return cached
-        return self._refresh_version_statistics_cache(db, dataset, version, root=root)
+        return self._refresh_version_raw_labels_cache(dataset, version, manifest=manifest)
 
     def _mounted_publish_source_root(self, version: IllegalDatasetVersion) -> Path | None:
         meta = version.meta if isinstance(version.meta, dict) else {}
@@ -351,71 +283,54 @@ class IllegalDatasetService:
         version: IllegalDatasetVersion,
         *,
         manifest: dict[str, Any] | None = None,
-        snapshot_root: Path | None = None,
     ) -> dict[str, Any]:
-        if manifest is not None:
-            class_names = read_class_names_from_manifest(manifest)
-            image_paths = image_rel_paths_from_manifest(manifest)
-            entries = [
-                {"id": int(idx), "path": rel_path, "name": Path(rel_path).name}
-                for idx, rel_path in enumerate(image_paths, start=1)
-            ]
+        class_names = read_class_names_from_manifest(manifest)
+        image_paths = image_rel_paths_from_manifest(manifest)
+        entries = [
+            {"id": int(idx), "path": rel_path, "name": Path(rel_path).name}
+            for idx, rel_path in enumerate(image_paths, start=1)
+        ]
 
-            def _process(entry: dict[str, Any]) -> dict[str, Any]:
-                width, height, object_count, classes = read_yolo_box_summary_from_manifest(
-                    manifest,
-                    entry["path"],
-                    class_names,
-                )
-                return {
-                    **entry,
-                    "width": width,
-                    "height": height,
-                    "object_count": int(object_count),
-                    "classes": [int(x) for x in classes],
-                }
-
-            workers = max(1, int(settings.view_index_max_workers or 1))
-            if len(entries) <= 1 or workers <= 1:
-                items = [_process(entry) for entry in entries]
-            else:
-                from concurrent.futures import ThreadPoolExecutor
-
-                with ThreadPoolExecutor(max_workers=min(workers, max(1, len(entries)))) as executor:
-                    items = list(executor.map(_process, entries))
-
-            category_counts: dict[int, int] = {}
-            for item in items:
-                for class_id in item.get("classes", []):
-                    category_counts[int(class_id)] = int(category_counts.get(int(class_id), 0)) + 1
-            view_index = {
-                "schema_version": 1,
-                "categories": [
-                    {
-                        "class_id": int(class_id),
-                        "name": class_names[class_id] if 0 <= int(class_id) < len(class_names) else str(class_id),
-                        "count": int(count),
-                    }
-                    for class_id, count in sorted(category_counts.items())
-                ],
-                "items": items,
-                "total_items": len(items),
-            }
-        else:
-            if snapshot_root is None:
-                snapshot_root = self._legacy_snapshot_root(version)
-            image_rows = (
-                db.query(IllegalDatasetImage)
-                .filter(IllegalDatasetImage.version_id == int(version.version_id))
-                .order_by(IllegalDatasetImage.path.asc())
-                .all()
+        def _process(entry: dict[str, Any]) -> dict[str, Any]:
+            width, height, object_count, classes = read_yolo_box_summary_from_manifest(
+                manifest,
+                entry["path"],
+                class_names,
             )
-            if not image_rows:
-                image_rows = [
-                    {"id": int(idx), "path": image_path.relative_to(snapshot_root).as_posix()}
-                    for idx, image_path in enumerate(iter_image_files(snapshot_root), start=1)
-                ]
-            view_index = build_yolo_view_index(snapshot_root, image_rows, max_workers=settings.view_index_max_workers)
+            return {
+                **entry,
+                "width": width,
+                "height": height,
+                "object_count": int(object_count),
+                "classes": [int(x) for x in classes],
+            }
+
+        workers = max(1, int(settings.view_index_max_workers or 1))
+        if len(entries) <= 1 or workers <= 1:
+            items = [_process(entry) for entry in entries]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(workers, max(1, len(entries)))) as executor:
+                items = list(executor.map(_process, entries))
+
+        category_counts: dict[int, int] = {}
+        for item in items:
+            for class_id in item.get("classes", []):
+                category_counts[int(class_id)] = int(category_counts.get(int(class_id), 0)) + 1
+        view_index = {
+            "schema_version": 1,
+            "categories": [
+                {
+                    "class_id": int(class_id),
+                    "name": class_names[class_id] if 0 <= int(class_id) < len(class_names) else str(class_id),
+                    "count": int(count),
+                }
+                for class_id, count in sorted(category_counts.items())
+            ],
+            "items": items,
+            "total_items": len(items),
+        }
 
         write_cached_json_file(self._version_view_index_cache_path(dataset, version), view_index)
         self._prewarm_version_thumbnails(dataset, version, view_index)
@@ -428,7 +343,6 @@ class IllegalDatasetService:
         version: IllegalDatasetVersion,
         *,
         manifest: dict[str, Any] | None = None,
-        snapshot_root: Path | None = None,
     ) -> dict[str, Any]:
         cached = load_cached_json_file(self._version_view_index_cache_path(dataset, version))
         if isinstance(cached, dict):
@@ -438,7 +352,6 @@ class IllegalDatasetService:
             dataset,
             version,
             manifest=manifest,
-            snapshot_root=snapshot_root,
         )
 
     def _prewarm_version_thumbnails(self, dataset: IllegalDataset, version: IllegalDatasetVersion, view_index: dict[str, Any]) -> None:
@@ -473,17 +386,7 @@ class IllegalDatasetService:
         if not version:
             return {}
         manifest = load_version_manifest(version)
-        if manifest:
-            return {
-                str(rel): {
-                    "hash": str(entry.get("hash") or ""),
-                    "size": int(entry.get("size") or entry.get("size_bytes") or 0),
-                    "mtime": float(entry.get("mtime") or 0.0),
-                }
-                for rel, entry in manifest_files(manifest).items()
-            }
-        snapshot_root = self._legacy_snapshot_root(version)
-        return scan_tree_to_cas_files(snapshot_root)
+        return {str(rel): dict(entry) for rel, entry in manifest_files(manifest).items()}
 
     def _create_version_from_tree(
         self,
@@ -589,18 +492,26 @@ class IllegalDatasetService:
         raw_labels: list[str] = []
         if active_version:
             manifest = load_version_manifest(active_version)
-            if manifest:
-                root = None
-                stats = manifest_stats_to_dataset_statistics(manifest)
-                raw_labels = self._load_version_raw_labels(dataset, active_version, manifest=manifest)
-            else:
-                root = self._legacy_snapshot_root(active_version)
-                stats = self._load_version_statistics(db, dataset, active_version, root=root)
-                raw_labels = self._load_version_raw_labels(dataset, active_version, root=root)
+            stats = manifest_stats_to_dataset_statistics(manifest)
+            raw_labels = self._load_version_raw_labels(dataset, active_version, manifest=manifest)
         else:
-            root = self._root_path(dataset)
-            manifest = None
-            stats = build_statistics(root, image_count=0)
+            stats = {
+                "total_files": 0,
+                "total_size_bytes": 0,
+                "total_size_mb": 0.0,
+                "size_mb": 0.0,
+                "dataset_size_mb": 0.0,
+                "total_images": 0,
+                "num_images": 0,
+                "image_count": 0,
+                "annotations_count": 0,
+                "target_count": 0,
+                "total_targets": 0,
+                "object_count": 0,
+                "total_objects": 0,
+                "num_classes": 0,
+                "class_count": 0,
+            }
             raw_labels = []
 
         class_count = self._effective_illegal_class_count(
@@ -654,19 +565,8 @@ class IllegalDatasetService:
 
         if not rel_path:
             manifest = load_version_manifest(version)
-            if manifest:
-                paths = image_rel_paths_from_manifest(manifest)
-                rel_path = str(paths[0]).strip() if paths else ""
-
-        if not rel_path:
-            try:
-                snapshot_root = self._legacy_snapshot_root(version)
-                images = iter_image_files(snapshot_root)
-                first_image = images[0] if images else None
-                if first_image:
-                    rel_path = first_image.relative_to(snapshot_root).as_posix()
-            except Exception:
-                rel_path = ""
+            paths = image_rel_paths_from_manifest(manifest)
+            rel_path = str(paths[0]).strip() if paths else ""
 
         if not rel_path:
             return None
@@ -765,45 +665,6 @@ class IllegalDatasetService:
             except Exception:
                 pass
 
-    def upload_archive(
-        self,
-        db: Session,
-        illegal_dataset_id: int,
-        upload,
-        *,
-        message: str | None = None,
-        created_by: str | None = None,
-        append: bool = False,
-    ) -> IllegalDataset:
-        row = self.get_dataset(db, illegal_dataset_id)
-        with self._dataset_lock(int(row.illegal_dataset_id)):
-            row = self._lock_dataset_for_version_create(db, row)
-            temp_dir = Path(tempfile.mkdtemp(dir=illegal_dataset_temp_root()))
-            try:
-                extracted_root = unpack_uploaded_archive(upload, temp_dir)
-                parent_version = self._active_version(db, row) if append else self.version_repo.get_latest(db, int(row.illegal_dataset_id))
-                inherited_files = self._version_files_for_inheritance(parent_version) if append and parent_version else {}
-                self._create_version_from_tree(
-                    db,
-                    row,
-                    source_root=extracted_root,
-                    base_files=inherited_files,
-                    parent_version=parent_version,
-                    message=message,
-                    created_by=created_by,
-                    event_type="appended" if append else "uploaded",
-                    event_message="Illegal dataset archive appended" if append else "Illegal dataset archive uploaded",
-                    event_data={"filename": str(getattr(upload, 'filename', '') or ''), "append": bool(append)},
-                )
-                db.commit()
-                db.refresh(row)
-                return row
-            finally:
-                try:
-                    remove_tree(temp_dir)
-                except Exception:
-                    pass
-
     def import_archive_file(
         self,
         db: Session,
@@ -891,27 +752,52 @@ class IllegalDatasetService:
             except Exception:
                 pass
             version_root.mkdir(parents=True, exist_ok=True)
-            manifest = link_source_tree(version_root, Path(source_root), prefer_yolo=True)
-            stats = build_statistics(version_root, image_count=int(manifest.get("image_count") or 0))
+            mounted = link_source_tree(version_root, Path(source_root), prefer_yolo=True)
+            files = scan_tree_to_cas_files(version_root)
+            source_image_root = Path(str(mounted.get("source_image_root") or source_root)).resolve(strict=False)
+            image_prefix = str(mounted.get("image_rel_prefix") or "images").strip().replace("\\", "/").strip("/")
+            image_rels = [
+                str(item).strip().replace("\\", "/").strip("/")
+                for item in (mounted.get("image_paths") or [])
+                if str(item).strip()
+            ]
+            for rel in image_rels:
+                image_suffix = rel
+                if image_prefix and rel == image_prefix:
+                    image_suffix = ""
+                elif image_prefix and rel.startswith(f"{image_prefix}/"):
+                    image_suffix = rel[len(image_prefix) + 1:]
+                source_path = source_image_root / image_suffix
+                files[rel] = mounted_file_entry(source_path)
+            manifest = build_manifest(
+                dataset_id=int(row.illegal_dataset_id),
+                version=version_no,
+                parent_version_id=parent_version_id,
+                files=files,
+            )
+            manifest_path = illegal_manifest_path(int(row.illegal_dataset_id), version_no)
+            write_manifest(manifest, manifest_path)
+            stats = manifest_stats_to_dataset_statistics(manifest)
             version_row = IllegalDatasetVersion(
                 illegal_dataset_id=int(row.illegal_dataset_id),
                 version=version_no,
                 parent_version_id=parent_version_id,
                 status=DatasetVersionStatus.FINALIZED,
                 message=message,
-                snapshot_path=to_storage_token(version_root),
-                manifest_path=None,
+                snapshot_path=None,
+                manifest_path=to_storage_token(manifest_path),
                 file_count=int(stats.get("total_files") or 0),
                 size_bytes=int(stats.get("total_size_bytes") or 0),
                 meta={
                     "source_type": "mounted_dir_link",
                     "source_root": str(Path(source_root).resolve(strict=False)),
-                    "format": manifest.get("format"),
-                    "link_type": manifest.get("link_type"),
-                    "image_count": int(manifest.get("image_count") or 0),
+                    "format": mounted.get("format"),
+                    "link_type": mounted.get("link_type"),
+                    "image_count": int(mounted.get("image_count") or 0),
                     "filename": str(filename or ""),
                     "append": bool(append),
                     "append_semantics": "new_mounted_version",
+                    "manifest_schema_version": int(manifest.get("schema_version") or 1),
                 },
                 created_by=created_by,
             )
@@ -925,9 +811,8 @@ class IllegalDatasetService:
             active_root.mkdir(parents=True, exist_ok=True)
             link_source_tree(active_root, Path(source_root), prefer_yolo=True)
             self._index_version_images(db, row, version_row)
-            self._refresh_version_raw_labels_cache(row, version_row, root=version_root)
-            self._refresh_version_statistics_cache(db, row, version_row, root=version_root)
-            self._refresh_version_view_index_cache(db, row, version_row, snapshot_root=version_root)
+            self._refresh_version_raw_labels_cache(row, version_row, manifest=manifest)
+            self._refresh_version_view_index_cache(db, row, version_row, manifest=manifest)
             self._add_event(
                 db,
                 int(row.illegal_dataset_id),
@@ -951,21 +836,7 @@ class IllegalDatasetService:
             if not version:
                 raise NotFoundError("Illegal dataset version not found")
             manifest = load_version_manifest(version)
-            if manifest:
-                replace_dir_from_manifest(manifest, self._root_path(row))
-            else:
-                snapshot_root = self._legacy_snapshot_root(version)
-                if str((version.meta or {}).get("source_type") or "") == "mounted_dir_link":
-                    source_root = Path(str((version.meta or {}).get("source_root") or ""))
-                    active_root = self._root_path(row)
-                    try:
-                        remove_tree(active_root)
-                    except Exception:
-                        pass
-                    active_root.mkdir(parents=True, exist_ok=True)
-                    link_source_tree(active_root, source_root, prefer_yolo=True)
-                else:
-                    replace_dir_from_snapshot(snapshot_root, self._root_path(row))
+            replace_dir_from_manifest(manifest, self._root_path(row))
             row.active_version_id = int(version.version_id)
             self._add_event(
                 db,
@@ -1110,25 +981,20 @@ class IllegalDatasetService:
             "boxes": boxes,
         }
 
-    def _list_manifest_files(
+    def _build_manifest_file_listing_cache(
         self,
         manifest: dict[str, Any],
         *,
         illegal_dataset_id: int,
         version_id: int,
-        page: int,
-        page_size: int,
-    ) -> tuple[list[dict[str, Any]], int]:
-        rel_paths = sorted(manifest_files(manifest))
-        total = len(rel_paths)
-        start = max(0, (int(page) - 1) * int(page_size))
-        end = start + int(page_size)
+    ) -> dict[str, Any]:
+        files_by_rel = manifest_files(manifest)
         items: list[dict[str, Any]] = []
-        for rel in rel_paths[start:end]:
-            entry = manifest_files(manifest).get(rel) or {}
+        for rel in sorted(files_by_rel):
+            entry = files_by_rel.get(rel) or {}
             exists = False
             try:
-                exists = cas_path_for_hash(str(entry.get("hash") or ""), require_exists=False).exists()
+                exists = manifest_file_path(manifest, rel, required=False).exists()
             except Exception:
                 exists = False
             url = illegal_dataset_file_url(illegal_dataset_id, version_id, rel) if Path(rel).suffix.lower() in IMAGE_EXTS else None
@@ -1141,7 +1007,40 @@ class IllegalDatasetService:
                     "exists": bool(exists),
                 }
             )
-        return items, total
+        return {
+            "schema_version": 1,
+            "total": len(items),
+            "items": items,
+        }
+
+    def _load_manifest_file_listing_cache(
+        self,
+        dataset: IllegalDataset,
+        version: IllegalDatasetVersion,
+        *,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        cache_path = self._version_file_listing_cache_path(dataset, version)
+        cached = load_cached_json_file(cache_path)
+        cached_items = cached.get("items") if isinstance(cached, dict) else None
+        if isinstance(cached_items, list):
+            return cached
+        payload = self._build_manifest_file_listing_cache(
+            manifest,
+            illegal_dataset_id=int(dataset.illegal_dataset_id),
+            version_id=int(version.version_id),
+        )
+        write_cached_json_file(cache_path, payload)
+        return payload
+
+    def _page_cached_file_listing(self, payload: dict[str, Any], *, page: int, page_size: int) -> tuple[list[dict[str, Any]], int]:
+        raw_items = payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(raw_items, list):
+            raw_items = []
+        total = int(payload.get("total") or len(raw_items)) if isinstance(payload, dict) else len(raw_items)
+        start = max(0, (int(page) - 1) * int(page_size))
+        end = start + int(page_size)
+        return raw_items[start:end], total
 
     def get_view(
         self,
@@ -1156,21 +1055,12 @@ class IllegalDatasetService:
         row = self.get_dataset(db, illegal_dataset_id)
         version = self._selected_version(db, row, version_id=version_id)
         manifest = load_version_manifest(version)
-        if manifest:
-            view_index = self._load_version_view_index(
-                db,
-                row,
-                version,
-                manifest=manifest,
-            )
-        else:
-            snapshot_root = self._legacy_snapshot_root(version)
-            view_index = self._load_version_view_index(
-                db,
-                row,
-                version,
-                snapshot_root=snapshot_root,
-            )
+        view_index = self._load_version_view_index(
+            db,
+            row,
+            version,
+            manifest=manifest,
+        )
         return build_view_payload_from_index(
             view_index,
             page=page,
@@ -1194,41 +1084,29 @@ class IllegalDatasetService:
         row = self.get_dataset(db, illegal_dataset_id)
         version = self._selected_version(db, row, version_id=version_id)
         manifest = load_version_manifest(version)
-        if manifest:
-            return self._build_manifest_annotations_payload(
-                manifest,
-                illegal_dataset_id=int(row.illegal_dataset_id),
-                version_id=int(version.version_id),
-                image_path=image_path,
-            )
-        snapshot_root = self._legacy_snapshot_root(version)
-        return build_annotations_payload(snapshot_root, str(version.snapshot_path), image_path)
+        return self._build_manifest_annotations_payload(
+            manifest,
+            illegal_dataset_id=int(row.illegal_dataset_id),
+            version_id=int(version.version_id),
+            image_path=image_path,
+        )
 
     def list_files(self, db: Session, illegal_dataset_id: int, *, version_id: int | None = None, page: int = 1, page_size: int = 100) -> tuple[list[dict[str, Any]], int]:
         row = self.get_dataset(db, illegal_dataset_id)
         version = self._selected_version(db, row, version_id=version_id)
         manifest = load_version_manifest(version)
-        if manifest:
-            return self._list_manifest_files(
-                manifest,
-                illegal_dataset_id=int(row.illegal_dataset_id),
-                version_id=int(version.version_id),
-                page=page,
-                page_size=page_size,
-            )
-        snapshot_root = self._legacy_snapshot_root(version)
-        return build_file_listing(snapshot_root, str(version.snapshot_path), page=page, page_size=page_size)
+        payload = self._load_manifest_file_listing_cache(
+            row,
+            version,
+            manifest=manifest,
+        )
+        return self._page_cached_file_listing(payload, page=page, page_size=page_size)
 
     def get_version_file_path(self, db: Session, illegal_dataset_id: int, version_id: int, file_path: str) -> Path:
         row = self.get_dataset(db, illegal_dataset_id)
         version = self._selected_version(db, row, version_id=version_id)
         manifest = load_version_manifest(version)
-        if manifest:
-            return manifest_cas_file_path(manifest, file_path, required=True)
-        snapshot_root = self._legacy_snapshot_root(version)
-        if str((version.meta or {}).get("source_type") or "") == "mounted_dir_link":
-            return resolve_dataset_file(snapshot_root, file_path)
-        return legacy_snapshot_file_path(snapshot_root, file_path)
+        return manifest_file_path(manifest, file_path, required=True)
 
     def upload_images(
         self,
@@ -1301,11 +1179,7 @@ class IllegalDatasetService:
         row = self.get_dataset(db, illegal_dataset_id)
         version = self._selected_version(db, row)
         manifest = load_version_manifest(version)
-        if manifest:
-            labels = set(self._load_version_raw_labels(row, version, manifest=manifest))
-        else:
-            snapshot_root = self._legacy_snapshot_root(version)
-            labels = set(self._load_version_raw_labels(row, version, root=snapshot_root))
+        labels = set(self._load_version_raw_labels(row, version, manifest=manifest))
         for mapping in db.query(IllegalDatasetLabelMapping).filter(IllegalDatasetLabelMapping.illegal_dataset_id == int(row.illegal_dataset_id)).all():
             labels.add(str(mapping.raw_label))
         return sorted(label for label in labels if label)
@@ -1438,11 +1312,7 @@ class IllegalDatasetService:
                 source_root = mounted_publish_root
             else:
                 manifest = load_version_manifest(version)
-                if manifest:
-                    materialize_manifest_to_dir(manifest, source_root, replace=True)
-                else:
-                    snapshot_root = self._legacy_snapshot_root(version)
-                    materialize_snapshot_to_dir(snapshot_root, source_root, replace=True)
+                materialize_manifest_to_dir(manifest, source_root, replace=True)
             if callable(progress_callback):
                 progress_callback(
                     "converting",

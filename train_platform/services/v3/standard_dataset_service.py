@@ -498,39 +498,6 @@ class StandardDatasetService:
         if delete_files:
             shutil.rmtree(root, ignore_errors=True)
 
-    def upload_archive(self, db: Session, standard_dataset_id: int, upload, *, created_by: str | None = None) -> StandardDataset:
-        row = self.get_dataset(db, standard_dataset_id)
-        root = self._root_path(row)
-        existing_files, _ = count_tree(root)
-        if existing_files > 0:
-            raise ConflictError("Standard dataset content is immutable after upload")
-        settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_dir = Path(tempfile.mkdtemp(dir=settings.temp_dir))
-        try:
-            extracted_root = unpack_uploaded_archive(upload, temp_dir)
-            yolo_root = self._resolve_uploaded_yolo_root(extracted_root)
-            if yolo_root is None:
-                raise ValidationError("Standard dataset upload only supports YOLO format")
-            copy_tree(yolo_root, root)
-            if not any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
-                FileService()._create_yolo_data_yaml(root, root / "data.yaml")
-            self._index_images(db, row)
-            self._refresh_dataset_statistics_cache(db, row)
-            self._refresh_dataset_view_index_cache(db, row)
-            self._add_event(
-                db,
-                int(row.standard_dataset_id),
-                "uploaded",
-                message="Standard dataset archive uploaded",
-                created_by=created_by,
-                data={"filename": str(getattr(upload, 'filename', '') or '')},
-            )
-            db.commit()
-            db.refresh(row)
-            return row
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
     def import_archive_file(
         self,
         db: Session,

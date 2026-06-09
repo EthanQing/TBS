@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
 from train_platform.models.v3.illegal_dataset import IllegalDatasetVersion
-from train_platform.services.v3.illegal_dataset_cas import load_version_manifest, manifest_cas_file_path
+from train_platform.services.v3.illegal_dataset_cas import load_version_manifest, manifest_file_path
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 from train_platform.services.v3.mounted_dataset_service import resolve_mounted_file
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
@@ -48,14 +48,8 @@ def get_thumbnail(
             if not ver:
                 raise NotFoundError("Illegal dataset version not found")
             manifest = load_version_manifest(ver)
-            if manifest:
-                source_path = manifest_cas_file_path(manifest, file_path, required=True)
-                cache_prefix = f"v{int(ver.version_id)}"
-            elif ver.snapshot_path:
-                root_token = ver.snapshot_path
-                cache_prefix = f"v{int(ver.version_id)}"
-                dataset_root = resolve_dataset_path(root_token).resolve(strict=False)
-                source_path = resolve_mounted_file(dataset_root, file_path)
+            source_path = manifest_file_path(manifest, file_path, required=True)
+            cache_prefix = f"v{int(ver.version_id)}"
     elif kind == "standard":
         ds = StandardDatasetService().get_dataset(db, int(dataset_id))
         root_token = ds.storage_path

@@ -23,7 +23,6 @@ from train_platform.schemas.v3.illegal_datasets import (
     IllegalDatasetListOut,
     IllegalDatasetOut,
     IllegalDatasetPublishJobOut,
-    IllegalDatasetPublishOut,
     IllegalDatasetPublishRequest,
     IllegalDatasetRawLabelsOut,
     IllegalDatasetUpdate,
@@ -99,28 +98,6 @@ def delete_illegal_dataset(
 ):
     svc.delete_dataset(db, illegal_dataset_id, delete_files=bool(delete_files), force=bool(force))
     return DeleteResponse(ok=True, message="Illegal dataset deleted")
-
-
-@router.post("/{illegal_dataset_id}/upload", response_model=IllegalDatasetOut, status_code=201, deprecated=True)
-def upload_illegal_dataset_archive(
-    illegal_dataset_id: int,
-    file: UploadFile = File(...),
-    message: str | None = Form(None),
-    created_by: str | None = Form(None),
-    db: Session = Depends(get_db),
-):
-    return svc.upload_archive(db, illegal_dataset_id, file, message=message, created_by=created_by, append=False)
-
-
-@router.post("/{illegal_dataset_id}/append", response_model=IllegalDatasetOut, status_code=201, deprecated=True)
-def append_illegal_dataset_archive(
-    illegal_dataset_id: int,
-    file: UploadFile = File(...),
-    message: str | None = Form(None),
-    created_by: str | None = Form(None),
-    db: Session = Depends(get_db),
-):
-    return svc.upload_archive(db, illegal_dataset_id, file, message=message, created_by=created_by, append=True)
 
 
 @router.post("/{illegal_dataset_id}/upload-sessions", response_model=DatasetUploadSessionOut, status_code=201)
@@ -291,15 +268,6 @@ def update_illegal_dataset_label_mappings(
     db: Session = Depends(get_db),
 ):
     return svc.update_label_mappings(db, illegal_dataset_id, items=[item.model_dump() for item in payload.items])
-
-
-@router.post("/{illegal_dataset_id}/publish", response_model=IllegalDatasetPublishOut, status_code=201)
-def publish_standard_dataset(
-    illegal_dataset_id: int,
-    payload: IllegalDatasetPublishRequest,
-    db: Session = Depends(get_db),
-):
-    return svc.publish_standard_dataset(db, illegal_dataset_id, obj=payload.model_dump())
 
 
 @router.post("/{illegal_dataset_id}/publish-jobs", response_model=IllegalDatasetPublishJobOut, status_code=202)

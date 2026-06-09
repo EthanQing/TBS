@@ -89,16 +89,6 @@ def delete_standard_dataset(
     return DeleteResponse(ok=True, message="Standard dataset deleted")
 
 
-@router.post("/{standard_dataset_id}/upload", response_model=StandardDatasetOut, status_code=201, deprecated=True)
-def upload_standard_dataset_archive(
-    standard_dataset_id: int,
-    file: UploadFile = File(...),
-    created_by: str | None = Form(None),
-    db: Session = Depends(get_db),
-):
-    return svc.upload_archive(db, standard_dataset_id, file, created_by=created_by)
-
-
 @router.post("/{standard_dataset_id}/upload-sessions", response_model=DatasetUploadSessionOut, status_code=201)
 def create_standard_upload_session(
     standard_dataset_id: int,

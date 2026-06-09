@@ -152,6 +152,22 @@ def store_file_in_cas(path: Path) -> dict[str, Any]:
     return {"hash": digest, "size": size, "mtime": mtime}
 
 
+def mounted_file_entry(path: Path) -> dict[str, Any]:
+    src = Path(path).resolve(strict=False)
+    if not src.exists() or not src.is_file():
+        raise NotFoundError(f"Mounted source file not found: {src}")
+    try:
+        st = src.stat()
+    except Exception as exc:
+        raise ValidationError(f"Cannot stat mounted source file: {src}") from exc
+    return {
+        "storage": "mounted",
+        "source_path": str(src),
+        "size": int(st.st_size),
+        "mtime": float(st.st_mtime),
+    }
+
+
 def iter_regular_files(root: Path) -> Iterable[Path]:
     root = Path(root)
     if not root.exists():
@@ -164,11 +180,7 @@ def scan_tree_to_cas_files(root: Path, *, base_files: Mapping[str, Mapping[str, 
     if not root.exists() or not root.is_dir():
         raise NotFoundError("Illegal dataset source tree not found")
     files: dict[str, dict[str, Any]] = {
-        safe_manifest_rel(rel): {
-            "hash": str(entry.get("hash") or ""),
-            "size": int(entry.get("size") or entry.get("size_bytes") or 0),
-            "mtime": float(entry.get("mtime") or 0.0),
-        }
+        safe_manifest_rel(rel): normalize_manifest_file_entry(entry)
         for rel, entry in (base_files or {}).items()
     }
     for path in sorted(iter_regular_files(root), key=lambda p: p.relative_to(root).as_posix()):
@@ -183,6 +195,33 @@ def _entry_hash(entry: Mapping[str, Any] | None) -> str:
     return str((entry or {}).get("hash") or "").strip().lower()
 
 
+def _entry_storage(entry: Mapping[str, Any] | None) -> str:
+    storage = str((entry or {}).get("storage") or "cas").strip().lower()
+    return "mounted" if storage == "mounted" else "cas"
+
+
+def normalize_manifest_file_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    storage = _entry_storage(entry)
+    normalized = {
+        "storage": storage,
+        "hash": _entry_hash(entry) if storage == "cas" else "",
+        "size": int(entry.get("size") or entry.get("size_bytes") or 0),
+        "mtime": float(entry.get("mtime") or 0.0),
+    }
+    if storage == "mounted":
+        source_path = str(entry.get("source_path") or entry.get("path") or "").strip()
+        if not source_path:
+            raise ValidationError("Mounted manifest file entry is missing source_path")
+        normalized["source_path"] = source_path
+    return normalized
+
+
+def _entry_identity(entry: Mapping[str, Any] | None) -> str:
+    if _entry_storage(entry) == "mounted":
+        return f"mounted:{str((entry or {}).get('source_path') or '')}:{int((entry or {}).get('size') or 0)}:{float((entry or {}).get('mtime') or 0.0)}"
+    return f"cas:{_entry_hash(entry)}"
+
+
 def build_manifest(
     *,
     dataset_id: int,
@@ -195,11 +234,7 @@ def build_manifest(
     normalized_files: dict[str, dict[str, Any]] = {}
     for rel, entry in files.items():
         rel_s = safe_manifest_rel(rel)
-        normalized_files[rel_s] = {
-            "hash": _entry_hash(entry),
-            "size": int(entry.get("size") or entry.get("size_bytes") or 0),
-            "mtime": float(entry.get("mtime") or 0.0),
-        }
+        normalized_files[rel_s] = normalize_manifest_file_entry(entry)
 
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -248,11 +283,7 @@ def load_manifest_path(path: Path) -> dict[str, Any]:
         rel_s = safe_manifest_rel(rel)
         if not isinstance(entry, dict):
             raise ValidationError("Invalid illegal dataset manifest file entry")
-        normalized[rel_s] = {
-            "hash": _entry_hash(entry),
-            "size": int(entry.get("size") or entry.get("size_bytes") or 0),
-            "mtime": float(entry.get("mtime") or 0.0),
-        }
+        normalized[rel_s] = normalize_manifest_file_entry(entry)
     data["files"] = normalized
     if not isinstance(data.get("stats"), dict):
         data["stats"] = {}
@@ -266,10 +297,10 @@ def load_manifest_token(token: str | Path | None) -> dict[str, Any] | None:
     return load_manifest_path(path)
 
 
-def load_version_manifest(version: Any) -> dict[str, Any] | None:
+def load_version_manifest(version: Any) -> dict[str, Any]:
     token = str(getattr(version, "manifest_path", "") or "").strip()
     if not token:
-        return None
+        raise NotFoundError("Illegal dataset version has no manifest")
     return load_manifest_token(token)
 
 
@@ -288,14 +319,27 @@ def manifest_entry(manifest: Mapping[str, Any], rel_path: str | Path, *, require
     return entry
 
 
+def manifest_file_path(manifest: Mapping[str, Any], rel_path: str | Path, *, required: bool = True) -> Path:
+    entry = manifest_entry(manifest, rel_path, required=True)
+    assert entry is not None
+    if _entry_storage(entry) == "mounted":
+        source_path = Path(str(entry.get("source_path") or "")).expanduser().resolve(strict=False)
+        if required and (not source_path.exists() or not source_path.is_file()):
+            raise NotFoundError("Mounted source file is no longer available")
+        return source_path
+    return cas_path_for_hash(str(entry.get("hash") or ""), require_exists=required)
+
+
 def manifest_cas_file_path(manifest: Mapping[str, Any], rel_path: str | Path, *, required: bool = True) -> Path:
     entry = manifest_entry(manifest, rel_path, required=True)
     assert entry is not None
+    if _entry_storage(entry) != "cas":
+        raise ValidationError("Manifest file is not stored in CAS")
     return cas_path_for_hash(str(entry.get("hash") or ""), require_exists=required)
 
 
 def read_manifest_text(manifest: Mapping[str, Any], rel_path: str | Path) -> str:
-    path = manifest_cas_file_path(manifest, rel_path, required=True)
+    path = manifest_file_path(manifest, rel_path, required=True)
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
@@ -358,7 +402,7 @@ def read_class_names_from_manifest(manifest: Mapping[str, Any]) -> list[str]:
 def manifest_image_size(manifest: Mapping[str, Any], image_rel_path: str | Path) -> tuple[int | None, int | None]:
     if Image is None:
         return None, None
-    path = manifest_cas_file_path(manifest, image_rel_path, required=True)
+    path = manifest_file_path(manifest, image_rel_path, required=True)
     try:
         with Image.open(path) as img:
             return int(img.width), int(img.height)
@@ -512,7 +556,7 @@ def extract_json_labels_from_manifest(manifest: Mapping[str, Any]) -> list[str]:
             continue
         if any(part.lower() in SKIP_JSON_LABEL_DIRS for part in path.parts[:-1]):
             continue
-        json_path = manifest_cas_file_path(manifest, rel, required=True)
+        json_path = manifest_file_path(manifest, rel, required=True)
         try:
             with json_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -552,7 +596,7 @@ def build_manifest_stats(
     unchanged_files = sum(
         1
         for rel, entry in files.items()
-        if rel in parent_files and _entry_hash(parent_files.get(rel)) == _entry_hash(entry)
+        if rel in parent_files and _entry_identity(parent_files.get(rel)) == _entry_identity(entry)
     )
     new_files = total_files - unchanged_files
     size_mb = round(float(total_size or 0) / (1024 * 1024), 2)
@@ -630,25 +674,9 @@ def materialize_manifest_to_dir(manifest: Mapping[str, Any], dst: Path, *, repla
     dst.mkdir(parents=True, exist_ok=True)
     for rel, entry in sorted(manifest_files(manifest).items()):
         rel_s = safe_manifest_rel(rel)
-        src = cas_path_for_hash(str(entry.get("hash") or ""), require_exists=True)
+        src = manifest_file_path(manifest, rel_s, required=True)
         target = _ensure_under_base(dst / rel_s, dst, "manifest materialization path")
         hardlink_file(src, target)
-
-
-def materialize_snapshot_to_dir(snapshot_root: Path, dst: Path, *, replace: bool = True) -> None:
-    src_root = Path(snapshot_root).resolve(strict=False)
-    if not src_root.exists() or not src_root.is_dir():
-        raise NotFoundError("Illegal dataset snapshot path not found")
-    dst = Path(dst).resolve(strict=False)
-    if replace:
-        remove_tree(dst)
-    dst.mkdir(parents=True, exist_ok=True)
-    for path in sorted(iter_regular_files(src_root), key=lambda p: p.relative_to(src_root).as_posix()):
-        if path.is_symlink():
-            raise ValidationError("Symlinks are not supported in illegal dataset snapshots")
-        rel = safe_manifest_rel(path.relative_to(src_root).as_posix())
-        target = _ensure_under_base(dst / rel, dst, "snapshot materialization path")
-        hardlink_file(path, target)
 
 
 def replace_dir_from_manifest(manifest: Mapping[str, Any], dst: Path) -> None:
@@ -665,25 +693,3 @@ def replace_dir_from_manifest(manifest: Mapping[str, Any], dst: Path) -> None:
         raise
 
 
-def replace_dir_from_snapshot(snapshot_root: Path, dst: Path) -> None:
-    dst = Path(dst).resolve(strict=False)
-    parent = dst.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(dir=str(parent), prefix=f".{dst.name}.staging."))
-    try:
-        materialize_snapshot_to_dir(snapshot_root, staging, replace=True)
-        remove_tree(dst)
-        staging.replace(dst)
-    except Exception:
-        remove_tree(staging)
-        raise
-
-
-def legacy_snapshot_file_path(snapshot_root: Path, rel_path: str | Path) -> Path:
-    root = Path(snapshot_root).resolve(strict=False)
-    rel = ensure_safe_relative_path(rel_path)
-    path = (root / rel).resolve(strict=False)
-    _ensure_under_base(path, root, "snapshot file path")
-    if not path.exists() or not path.is_file():
-        raise NotFoundError("File not found in illegal dataset snapshot")
-    return path
