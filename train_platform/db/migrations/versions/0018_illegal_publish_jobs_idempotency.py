@@ -20,10 +20,32 @@ depends_on = None
 
 TABLE_NAME = "illegal_dataset_publish_jobs"
 STANDARD_DATASET_ID_START = 2000000
+ALEMBIC_VERSION_TABLE = "alembic_version"
+ALEMBIC_VERSION_LENGTH = 255
 
 
 def _table_names() -> set[str]:
     return {str(name) for name in inspect(op.get_bind()).get_table_names()}
+
+
+def _ensure_alembic_version_length() -> None:
+    bind = op.get_bind()
+    if bind.dialect.name != "mysql" or ALEMBIC_VERSION_TABLE not in _table_names():
+        return
+
+    columns = inspect(bind).get_columns(ALEMBIC_VERSION_TABLE)
+    version_column = next((column for column in columns if column["name"] == "version_num"), None)
+    column_type = version_column.get("type") if version_column else None
+    current_length = getattr(column_type, "length", None)
+    if current_length is not None and current_length >= ALEMBIC_VERSION_LENGTH:
+        return
+
+    op.execute(
+        sa.text(
+            f"ALTER TABLE {ALEMBIC_VERSION_TABLE} "
+            f"MODIFY version_num VARCHAR({ALEMBIC_VERSION_LENGTH}) NOT NULL"
+        )
+    )
 
 
 def _index_names(table_name: str) -> set[str]:
@@ -50,6 +72,8 @@ def _bump_standard_dataset_auto_increment() -> None:
 
 
 def upgrade() -> None:
+    _ensure_alembic_version_length()
+
     tables = _table_names()
     if TABLE_NAME not in tables:
         op.create_table(
