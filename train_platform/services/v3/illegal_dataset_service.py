@@ -1264,6 +1264,8 @@ class IllegalDatasetService:
         *,
         obj: dict,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        publish_job_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         row = self.get_dataset(db, illegal_dataset_id)
         version = self._selected_version(db, row, version_id=obj.get("version_id"))
@@ -1289,11 +1291,17 @@ class IllegalDatasetService:
             "source_illegal_dataset_name": str(row.name),
             "source_illegal_version_id": int(version.version_id),
             "source_version": int(version.version),
+            "publish_job_id": str(publish_job_id) if publish_job_id else None,
+            "idempotency_key": str(idempotency_key) if idempotency_key else None,
             "label_mappings": mapping_snapshot,
             "label_filters": label_filters,
             "split": obj.get("split") or {},
             **(obj.get("publish_config") or {}),
         }
+        if publish_config.get("publish_job_id") is None:
+            publish_config.pop("publish_job_id", None)
+        if publish_config.get("idempotency_key") is None:
+            publish_config.pop("idempotency_key", None)
         from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 
         temp_dir = Path(tempfile.mkdtemp(dir=illegal_dataset_temp_root()))
@@ -1360,6 +1368,7 @@ class IllegalDatasetService:
                 description=obj.get("description"),
                 source_type="illegal_publish",
                 publish_config=publish_config,
+                commit=False,
             )
             self._add_event(
                 db,
@@ -1374,6 +1383,7 @@ class IllegalDatasetService:
                 },
             )
             db.commit()
+            db.refresh(standard)
             return {
                 "standard_dataset_id": int(standard.standard_dataset_id),
                 "name": standard.name,

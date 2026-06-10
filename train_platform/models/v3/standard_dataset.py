@@ -14,7 +14,7 @@ from train_platform.models.v3.enums import DatasetSplit, DatasetType
 class StandardDataset(V3Base):
     __tablename__ = "standard_datasets"
 
-    standard_dataset_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    standard_dataset_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
     dataset_type: Mapped[DatasetType] = mapped_column(
         Enum(DatasetType, values_callable=lambda x: [e.value for e in x]),

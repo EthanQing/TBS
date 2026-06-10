@@ -57,13 +57,6 @@ class StandardDatasetService:
     def __init__(self) -> None:
         self.repo = StandardDatasetRepository()
 
-    def _next_dataset_id(self, db: Session) -> int:
-        current_max = db.query(func.max(StandardDataset.standard_dataset_id)).scalar()
-        start = int(settings.standard_dataset_id_start)
-        if current_max is None:
-            return start
-        return max(start, int(current_max) + 1)
-
     def _root_path(self, dataset: StandardDataset) -> Path:
         return resolve_storage_token(dataset.storage_path)
 
@@ -472,7 +465,6 @@ class StandardDatasetService:
             raise ValidationError("Only YOLO dataset format is supported")
         self._ensure_name_available(db, name)
         row = StandardDataset(
-            standard_dataset_id=self._next_dataset_id(db),
             name=name,
             dataset_type=obj["dataset_type"],
             format=fmt,
@@ -763,6 +755,7 @@ class StandardDatasetService:
         source_type: str | None = None,
         publish_config: dict[str, Any] | None = None,
         created_by: str | None = None,
+        commit: bool = True,
     ) -> StandardDataset:
         row = self.create_dataset(
             db,
@@ -777,23 +770,31 @@ class StandardDatasetService:
             commit=False,
         )
         root = self._root_path(row)
-        copy_tree(source_root, root)
-        if not any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
-            FileService()._create_yolo_data_yaml(root, root / "data.yaml")
-        self._index_images(db, row)
-        self._refresh_dataset_statistics_cache(db, row)
-        self._refresh_dataset_view_index_cache(db, row)
-        self._add_event(
-            db,
-            int(row.standard_dataset_id),
-            "published",
-            message="Standard dataset materialized from source tree",
-            created_by=created_by,
-            data={"source_type": source_type},
-        )
-        db.commit()
-        db.refresh(row)
-        return row
+        try:
+            copy_tree(source_root, root)
+            if not any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
+                FileService()._create_yolo_data_yaml(root, root / "data.yaml")
+            self._index_images(db, row)
+            self._refresh_dataset_statistics_cache(db, row)
+            self._refresh_dataset_view_index_cache(db, row)
+            self._add_event(
+                db,
+                int(row.standard_dataset_id),
+                "published",
+                message="Standard dataset materialized from source tree",
+                created_by=created_by,
+                data={"source_type": source_type},
+            )
+            if commit:
+                db.commit()
+                db.refresh(row)
+            else:
+                db.flush()
+            return row
+        except Exception:
+            if not commit:
+                shutil.rmtree(root, ignore_errors=True)
+            raise
 
     def list_events(self, db: Session, standard_dataset_id: int, *, skip: int = 0, limit: int = 100) -> list[StandardDatasetEvent]:
         self.get_dataset(db, standard_dataset_id)

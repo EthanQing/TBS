@@ -253,6 +253,8 @@ class IllegalDatasetPublishJobOut(BaseModel):
     result: Optional[IllegalDatasetPublishOut] = None
     logs: list[str] = Field(default_factory=list)
     error_message: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    reused: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

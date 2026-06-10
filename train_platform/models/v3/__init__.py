@@ -26,6 +26,7 @@ from train_platform.models.v3.illegal_dataset import (
     IllegalDatasetEvent,
     IllegalDatasetImage,
     IllegalDatasetLabelMapping,
+    IllegalDatasetPublishJob,
     IllegalDatasetVersion,
 )
 from train_platform.models.v3.inference import InferenceRun
@@ -56,6 +57,7 @@ __all__ = [
     "IllegalDatasetEvent",
     "IllegalDatasetImage",
     "IllegalDatasetLabelMapping",
+    "IllegalDatasetPublishJob",
     "StandardDataset",
     "StandardDatasetEvent",
     "StandardDatasetImage",

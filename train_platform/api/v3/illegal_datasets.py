@@ -277,7 +277,8 @@ def create_illegal_dataset_publish_job(
     db: Session = Depends(get_db),
 ):
     job = publish_job_svc.create_job(db, int(illegal_dataset_id), payload)
-    publish_job_svc.start_job(int(illegal_dataset_id), str(job.job_id))
+    if job.status == "queued":
+        publish_job_svc.start_job(int(illegal_dataset_id), str(job.job_id))
     return job
 
 
