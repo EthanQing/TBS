@@ -7,7 +7,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
@@ -347,6 +347,7 @@ class DatasetUploadService:
         return task
 
     def run_task(self, task_id: str) -> None:
+        import_progress = self._make_import_progress_callback(task_id)
         with SessionLocal() as db:
             task = self.get_task(db, task_id)
             try:
@@ -409,6 +410,7 @@ class DatasetUploadService:
                             created_by=task.created_by,
                             append=(task.mode == "append"),
                             filename=source.name,
+                            progress_callback=import_progress,
                         )
                     else:
                         extracted_root, staging = self._extract_archive_for_task(db, task, source)
@@ -422,6 +424,7 @@ class DatasetUploadService:
                                 created_by=task.created_by,
                                 append=(task.mode == "append"),
                                 filename=source.name,
+                                progress_callback=import_progress,
                             )
                         finally:
                             shutil.rmtree(staging, ignore_errors=True)
@@ -496,6 +499,28 @@ class DatasetUploadService:
                 return
             last_progress["value"] = progress
             self._update_task(db, task, status="extracting", stage="extracting", progress=progress)
+
+        return _callback
+
+    def _make_import_progress_callback(self, task_id: str) -> Callable[[int, str], None]:
+        last_progress = {"value": -1}
+
+        def _callback(progress: int, stage: str) -> None:
+            progress = max(0, min(99, int(progress)))
+            if progress <= int(last_progress["value"]):
+                return
+            last_progress["value"] = progress
+            with SessionLocal() as progress_db:
+                task = progress_db.query(DatasetUploadTask).filter(DatasetUploadTask.task_id == str(task_id)).first()
+                if not task or str(task.status) in {"done", "failed", "cancelled"}:
+                    return
+                self._update_task(
+                    progress_db,
+                    task,
+                    status=str(stage or "validating"),
+                    stage=str(stage or "validating"),
+                    progress=progress,
+                )
 
         return _callback
 

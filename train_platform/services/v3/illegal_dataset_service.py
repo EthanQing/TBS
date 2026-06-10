@@ -401,11 +401,18 @@ class IllegalDatasetService:
         event_type: str = "version_created",
         event_message: str | None = None,
         event_data: dict[str, Any] | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> IllegalDatasetVersion:
+        def _progress(progress: int, stage: str) -> None:
+            if progress_callback:
+                progress_callback(progress, stage)
+
         version_no = self._next_version_no(db, dataset)
         parent_version_id = int(parent_version.version_id) if parent_version else None
         inherited_files = base_files or {}
+        _progress(76, "validating")
         files = scan_tree_to_cas_files(source_root, base_files=inherited_files)
+        _progress(80, "validating")
         manifest = build_manifest(
             dataset_id=int(dataset.illegal_dataset_id),
             version=version_no,
@@ -413,6 +420,7 @@ class IllegalDatasetService:
             files=files,
             parent_files=inherited_files,
         )
+        _progress(84, "validating")
         manifest_path = illegal_manifest_path(int(dataset.illegal_dataset_id), version_no)
         write_manifest(manifest, manifest_path)
         stats = manifest_stats_to_dataset_statistics(manifest)
@@ -431,11 +439,15 @@ class IllegalDatasetService:
         )
         db.add(row)
         db.flush()
+        _progress(88, "materializing")
         replace_dir_from_manifest(manifest, self._root_path(dataset))
         dataset.active_version_id = int(row.version_id)
+        _progress(92, "indexing")
         self._index_version_images(db, dataset, row)
         self._refresh_version_raw_labels_cache(dataset, row, manifest=manifest)
+        _progress(96, "indexing")
         self._refresh_version_view_index_cache(db, dataset, row, manifest=manifest)
+        _progress(98, "finalizing")
         self._add_event(
             db,
             int(dataset.illegal_dataset_id),
@@ -719,9 +731,12 @@ class IllegalDatasetService:
         created_by: str | None = None,
         append: bool = False,
         filename: str | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> IllegalDataset:
         row = self.get_dataset(db, illegal_dataset_id)
         with self._dataset_lock(int(row.illegal_dataset_id)):
+            if progress_callback:
+                progress_callback(75, "validating")
             row = self._lock_dataset_for_version_create(db, row)
             parent_version = self._active_version(db, row) if append else self.version_repo.get_latest(db, int(row.illegal_dataset_id))
             inherited_files = self._version_files_for_inheritance(parent_version) if append and parent_version else {}
@@ -736,6 +751,7 @@ class IllegalDatasetService:
                 event_type="appended" if append else "uploaded",
                 event_message="Illegal dataset archive appended" if append else "Illegal dataset archive uploaded",
                 event_data={"filename": str(filename or ""), "append": bool(append)},
+                progress_callback=progress_callback,
             )
             db.commit()
             db.refresh(row)
