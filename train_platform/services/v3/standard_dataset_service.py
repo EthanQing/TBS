@@ -382,8 +382,7 @@ class StandardDatasetService:
         except Exception:
             pass
 
-    def _dataset_with_statistics(self, db: Session, dataset: StandardDataset) -> dict[str, Any]:
-        statistics = self._build_dataset_statistics(db, dataset)
+    def _dataset_base_payload(self, dataset: StandardDataset) -> dict[str, Any]:
         return {
             "standard_dataset_id": int(dataset.standard_dataset_id),
             "name": dataset.name,
@@ -395,9 +394,29 @@ class StandardDatasetService:
             "publish_config": dataset.publish_config,
             "created_at": dataset.created_at,
             "updated_at": dataset.updated_at,
+        }
+
+    def _dataset_with_statistics(
+        self,
+        db: Session,
+        dataset: StandardDataset,
+        *,
+        include_statistics: bool = True,
+    ) -> dict[str, Any]:
+        payload = self._dataset_base_payload(dataset)
+        if not include_statistics:
+            payload.update({
+                "statistics": None,
+                "preview_image_url": None,
+            })
+            return payload
+
+        statistics = self._build_dataset_statistics(db, dataset)
+        payload.update({
             "statistics": statistics,
             "preview_image_url": self._first_image_preview_url(db, dataset, statistics=statistics),
-        }
+        })
+        return payload
 
     def _first_image_preview_url(
         self,
@@ -426,12 +445,23 @@ class StandardDatasetService:
             size=int(settings.thumbnail_size or 200),
         )
 
-    def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[dict[str, Any]]:
+    def list_datasets(
+        self,
+        db: Session,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+        format: str | None = None,
+        include_statistics: bool = True,
+    ) -> list[dict[str, Any]]:
         q = db.query(StandardDataset)
         if format:
             q = q.filter(StandardDataset.format == str(format))
         rows = q.order_by(StandardDataset.updated_at.desc()).offset(skip).limit(limit).all()
-        return [self._dataset_with_statistics(db, row) for row in rows]
+        return [
+            self._dataset_with_statistics(db, row, include_statistics=bool(include_statistics))
+            for row in rows
+        ]
 
     def create_dataset(self, db: Session, *, obj: dict, commit: bool = True) -> StandardDataset:
         name = str(obj.get("name") or "").strip()

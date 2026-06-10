@@ -50,6 +50,10 @@ def list_standard_datasets(
     page: int = 1,
     page_size: int = 50,
     format: str | None = Query(None),
+    include_statistics: bool = Query(
+        True,
+        description="Set false for lightweight reference lists that do not need statistics or preview images.",
+    ),
     db: Session = Depends(get_db),
 ):
     page = max(int(page), 1)
@@ -59,7 +63,13 @@ def list_standard_datasets(
     if format:
         q = q.filter(StandardDataset.format == str(format))
     total = q.count()
-    items = svc.list_datasets(db, skip=skip, limit=page_size, format=format)
+    items = svc.list_datasets(
+        db,
+        skip=skip,
+        limit=page_size,
+        format=format,
+        include_statistics=bool(include_statistics),
+    )
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
