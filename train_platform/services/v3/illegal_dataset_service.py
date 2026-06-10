@@ -495,23 +495,7 @@ class IllegalDatasetService:
             stats = manifest_stats_to_dataset_statistics(manifest)
             raw_labels = self._load_version_raw_labels(dataset, active_version, manifest=manifest)
         else:
-            stats = {
-                "total_files": 0,
-                "total_size_bytes": 0,
-                "total_size_mb": 0.0,
-                "size_mb": 0.0,
-                "dataset_size_mb": 0.0,
-                "total_images": 0,
-                "num_images": 0,
-                "image_count": 0,
-                "annotations_count": 0,
-                "target_count": 0,
-                "total_targets": 0,
-                "object_count": 0,
-                "total_objects": 0,
-                "num_classes": 0,
-                "class_count": 0,
-            }
+            stats = self._empty_dataset_statistics()
             raw_labels = []
 
         class_count = self._effective_illegal_class_count(
@@ -524,8 +508,37 @@ class IllegalDatasetService:
         stats["class_count"] = int(class_count)
         return stats
 
+    @staticmethod
+    def _empty_dataset_statistics() -> dict[str, Any]:
+        return {
+            "total_files": 0,
+            "total_size_bytes": 0,
+            "total_size_mb": 0.0,
+            "size_mb": 0.0,
+            "dataset_size_mb": 0.0,
+            "total_images": 0,
+            "num_images": 0,
+            "image_count": 0,
+            "annotations_count": 0,
+            "target_count": 0,
+            "total_targets": 0,
+            "object_count": 0,
+            "total_objects": 0,
+            "num_classes": 0,
+            "class_count": 0,
+            "declared_class_count": 0,
+            "used_class_count": 0,
+        }
+
     def _dataset_with_statistics(self, db: Session, dataset: IllegalDataset) -> dict[str, Any]:
-        statistics = self._build_dataset_statistics(db, dataset)
+        try:
+            statistics = self._build_dataset_statistics(db, dataset)
+        except (NotFoundError, ValidationError):
+            statistics = self._empty_dataset_statistics()
+        try:
+            preview_image_url = self._first_image_preview_url(db, dataset, statistics=statistics)
+        except (NotFoundError, ValidationError):
+            preview_image_url = None
         return {
             "illegal_dataset_id": int(dataset.illegal_dataset_id),
             "name": dataset.name,
@@ -537,7 +550,7 @@ class IllegalDatasetService:
             "created_at": dataset.created_at,
             "updated_at": dataset.updated_at,
             "statistics": statistics,
-            "preview_image_url": self._first_image_preview_url(db, dataset, statistics=statistics),
+            "preview_image_url": preview_image_url,
         }
 
     def _first_image_preview_url(
