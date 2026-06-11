@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import random
@@ -18,6 +19,8 @@ from rasterio.windows import Window
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
 
+logger = logging.getLogger(__name__)
+
 Image.MAX_IMAGE_PIXELS = None
 
 SKIPPABLE_IMAGE_ERRORS = (
@@ -27,6 +30,7 @@ SKIPPABLE_IMAGE_ERRORS = (
     rasterio.errors.RasterioError,
 )
 SKIPPABLE_CONVERSION_ERRORS = (ValidationError,) + SKIPPABLE_IMAGE_ERRORS
+FATAL_CONVERSION_ERRORS = (KeyboardInterrupt, SystemExit, MemoryError)
 
 try:
     from osgeo import gdal
@@ -1162,6 +1166,26 @@ class IllegalDatasetPublishService:
         successful_labels: set[str] = set()
         aggregate_stats = {"images": 0, "slices": 0, "labels": 0, "empty_slices": 0}
 
+        def skip_pair(image_path: Path, json_path: Path, exc: BaseException) -> None:
+            nonlocal completed
+            skip_name = f"{image_path.name} / {json_path.name}"
+            skipped_files.append(f"{skip_name}: {exc}")
+            warnings.append(f"Skipped {skip_name}: {exc}")
+            logger.warning("Skipped illegal dataset publish sample %s: %s", skip_name, exc)
+            completed += 1
+            if callable(progress_callback):
+                progress_callback(
+                    "converting",
+                    {
+                        "message": f"跳过 {skip_name}: {exc}",
+                        "processed": processed,
+                        "completed": completed,
+                        "total": len(pairs),
+                        "skipped": len(skipped_files),
+                        "current_file": skip_name,
+                    },
+                )
+
         for image_path, json_path in pairs:
             cfg = self._build_pair_cfg(
                 source_root=source_root,
@@ -1175,22 +1199,12 @@ class IllegalDatasetPublishService:
             try:
                 stats, global_label_map = self._run_single(cfg)
             except SKIPPABLE_CONVERSION_ERRORS as exc:
-                skip_name = f"{image_path.name} / {json_path.name}"
-                skipped_files.append(f"{skip_name}: {exc}")
-                warnings.append(f"Skipped {skip_name}: {exc}")
-                completed += 1
-                if callable(progress_callback):
-                    progress_callback(
-                        "converting",
-                        {
-                            "message": f"跳过 {skip_name}: {exc}",
-                            "processed": processed,
-                            "completed": completed,
-                            "total": len(pairs),
-                            "skipped": len(skipped_files),
-                            "current_file": skip_name,
-                        },
-                    )
+                skip_pair(image_path, json_path, exc)
+                continue
+            except FATAL_CONVERSION_ERRORS:
+                raise
+            except Exception as exc:
+                skip_pair(image_path, json_path, exc)
                 continue
 
             processed += 1
