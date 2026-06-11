@@ -30,7 +30,7 @@
 - 发布任务逻辑位于 `illegal_dataset_publish_job_service.py`。
 - 前端应通过 `/api/v3/illegal-datasets/{id}/publish-jobs` 创建后台发布任务，并轮询 `/publish-jobs/{job_id}` 展示 `phase`、`progress`、`processed/total`、`logs` 和 `error_message`；同步 `/publish` 接口已移除。
 - 发布任务以数据库表 `illegal_dataset_publish_jobs` 为状态源，并把状态镜像写到 `temp/illegal_dataset_publish_jobs/<dataset_id>/<job_id>/status.json` 兼容旧轮询排查。幂等键由源违规数据集、源版本、最终生效标签映射、过滤、切片、拆分和 publish_config 生成，排除 `name`/`description`；同一请求重复提交返回已有 queued/running/completed 任务，failed/cancelled 可重置后重试。
-- 发布转换会先按图片/JSON 基名配对，并兼容 `images/`、`json/`、`annotations/` 等顶层目录别名；缺图片或缺 JSON 的孤立文件会记录为 skipped/warnings 后跳过，不阻塞还有有效成对样本的发布。
+- 发布转换会先按图片/JSON 基名配对，并兼容 `images/`、`json/`、`annotations/` 等顶层目录别名；缺图片、缺 JSON、图片截断或图片不可解码的样本会记录为 skipped/warnings 后跳过，不阻塞还有有效样本的发布。
 - 违规数据集版本统一使用 `manifest_path`；挂载导入的图片条目可引用挂载源文件，生成的 YOLO labels 和配置文件仍记录在 manifest 中。历史 `manifest_path` 为空的版本不再支持访问。违规数据集不再对外提供文件列表、原图打开、图片标注查看、样本预览和缩略图；发布转换仍由后端内部读取 manifest 和源文件。
 - 遥感大图或窗口读取相关逻辑也在发布 service 中，修改时注意内存和切片边界。
 

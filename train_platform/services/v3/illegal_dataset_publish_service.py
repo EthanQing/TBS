@@ -12,13 +12,21 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import rasterio
 import yaml
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from rasterio.windows import Window
 
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
 
 Image.MAX_IMAGE_PIXELS = None
+
+SKIPPABLE_IMAGE_ERRORS = (
+    OSError,
+    ValueError,
+    UnidentifiedImageError,
+    rasterio.errors.RasterioError,
+)
+SKIPPABLE_CONVERSION_ERRORS = (ValidationError,) + SKIPPABLE_IMAGE_ERRORS
 
 try:
     from osgeo import gdal
@@ -625,22 +633,35 @@ def _should_use_numpy_reader(image_path: str) -> bool:
 
 def open_image_reader(image_path: str, *, slice_size: int) -> BaseImageReader:
     ext = Path(image_path).suffix.lower()
+    errors: list[str] = []
     if _should_use_numpy_reader(image_path):
-        return NumpyImageReader(image_path)
+        try:
+            return NumpyImageReader(image_path)
+        except SKIPPABLE_IMAGE_ERRORS as exc:
+            errors.append(f"PIL: {type(exc).__name__}: {exc}")
 
     if gdal is not None and ext in _WINDOWED_RASTER_EXTS:
         try:
             return GDALRasterReader(image_path, slice_size=slice_size)
-        except Exception:
-            pass
+        except SKIPPABLE_IMAGE_ERRORS as exc:
+            errors.append(f"GDAL: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            errors.append(f"GDAL: {type(exc).__name__}: {exc}")
 
     if gdal is not None:
         try:
             return GDALRasterReader(image_path, slice_size=slice_size)
-        except Exception:
-            pass
+        except SKIPPABLE_IMAGE_ERRORS as exc:
+            errors.append(f"GDAL: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            errors.append(f"GDAL: {type(exc).__name__}: {exc}")
 
-    return RasterioRasterReader(image_path, slice_size=slice_size)
+    try:
+        return RasterioRasterReader(image_path, slice_size=slice_size)
+    except SKIPPABLE_IMAGE_ERRORS as exc:
+        errors.append(f"rasterio: {type(exc).__name__}: {exc}")
+    detail = "; ".join(errors[-3:]) if errors else "unsupported or unreadable image"
+    raise ValidationError(f"Unreadable image file {Path(image_path).name}: {detail}")
 
 
 def save_slices(cfg: dict, slices: List[SliceInfo], reader: BaseImageReader) -> Dict[str, int]:
@@ -663,17 +684,27 @@ def save_slices(cfg: dict, slices: List[SliceInfo], reader: BaseImageReader) -> 
 
     for sl in sorted(slices_to_save, key=lambda item: (item.y, item.x, item.idx)):
         has_labels = len(sl.bboxes) > 0
-        rgb = reader.read_window_rgb(sl.x, sl.y, sl.w, sl.h)
+        try:
+            rgb = reader.read_window_rgb(sl.x, sl.y, sl.w, sl.h)
+        except SKIPPABLE_IMAGE_ERRORS as exc:
+            raise ValidationError(
+                f"Unreadable image window {Path(str(getattr(reader, 'image_path', ''))).name}: {type(exc).__name__}: {exc}"
+            ) from exc
 
         name = f"{prefix}_{sl.idx:06d}"
         img_path = img_dir / f"{name}.{ext}"
-        pil_img = Image.fromarray(rgb)
-        if ext in ("jpg", "jpeg"):
-            pil_img.save(img_path, quality=quality, optimize=False)
-        elif ext == "png":
-            pil_img.save(img_path, compress_level=max(0, min(9, png_compress_level)))
-        else:
-            pil_img.save(img_path)
+        try:
+            pil_img = Image.fromarray(rgb)
+            if ext in ("jpg", "jpeg"):
+                pil_img.save(img_path, quality=quality, optimize=False)
+            elif ext == "png":
+                pil_img.save(img_path, compress_level=max(0, min(9, png_compress_level)))
+            else:
+                pil_img.save(img_path)
+        except SKIPPABLE_IMAGE_ERRORS as exc:
+            raise ValidationError(
+                f"Failed to write converted image {img_path.name}: {type(exc).__name__}: {exc}"
+            ) from exc
 
         lbl_path = lbl_dir / f"{name}.txt"
         lines = [bbox_to_yolo(bbox, sl.w, sl.h) for bbox in sl.bboxes]
@@ -1143,20 +1174,21 @@ class IllegalDatasetPublishService:
             )
             try:
                 stats, global_label_map = self._run_single(cfg)
-            except ValidationError as exc:
-                skipped_files.append(f"{json_path.name}: {exc}")
-                warnings.append(f"Skipped {json_path.name}: {exc}")
+            except SKIPPABLE_CONVERSION_ERRORS as exc:
+                skip_name = f"{image_path.name} / {json_path.name}"
+                skipped_files.append(f"{skip_name}: {exc}")
+                warnings.append(f"Skipped {skip_name}: {exc}")
                 completed += 1
                 if callable(progress_callback):
                     progress_callback(
                         "converting",
                         {
-                            "message": f"跳过 {json_path.name}: {exc}",
+                            "message": f"跳过 {skip_name}: {exc}",
                             "processed": processed,
                             "completed": completed,
                             "total": len(pairs),
                             "skipped": len(skipped_files),
-                            "current_file": json_path.name,
+                            "current_file": skip_name,
                         },
                     )
                 continue

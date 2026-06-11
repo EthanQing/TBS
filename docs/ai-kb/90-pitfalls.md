@@ -44,6 +44,10 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 
 标准数据集详情页依赖 `standard_dataset_images` 和 `.dataset_stats.json` / `.dataset_view_index.json`，不是直接实时扫目录。若本地 `datasets/standard/<id>/images` 有文件、卡片有大小但图片数/目标数为 0，通常是发布或导入过程中索引/缓存未刷新完整。后端应在统计或视图缓存为 0 但数据库索引或目录存在图片时自动重建索引与缓存；发布转换标准数据集时避免在复制文件和索引完成前提前提交半成品数据集。
 
+## 违规数据集发布不要被单张坏图带崩
+
+违规数据集发布转换需要读取原图生成标准数据集，但大批量原始数据可能存在截断 JPEG、不可解码图片或窗口读取失败。转换循环应把这类单样本读图错误记录到 `warnings` / `skipped_details` 并继续处理后续样本；只有全部图片/JSON 对都失败或没有生成任何有效 YOLO 样本时，才让发布任务失败。
+
 ## 标准数据集主键必须由数据库生成
 
 `standard_datasets.standard_dataset_id` 依赖数据库自增和迁移设置的 ID 段。不要在应用层用 `MAX(standard_dataset_id)+1` 或固定值生成主键；并发转换/重复提交时这种写法会让多个任务拿到同一个 ID，触发 `Duplicate entry ... for key 'standard_datasets.PRIMARY'`。

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -29,6 +31,45 @@ def test_collect_pairs_ignores_mounted_manifest(tmp_path: Path) -> None:
     assert pairs == []
     assert warnings == []
     assert unmatched_files == []
+
+
+def test_convert_dataset_skips_truncated_image_and_keeps_valid_pairs(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "output"
+    source_root.mkdir()
+
+    good_image = source_root / "good.jpg"
+    Image.new("RGB", (64, 64), (255, 0, 0)).save(good_image)
+    good_json = {
+        "shapes": [
+            {
+                "label": "car",
+                "shape_type": "rectangle",
+                "points": [[5, 5], [40, 40]],
+            }
+        ]
+    }
+    (source_root / "good.json").write_text(json.dumps(good_json), encoding="utf-8")
+
+    bad_image = source_root / "bad.jpg"
+    bad_image.write_bytes(good_image.read_bytes()[:-13])
+    (source_root / "bad.json").write_text(json.dumps(good_json), encoding="utf-8")
+
+    events: list[tuple[str, dict]] = []
+    result = IllegalDatasetPublishService().convert_dataset(
+        source_root,
+        output_root,
+        label_mapping={"car": "car"},
+        publish_config={"slice": {"enabled": False, "output_format": "jpg"}},
+        progress_callback=lambda phase, info: events.append((phase, info)),
+    )
+
+    assert result["pairs_total"] == 2
+    assert result["pairs_processed"] == 1
+    assert result["pairs_skipped"] == 1
+    assert any("bad.jpg / bad.json" in item for item in result["warnings"])
+    assert any("跳过 bad.jpg / bad.json" in str(info.get("message", "")) for _phase, info in events)
+    assert len(list((output_root / "images").glob("*.jpg"))) == 1
 
 
 def test_publish_uses_original_source_for_mounted_json_versions(tmp_path: Path, monkeypatch) -> None:
@@ -144,8 +185,6 @@ def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -
                 "image_count": 1,
                 "image_paths": ["images/sample.jpg"],
             }
-            import json
-
             (target_root / ".mounted_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             return manifest
 
@@ -165,7 +204,6 @@ def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -
         monkeypatch.setattr(service_module, "link_source_tree", fake_link_source_tree)
         monkeypatch.setattr(svc, "_refresh_version_raw_labels_cache", lambda *_args, **_kwargs: [])
         monkeypatch.setattr(svc, "_refresh_version_statistics_cache", lambda *_args, **_kwargs: {})
-        monkeypatch.setattr(svc, "_refresh_version_view_index_cache", lambda *_args, **_kwargs: {})
 
         result = svc.import_mounted_source_tree(db, 1000004, source_root, append=True, filename="train")
 
