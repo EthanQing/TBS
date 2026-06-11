@@ -24,7 +24,6 @@ from train_platform.models.v3.enums import DatasetVersionStatus
 from train_platform.repositories.v3.illegal_dataset_repo import IllegalDatasetRepository
 from train_platform.repositories.v3.illegal_dataset_version_repo import IllegalDatasetVersionRepository
 from train_platform.services.v3.dataset_common import (
-    build_view_payload_from_index,
     detect_split_from_relpath,
     load_cached_json_file,
     resolve_storage_token,
@@ -57,7 +56,6 @@ from train_platform.services.v3.illegal_dataset_cas import (
 )
 from train_platform.services.v3.illegal_dataset_publish_service import IllegalDatasetPublishService
 from train_platform.services.v3.mounted_dataset_service import link_source_tree
-from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
 
@@ -333,7 +331,6 @@ class IllegalDatasetService:
         }
 
         write_cached_json_file(self._version_view_index_cache_path(dataset, version), view_index)
-        self._prewarm_version_thumbnails(dataset, version, view_index)
         return view_index
 
     def _load_version_view_index(
@@ -355,29 +352,7 @@ class IllegalDatasetService:
         )
 
     def _prewarm_version_thumbnails(self, dataset: IllegalDataset, version: IllegalDatasetVersion, view_index: dict[str, Any]) -> None:
-        if int(dataset.active_version_id or 0) != int(version.version_id):
-            return
-        limit = max(0, int(settings.thumbnail_first_page_prewarm or 0))
-        if limit <= 0:
-            return
-        items = view_index.get("items") if isinstance(view_index, dict) else []
-        if not isinstance(items, list) or not items:
-            return
-        rel_paths = [str(item.get("path") or "") for item in items[:limit] if str(item.get("path") or "")]
-        if not rel_paths:
-            return
-        try:
-            ThumbnailService().pregenerate_for_dataset(
-                dataset_id=int(dataset.illegal_dataset_id),
-                dataset_root=self._root_path(dataset),
-                size=int(settings.thumbnail_size or 200),
-                max_workers=int(settings.thumbnail_max_workers or 4),
-                dataset_namespace="illegal",
-                cache_prefix=f"v{int(version.version_id)}",
-                rel_paths=rel_paths,
-            )
-        except Exception:
-            pass
+        return
 
     def _version_files_for_inheritance(
         self,
@@ -446,7 +421,6 @@ class IllegalDatasetService:
         self._index_version_images(db, dataset, row)
         self._refresh_version_raw_labels_cache(dataset, row, manifest=manifest)
         _progress(96, "indexing")
-        self._refresh_version_view_index_cache(db, dataset, row, manifest=manifest)
         _progress(98, "finalizing")
         self._add_event(
             db,
@@ -547,10 +521,7 @@ class IllegalDatasetService:
             statistics = self._build_dataset_statistics(db, dataset)
         except (NotFoundError, ValidationError):
             statistics = self._empty_dataset_statistics()
-        try:
-            preview_image_url = self._first_image_preview_url(db, dataset, statistics=statistics)
-        except (NotFoundError, ValidationError):
-            preview_image_url = None
+        preview_image_url = None
         return {
             "illegal_dataset_id": int(dataset.illegal_dataset_id),
             "name": dataset.name,
@@ -841,7 +812,6 @@ class IllegalDatasetService:
             link_source_tree(active_root, Path(source_root), prefer_yolo=True)
             self._index_version_images(db, row, version_row)
             self._refresh_version_raw_labels_cache(row, version_row, manifest=manifest)
-            self._refresh_version_view_index_cache(db, row, version_row, manifest=manifest)
             self._add_event(
                 db,
                 int(row.illegal_dataset_id),
@@ -1081,33 +1051,17 @@ class IllegalDatasetService:
         page: int = 1,
         page_size: int = 50,
     ) -> dict[str, Any]:
-        row = self.get_dataset(db, illegal_dataset_id)
-        version = self._selected_version(db, row, version_id=version_id)
-        manifest = load_version_manifest(version)
-        view_index = self._load_version_view_index(
-            db,
-            row,
-            version,
-            manifest=manifest,
-        )
-        return build_view_payload_from_index(
-            view_index,
-            page=page,
-            page_size=page_size,
-            class_id=class_id,
-            file_url_builder=lambda rel_path: illegal_dataset_file_url(
-                int(row.illegal_dataset_id),
-                int(version.version_id),
-                rel_path,
-            ),
-            thumbnail_url_builder=lambda rel_path: dataset_thumbnail_url(
-                "illegal",
-                int(row.illegal_dataset_id),
-                rel_path,
-                version_id=int(version.version_id),
-                size=320,
-            ),
-        )
+        self.get_dataset(db, illegal_dataset_id)
+        return {
+            "categories": [],
+            "items": [],
+            "meta": {
+                "page": int(page),
+                "page_size": int(page_size),
+                "total_items": 0,
+                "total_pages": 1,
+            },
+        }
 
     def get_image_annotations(self, db: Session, illegal_dataset_id: int, *, image_path: str, version_id: int | None = None) -> dict[str, Any]:
         row = self.get_dataset(db, illegal_dataset_id)

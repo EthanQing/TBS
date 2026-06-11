@@ -5,8 +5,6 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.models.v3.illegal_dataset import IllegalDatasetVersion
-from train_platform.services.v3.illegal_dataset_cas import load_version_manifest, manifest_file_path
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 from train_platform.services.v3.mounted_dataset_service import resolve_mounted_file
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
@@ -34,22 +32,8 @@ def get_thumbnail(
     source_path = None
 
     if kind == "illegal":
-        ds = IllegalDatasetService().get_dataset(db, int(dataset_id))
-        root_token = ds.storage_path
-        if version_id is not None:
-            ver = (
-                db.query(IllegalDatasetVersion)
-                .filter(
-                    IllegalDatasetVersion.version_id == int(version_id),
-                    IllegalDatasetVersion.illegal_dataset_id == int(ds.illegal_dataset_id),
-                )
-                .first()
-            )
-            if not ver:
-                raise NotFoundError("Illegal dataset version not found")
-            manifest = load_version_manifest(ver)
-            source_path = manifest_file_path(manifest, file_path, required=True)
-            cache_prefix = f"v{int(ver.version_id)}"
+        IllegalDatasetService().get_dataset(db, int(dataset_id))
+        raise NotFoundError("Illegal dataset thumbnails are disabled")
     elif kind == "standard":
         ds = StandardDatasetService().get_dataset(db, int(dataset_id))
         root_token = ds.storage_path
