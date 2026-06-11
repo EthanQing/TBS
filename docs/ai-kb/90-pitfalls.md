@@ -54,11 +54,11 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 
 ## 违规数据集版本必须有 manifest
 
-`GET /api/v3/illegal-datasets/{id}/files`、详情统计和发布都依赖 `illegal_dataset_versions.manifest_path`。挂载导入也必须生成 manifest，图片条目可以引用挂载源文件。违规数据集已取消样本预览和缩略图生成，不要为了恢复预览而恢复 `snapshot_path` 或无 manifest 历史版本的目录扫描兼容，否则 200-300G 或大量小文件数据集会重新出现每次进详情等待十几秒的问题。
+详情统计和发布都依赖 `illegal_dataset_versions.manifest_path`。挂载导入也必须生成 manifest，图片条目可以引用挂载源文件。违规数据集已取消文件列表、原图打开、图片标注查看、样本预览和缩略图生成，不要为了恢复浏览能力而恢复 `snapshot_path`、无 manifest 历史版本目录扫描或逐文件 exists 检查，否则 200-300G 或大量小文件数据集会重新出现每次进详情等待十几秒的问题。
 
 ## 违规数据集列表应容忍坏版本
 
-`GET /api/v3/illegal-datasets` 是管理页入口，不应因为某一条历史/异常数据集的 active version 缺少 manifest 而整体 404。列表构建统计时应对 `NotFoundError` / manifest 校验错误降级为空统计；违规数据集预览图固定为空。详情、文件列表、统计和发布接口仍应保留对坏版本的明确错误。
+`GET /api/v3/illegal-datasets` 是管理页入口，不应因为某一条历史/异常数据集的 active version 缺少 manifest 而整体 404。列表构建统计时应对 `NotFoundError` / manifest 校验错误降级为空统计；违规数据集预览图固定为空，且不提供文件浏览接口。详情、统计和发布接口仍应保留对坏版本的明确错误。
 
 ## 数据集列表排序需要数据库索引
 

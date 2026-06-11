@@ -66,14 +66,6 @@ class IllegalDatasetEventOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class DatasetFileOut(BaseModel):
-    path: str
-    size_bytes: int
-    mtime: float
-    url: Optional[str] = None
-    exists: bool = True
-
-
 class DatasetImageOut(BaseModel):
     image_id: int
     path: str
@@ -148,24 +140,6 @@ class DatasetViewOut(BaseModel):
     categories: list[CategoryInfo]
     items: list[ViewImageItem]
     meta: ViewMeta
-
-
-class DatasetImageAnnotationBoxOut(BaseModel):
-    class_id: int
-    class_name: str
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-
-
-class DatasetImageAnnotationsOut(BaseModel):
-    image_path: str
-    image_url: str
-    width: Optional[int] = None
-    height: Optional[int] = None
-    object_count: int = 0
-    boxes: list[DatasetImageAnnotationBoxOut] = Field(default_factory=list)
 
 
 class IllegalDatasetLabelMappingRow(BaseModel):

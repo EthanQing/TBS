@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-import mimetypes
-
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
-from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
 from train_platform.models.v3.illegal_dataset import IllegalDataset, IllegalDatasetEvent, IllegalDatasetVersion
 from train_platform.schemas.v3.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v3.illegal_datasets import (
-    DatasetFileOut,
-    DatasetImageAnnotationsOut,
     DatasetImageUploadOut,
     DatasetStatisticsOut,
     DatasetViewOut,
@@ -208,18 +203,6 @@ def activate_illegal_dataset_version(illegal_dataset_id: int, version_id: int, d
     return svc.activate_version(db, illegal_dataset_id, version_id)
 
 
-@router.get("/{illegal_dataset_id}/versions/{version_id}/files/{file_path:path}")
-def get_illegal_dataset_version_file(
-    illegal_dataset_id: int,
-    version_id: int,
-    file_path: str,
-    db: Session = Depends(get_db),
-):
-    path = svc.get_version_file_path(db, illegal_dataset_id, version_id, file_path)
-    media_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-    return FileResponse(path=str(path), media_type=media_type)
-
-
 @router.get("/{illegal_dataset_id}/events", response_model=Page[IllegalDatasetEventOut])
 def list_illegal_dataset_events(
     illegal_dataset_id: int,
@@ -299,16 +282,6 @@ def get_illegal_dataset_view(
     return svc.get_view(db, illegal_dataset_id, version_id=version_id, class_id=class_id, page=page, page_size=page_size)
 
 
-@router.get("/{illegal_dataset_id}/image-annotations", response_model=DatasetImageAnnotationsOut)
-def get_illegal_dataset_image_annotations(
-    illegal_dataset_id: int,
-    image_path: str = Query(...),
-    version_id: int | None = Query(None),
-    db: Session = Depends(get_db),
-):
-    return svc.get_image_annotations(db, illegal_dataset_id, image_path=image_path, version_id=version_id)
-
-
 @router.get("/{illegal_dataset_id}/statistics", response_model=DatasetStatisticsOut)
 def get_illegal_dataset_statistics(
     illegal_dataset_id: int,
@@ -316,17 +289,3 @@ def get_illegal_dataset_statistics(
     db: Session = Depends(get_db),
 ):
     return svc.get_statistics(db, illegal_dataset_id, version_id=version_id)
-
-
-@router.get("/{illegal_dataset_id}/files", response_model=Page[DatasetFileOut])
-def list_illegal_dataset_files(
-    illegal_dataset_id: int,
-    version_id: int | None = Query(None),
-    page: int = 1,
-    page_size: int = 100,
-    db: Session = Depends(get_db),
-):
-    page = max(int(page), 1)
-    page_size = min(max(int(page_size), 1), 500)
-    items, total = svc.list_files(db, illegal_dataset_id, version_id=version_id, page=page, page_size=page_size)
-    return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
