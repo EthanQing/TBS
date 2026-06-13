@@ -27,7 +27,7 @@ def test_yolo_worker_uses_worker_id_env(monkeypatch):
         def tick(self):
             pass
 
-    monkeypatch.setenv("WORKER_ID", "worker-yolo-gpu0-slot1")
+    monkeypatch.setenv("WORKER_ID", "custom-yolo-worker-a")
     monkeypatch.setattr(yolo_worker, "DbQueueWorker", FakeTrainingWorker)
     monkeypatch.setattr(yolo_worker, "ModelConversionQueueWorker", FakeConversionWorker)
     monkeypatch.setattr(yolo_worker, "settings", SimpleNamespace(ensure_dirs=lambda: None))
@@ -35,6 +35,6 @@ def test_yolo_worker_uses_worker_id_env(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         yolo_worker.main()
 
-    assert seen["worker_id"] == "worker-yolo-gpu0-slot1"
-    assert seen["conversion_worker_id"] == "worker-yolo-gpu0-slot1"
+    assert seen["worker_id"] == "custom-yolo-worker-a"
+    assert seen["conversion_worker_id"] == "custom-yolo-worker-a"
     assert seen["allowed_engines"] == {"ultralytics-yolo"}
