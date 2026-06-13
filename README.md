@@ -2,11 +2,11 @@
 
 TBS Backend is a training platform backend built with **FastAPI**, **SQLAlchemy**, and **Alembic**. It provides APIs and worker components for dataset management, training orchestration, deployment, inference, alerting, and system resource monitoring.
 
-> Current stable API namespace: ` /api/v2 `
+> Current stable API namespace: `/api/v3`
 
 ## Features
 
-- Dataset management, conversion, and augmentation
+- Dataset management, mounted imports, publishing, and augmentation
 - Project and model version management
 - Training run orchestration
 - Pluggable training framework architecture
@@ -31,11 +31,11 @@ TBS Backend is a training platform backend built with **FastAPI**, **SQLAlchemy*
 
 ```text
 train_platform/
-  api/v2/          API routers
+  api/v3/          API routers
   core/            configuration and shared infrastructure
   db/              database initialization and migrations
-  schemas/         Pydantic schemas
-  services/        application services
+  schemas/v3/      Pydantic schemas
+  services/v3/     application services
   training/        training plugins and runtime logic
   workers/         worker entrypoints
 
@@ -191,6 +191,7 @@ For offline deployments, place large ZIP files or extracted dataset directories 
 - `UPLOAD_CHUNK_SIZE_MB` defaults to `64`.
 - `UPLOAD_SESSION_TTL_HOURS` defaults to `24`.
 - Mount `BASE_DATASETS_DIR`, `BASE_UPLOAD_SESSIONS_DIR`, `BASE_DATASET_STAGING_DIR`, and `BASE_IMPORTS_DIR` on large-capacity storage.
+- Directory import and mounted-link import only see paths visible to the backend process or container. Mount network shares into the host/container first, then expose them through `BASE_IMPORTS_DIR` or `DATASET_IMPORT_ROOTS`.
 - Configure Nginx upload routes with enough `proxy_read_timeout` / `proxy_send_timeout`, and keep request-body temp storage off the container overlay filesystem.
 
 ### Inference restrictions
@@ -209,11 +210,11 @@ For offline deployments, place large ZIP files or extracted dataset directories 
 
 ## System Metrics API
 
-The backend exposes resource monitoring endpoints under ` /api/v2/system-metrics `:
+The backend exposes resource monitoring endpoints under `/api/v3/system-metrics`:
 
-- `GET /api/v2/system-metrics/summary`
-- `GET /api/v2/system-metrics/history`
-- `GET /api/v2/system-metrics/nodes`
+- `GET /api/v3/system-metrics/summary`
+- `GET /api/v3/system-metrics/history`
+- `GET /api/v3/system-metrics/nodes`
 
 Collected metrics include:
 
@@ -236,18 +237,23 @@ The project includes a pluggable training framework system for:
 - retrieving plugin configuration schemas
 - validating and normalizing framework-specific training configuration
 
-See:
-
-- `docs/framework_plugins_api.md`
+See `docs/11_辅助接口.md`.
 
 ## Documentation
 
-- `docs/datasets_api.md`
-- `docs/large_dataset_upload_reliability_backend.md`
-- `docs/alarms_api.md`
-- `docs/framework_plugins_api.md`
-- `docs/paddle_local_dev.md`
-- `docs/custom_script_integration/`
+- `docs/00_概述.md`
+- `docs/01_项目管理.md`
+- `docs/02_数据集管理.md`
+- `docs/03_训练任务.md`
+- `docs/04_模型版本.md`
+- `docs/05_模型部署.md`
+- `docs/06_推理服务.md`
+- `docs/07_在线服务.md`
+- `docs/08_数据集转换与增强.md`
+- `docs/09_模型转换.md`
+- `docs/10_系统监控与告警.md`
+- `docs/11_辅助接口.md`
+- `docs/12_合格模型.md`
 
 ## Development Notes
 

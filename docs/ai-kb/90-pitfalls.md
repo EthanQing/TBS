@@ -1,8 +1,8 @@
 # 常见坑点
 
-## API 版本容易混淆
+## 历史 API 版本容易混淆
 
-README 顶部和旧人工 docs 中仍有 `/api/v2` 描述，但当前代码在 `train_platform/app.py` 中注册 `api.v3`，统一前缀是 `/api/v3`。改接口或排查路由时以代码为准。
+当前代码在 `train_platform/app.py` 中注册 `api.v3`，统一前缀是 `/api/v3`。README 和人工 API 文档已刷新为 v3；如果历史提示词、旧交付文档或截图仍写 `/api/v2`，改接口或排查路由时以代码为准。
 
 ## `docs/` 当前被 `.gitignore` 忽略
 
