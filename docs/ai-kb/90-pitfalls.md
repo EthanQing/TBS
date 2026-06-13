@@ -91,3 +91,7 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 ## Worker 状态需要成套维护
 
 训练、推理、部署和转换都有排队、运行、取消、失败、完成等状态。修改某个状态时要同步检查 API 响应、数据库/文件状态、WebSocket 或轮询查询逻辑。
+
+## 多 YOLO worker 要同时核对 ID 和 GPU 可见性
+
+`workers/yolo_worker.py` 应尊重 `WORKER_ID`；多容器部署时如果日志仍显示相同 `worker_id`，训练任务事件和数据库领取记录会看起来像同一个 worker 在工作。`WORKER_ID` 只影响队列身份，不负责 GPU 隔离。Docker compose 中配置 GPU 后仍要进入每个 worker 容器检查 `NVIDIA_VISIBLE_DEVICES`、`CUDA_VISIBLE_DEVICES`、`nvidia-smi -L` 和 `torch.cuda.device_count()`；如果每个容器都能看到所有 GPU，多个 worker 可能会争抢同一张卡，表现为“多 worker 没有效果”或更慢。

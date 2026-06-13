@@ -125,6 +125,13 @@ YOLO worker:
 python -m train_platform.workers.yolo_worker
 ```
 
+Set `WORKER_ID` when running multiple YOLO worker instances. The dedicated
+YOLO entrypoint falls back to `worker-yolo` when the variable is not set, and
+uses the provided value in queue claims, events, and logs when it is set.
+For multi-GPU Docker deployments, also verify the GPU visibility inside each
+container because `WORKER_ID` only identifies the queue worker; it does not bind
+the process to a GPU by itself.
+
 The YOLO worker also polls queued model-conversion jobs from
 `temp/model_conversions` and runs PT/PTH -> ONNX conversion locally in the
 worker process.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import time
 
@@ -10,7 +11,10 @@ from train_platform.workers.worker import DbQueueWorker
 
 def main() -> None:
     # Dedicated entrypoint for Ultralytics YOLO training jobs and YOLO-side utility jobs.
-    training_worker = DbQueueWorker(worker_id="worker-yolo", allowed_engines={"ultralytics-yolo"})
+    training_worker = DbQueueWorker(
+        worker_id=os.getenv("WORKER_ID") or "worker-yolo",
+        allowed_engines={"ultralytics-yolo"},
+    )
     conversion_worker = ModelConversionQueueWorker(worker_id=training_worker.worker_id)
     engines_text = ",".join(sorted(training_worker.allowed_engines)) if training_worker.allowed_engines else "*"
     print(f"[worker] starting worker_id={training_worker.worker_id} engines={engines_text}", flush=True)
