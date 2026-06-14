@@ -2,7 +2,7 @@
 
 # Build protected runtime sources. API/schema/migration code remains readable for
 # framework reflection; services/workers are protected by PyArmor by default.
-FROM python:3.10-slim-bookworm AS source-protector
+FROM python:3.11-slim-bookworm AS source-protector
 
 ARG SOURCE_PROTECTION_MODE=pyarmor
 ARG PYARMOR_VERSION=8.5.12
