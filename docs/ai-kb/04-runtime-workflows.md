@@ -48,6 +48,8 @@
 训练参数 `lr_scheduler` 默认 `linear`；选择 `cosine` 时，Ultralytics 使用 `cos_lr=true`，PaddleDetection 使用 `CosineDecay` 替换主学习率调度器并保留 warmup。
 PaddleDetection 训练插件通过 `utils/paddledet_paths.py` 解析完整 `release/2.6` 源码 checkout，先把 repo root 加入 `sys.path` 再导入 `ppdet`。不要依赖 `paddledet` pip 包；该包不包含平台需要的官方 `configs/` YAML 树。
 
+训练完成后的导出接口是 `POST /api/v3/training-runs/{run_id}/export` 和随后返回的 `/export/download`。默认下载单个 `.pt` 或 `.onnx` 文件；`include_report=true` 时，下载接口会调用 `TrainingRunService().build_report()` 和 DOCX 生成工具即时生成训练报告，并把模型文件与报告打包成 ZIP 返回。
+
 YOLO 专用 worker 会优先使用环境变量 `WORKER_ID`，未设置时回退到 `worker-yolo`。多容器或多 GPU 部署时应为每个 worker 设置任意稳定且唯一的 `WORKER_ID`；代码会原样使用该值，不要求容器名或 ID 遵循特定格式。这样 `TrainingRun.worker_id`、事件和日志才能区分实际领取任务的实例。队列并发以任务为粒度：一个 worker 同时只执行一个训练子进程，多 worker 只会并行领取多个 queued 任务，不会自动拆分单个训练任务。
 
 GPU 绑定由容器运行时和训练参数共同决定。`device=auto` 会继承容器内可见 CUDA 设备；显式 `device=0` 会在训练子进程内设置 `CUDA_VISIBLE_DEVICES=0` 并传给框架本地设备 0。排查多 GPU 部署时，应在每个 worker 容器内检查 `NVIDIA_VISIBLE_DEVICES`、`CUDA_VISIBLE_DEVICES`、`nvidia-smi -L` 和 `torch.cuda.device_count()`，确认容器确实只看到预期 GPU。

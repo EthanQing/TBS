@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 import os
 from pathlib import Path
+from urllib.parse import quote
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import APIRouter, Body, Depends, Query, HTTPException
 from fastapi import WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 import requests
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -42,6 +45,7 @@ from train_platform.utils.exceptions import NotFoundError, ValidationError
 from train_platform.utils.training_augmentations import get_training_augmentation_options
 from train_platform.utils.training_loss_weights import get_training_loss_weight_options
 from train_platform.utils.mlflow_utils import fetch_mlflow_epoch_metrics
+from train_platform.utils.training_report_docx import build_training_report_docx, build_training_report_filename
 
 
 router = APIRouter(prefix="/training-runs", tags=["training-runs"])
@@ -90,6 +94,34 @@ def _export_onnx_via_worker(
     err = data.get("error")
     if err:
         raise ValidationError(err)
+
+
+def _training_export_download_url(run_id: str, fmt: str, weights: str, include_report: bool = False) -> str:
+    url = f"/api/v3/training-runs/{run_id}/export/download?format={fmt}&weights={weights}"
+    if include_report:
+        url += "&include_report=1"
+    return url
+
+
+def _build_export_with_report_zip(
+    *,
+    run: TrainingRun,
+    export_path: Path,
+    fmt: str,
+    weights: str,
+    db: Session,
+) -> tuple[bytes, str]:
+    report = TrainingRunService().build_report(db, str(run.run_id))
+    report_filename = build_training_report_filename(report)
+    report_content = build_training_report_docx(report)
+
+    archive_buffer = BytesIO()
+    with ZipFile(archive_buffer, "w", compression=ZIP_DEFLATED) as archive:
+        archive.write(export_path, arcname=export_path.name)
+        archive.writestr(report_filename, report_content)
+
+    filename = f"{run.run_id}_{weights}_{fmt}_with_report.zip"
+    return archive_buffer.getvalue(), filename
 
 
 @router.get("", response_model=Page[TrainingRunOut])
@@ -272,7 +304,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
         raise ValidationError("Weights not found")
 
     if fmt == "pt":
-        url = f"/api/v3/training-runs/{run.run_id}/export/download?format=pt&weights={weights}"
+        url = _training_export_download_url(str(run.run_id), "pt", weights, include_report=bool(payload.include_report))
         return TrainingRunExportOut(run_id=str(run.run_id), format=fmt, weights=weights, download_url=url, artifact=None)
 
     # fmt == onnx
@@ -350,7 +382,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
     db.commit()
     db.refresh(art)
 
-    url = f"/api/v3/training-runs/{run.run_id}/export/download?format=onnx&weights={weights}"
+    url = _training_export_download_url(str(run.run_id), "onnx", weights, include_report=bool(payload.include_report))
     return TrainingRunExportOut(
         run_id=str(run.run_id),
         format=fmt,
@@ -365,6 +397,7 @@ def download_training_run_export(
     run_id: str,
     format: str = Query("pt", description="pt | onnx"),
     weights: str = Query("best", description="best | last"),
+    include_report: bool = Query(False, description="package model export with DOCX training report"),
     db: Session = Depends(get_db),
 ):
     run = TrainingRunService().get_run(db, run_id)
@@ -383,6 +416,23 @@ def download_training_run_export(
         raise ValidationError("Unsafe export path")
     if not out_path.exists() or not out_path.is_file():
         raise NotFoundError(f"Export file not found: {out_path.name}")
+
+    if include_report:
+        content, filename = _build_export_with_report_zip(
+            run=run,
+            export_path=out_path,
+            fmt=fmt,
+            weights=weights_key,
+            db=db,
+        )
+        quoted = quote(filename)
+        return Response(
+            content=content,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}; filename*=UTF-8''{quoted}",
+            },
+        )
 
     return FileResponse(
         path=str(out_path),

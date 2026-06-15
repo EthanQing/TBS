@@ -259,6 +259,7 @@ class TrainingRunExportRequest(BaseModel):
     opset: int | None = Field(None, ge=9, le=20)
     dynamic: bool = Field(True, description="dynamic axes (ONNX)")
     imgsz: int | None = Field(None, ge=32, le=4096, description="image size (ONNX)")
+    include_report: bool = Field(False, description="package the model export with a DOCX training report")
 
 
 class TrainingRunExportOut(BaseModel):

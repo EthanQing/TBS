@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added optional `include_report` model export packaging, returning a ZIP with
+  the exported weights and an on-demand DOCX training report.
 - Added `lr_scheduler` to training run parameters, supporting `linear` and
   `cosine` learning-rate decay across Ultralytics YOLO and PaddleDetection.
 - Switched PaddleDetection integration to a local `release/2.6` source checkout
