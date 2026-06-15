@@ -128,6 +128,15 @@ class ModelEvaluationService:
             return data
         return None
 
+    def get_active_job(self, *, include_items: bool = False) -> Optional[ModelEvaluationOut]:
+        active = self._has_active_job()
+        if not active:
+            return None
+        job_id = str(active.get("job_id") or "").strip()
+        if not job_id:
+            return None
+        return self.get_job(job_id, include_items=include_items)
+
     def _ensure_model_version_for_payload(
         self,
         db: Session,

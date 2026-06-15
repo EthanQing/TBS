@@ -98,3 +98,10 @@ def test_select_image_rows_all_keeps_unsplit_uploaded_test_dataset() -> None:
     selected = svc._select_image_rows(FakeDb(rows), dataset, scope="all")
 
     assert [r.path for r in selected] == ["images/a.jpg", "images/b.jpg", "images/c.jpg"]
+
+
+def test_get_active_job_returns_none_without_running_status(tmp_path, monkeypatch) -> None:
+    svc = ModelEvaluationService()
+    monkeypatch.setattr(svc, "jobs_root", lambda: tmp_path)
+
+    assert svc.get_active_job() is None

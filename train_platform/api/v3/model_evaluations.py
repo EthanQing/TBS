@@ -36,6 +36,11 @@ def create_model_evaluation(payload: ModelEvaluationCreate, db: Session = Depend
     return _svc.create_job(db, payload)
 
 
+@router.get("/active", response_model=ModelEvaluationOut | None)
+def get_active_model_evaluation(include_items: bool = Query(False)):
+    return _svc.get_active_job(include_items=bool(include_items))
+
+
 @router.get("/{job_id}", response_model=ModelEvaluationOut)
 def get_model_evaluation(job_id: str, include_items: bool = Query(True)):
     return _svc.get_job(job_id, include_items=bool(include_items))
