@@ -349,6 +349,50 @@ class InferenceService:
 
         raise RuntimeError(worker_error or "Inference worker request failed")
 
+    def run_ultralytics_yolo_validation(
+        self,
+        *,
+        weights_path: Path,
+        data_yaml: Path,
+        conf: float,
+        iou: float,
+        timeout: float | None = None,
+    ) -> Dict[str, Any]:
+        worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
+        request_timeout = float(timeout if timeout is not None else os.getenv("MODEL_EVALUATION_WORKER_TIMEOUT", "7200"))
+        payload = {
+            "weights_path": str(weights_path),
+            "data_yaml": str(data_yaml),
+            "conf": float(conf),
+            "iou": float(iou),
+        }
+
+        worker_error: str | None = None
+        try:
+            resp = requests.post(
+                f"{worker_url}/internal/model-evaluations/yolo-val",
+                json=payload,
+                timeout=request_timeout,
+                headers=self._internal_request_headers(),
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Inference worker validation error {resp.status_code}: {resp.text}")
+            try:
+                data = resp.json()
+            except Exception as e:
+                raise RuntimeError(f"Inference worker returned non-JSON validation response: {e}") from e
+            err = data.get("error")
+            if err:
+                raise RuntimeError(str(err))
+            output = data.get("output")
+            if output is None:
+                raise RuntimeError("Inference worker validation response missing output")
+            return output
+        except Exception as e:
+            worker_error = f"{type(e).__name__}: {e}"
+
+        raise RuntimeError(worker_error or "Inference worker validation request failed")
+
     def _run_paddle_det(
         self,
         weights_path: Path,

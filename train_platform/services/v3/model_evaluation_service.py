@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import yaml
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
@@ -68,6 +69,27 @@ def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
     tmp.replace(path)
+
+
+def _is_valid_yolo_label(path: Path) -> bool:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return False
+    for line in lines:
+        parts = [p for p in line.strip().split() if p]
+        if len(parts) < 5:
+            continue
+        try:
+            int(float(parts[0]))
+            float(parts[1])
+            float(parts[2])
+            float(parts[3])
+            float(parts[4])
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def _job_lock(job_id: str) -> threading.Lock:
@@ -203,6 +225,10 @@ class ModelEvaluationService:
             rows = self._select_image_rows(db, dataset, scope=payload.scope)
             if not rows:
                 raise ValidationError("No images found for selected evaluation scope")
+            root = resolve_storage_token(dataset.storage_path)
+            labeled_rows, skipped_images = self._select_labeled_image_rows(root, rows)
+            if not labeled_rows:
+                raise ValidationError("No labeled images were available for evaluation")
 
             job_id = self._new_job_id()
             self.job_dir(job_id)
@@ -212,7 +238,7 @@ class ModelEvaluationService:
                 "phase": "preparing",
                 "progress": 0,
                 "processed": 0,
-                "total": int(len(rows)),
+                "total": int(len(labeled_rows)),
                 "seq": 1,
                 "last_result_id": 0,
                 "model_version_id": int(mv_id),
@@ -226,6 +252,7 @@ class ModelEvaluationService:
                 "family": ctx.get("family"),
                 "variant": ctx.get("variant"),
                 "cancel_requested": False,
+                "skipped_images": int(skipped_images),
                 "result": {"metrics": None},
                 "error_message": None,
                 "created_at": _to_iso(),
@@ -264,6 +291,71 @@ class ModelEvaluationService:
         elif scope_norm != "all":
             raise ValidationError("scope must be one of: all, test, val, train")
         return q.order_by(StandardDatasetImage.path.asc()).all()
+
+    def _select_labeled_image_rows(
+        self,
+        root: Path,
+        rows: list[StandardDatasetImage],
+    ) -> tuple[list[StandardDatasetImage], int]:
+        labeled: list[StandardDatasetImage] = []
+        skipped = 0
+        for row in rows:
+            rel_path = str(getattr(row, "path", "") or "")
+            if not rel_path:
+                skipped += 1
+                continue
+            image_path = root / rel_path
+            label_path = guess_label_path(root, rel_path)
+            if not image_path.exists() or not image_path.is_file() or not label_path.exists() or not label_path.is_file():
+                skipped += 1
+                continue
+            if not _is_valid_yolo_label(label_path):
+                skipped += 1
+                continue
+            labeled.append(row)
+        return labeled, skipped
+
+    def _write_ultralytics_eval_data_yaml(
+        self,
+        job_id: str,
+        root: Path,
+        rows: list[StandardDatasetImage],
+        class_names: list[str],
+    ) -> Path:
+        job_root = self.job_dir(job_id)
+        images_txt = job_root / "eval_images.txt"
+        data_yaml = job_root / "eval_data.yaml"
+        with images_txt.open("w", encoding="utf-8") as f:
+            for row in rows:
+                rel_path = str(getattr(row, "path", "") or "")
+                if not rel_path:
+                    continue
+                f.write((root / rel_path).resolve(strict=False).as_posix() + "\n")
+
+        names: list[str] = list(class_names or [])
+        if not names:
+            max_class_id = -1
+            for row in rows:
+                label_path = guess_label_path(root, str(getattr(row, "path", "") or ""))
+                try:
+                    for line in label_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        parts = [p for p in line.strip().split() if p]
+                        if len(parts) >= 5:
+                            max_class_id = max(max_class_id, int(float(parts[0])))
+                except Exception:
+                    continue
+            names = [str(i) for i in range(max_class_id + 1)] if max_class_id >= 0 else ["0"]
+
+        payload = {
+            "path": root.resolve(strict=False).as_posix(),
+            "train": images_txt.resolve(strict=False).as_posix(),
+            "val": images_txt.resolve(strict=False).as_posix(),
+            "test": images_txt.resolve(strict=False).as_posix(),
+            "names": names,
+            "nc": len(names),
+        }
+        data_yaml.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        return data_yaml
 
     def _read_status(self, job_id: str) -> Dict[str, Any]:
         return _read_json(self.status_path(job_id))
@@ -399,22 +491,74 @@ class ModelEvaluationService:
         rows = self._select_image_rows(db, dataset, scope=str(status.get("scope") or "all"))
         ctx = self._infer.resolve_model_context(db, model_version_id=int(status["model_version_id"]))
         class_names = read_class_names(root)
+        labeled_rows, skipped_by_label_scan = self._select_labeled_image_rows(root, rows)
 
-        total = len(rows)
+        total = len(labeled_rows)
         start = time.perf_counter()
-        skipped = 0
+        skipped = int(status.get("skipped_images") or skipped_by_label_scan)
         failed = 0
         evaluated = 0
         gt_by_image: dict[str, list[dict[str, Any]]] = {}
         pred_by_image: dict[str, list[dict[str, Any]]] = {}
 
+        if total <= 0:
+            raise ValidationError("No labeled images were available for evaluation")
+
         self._update_status_if_not_terminal(
             job_id,
-            {"status": "running", "phase": "inferring", "total": total, "processed": 0, "progress": 0},
+            {"status": "running", "phase": "validating", "total": total, "processed": 0, "progress": 1},
             bump_seq=True,
         )
 
-        for idx, row in enumerate(rows, start=1):
+        if str(ctx.get("engine") or "").strip().lower() == "ultralytics-yolo":
+            if self._is_cancel_requested(job_id):
+                self._update_status_if_not_terminal(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+                return
+            data_yaml = self._write_ultralytics_eval_data_yaml(job_id, root, labeled_rows, class_names)
+            self._update_status_if_not_terminal(
+                job_id,
+                {"phase": "calculating", "progress": 5},
+                bump_seq=True,
+            )
+            metrics = self._infer.run_ultralytics_yolo_validation(
+                weights_path=Path(str(ctx["weights_path"])),
+                data_yaml=data_yaml,
+                conf=float(status.get("conf") or 0.25),
+                iou=float(status.get("iou") or 0.5),
+            )
+            if self._is_cancel_requested(job_id):
+                self._update_status_if_not_terminal(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+                return
+            metrics.update(
+                {
+                    "evaluated_images": int(total),
+                    "skipped_images": int(skipped),
+                    "failed_images": 0,
+                    "elapsed_ms": float(metrics.get("elapsed_ms") or round((time.perf_counter() - start) * 1000.0, 2)),
+                }
+            )
+            self._update_status_if_not_terminal(
+                job_id,
+                {
+                    "status": "completed",
+                    "phase": "done",
+                    "progress": 100,
+                    "processed": int(total),
+                    "total": int(total),
+                    "result": {"metrics": metrics},
+                    "error_message": None,
+                },
+                bump_seq=True,
+            )
+            return
+
+        self._update_status_if_not_terminal(
+            job_id,
+            {"phase": "inferring", "processed": 0, "progress": 1},
+            bump_seq=True,
+        )
+
+        for idx, row in enumerate(labeled_rows, start=1):
             if self._is_cancel_requested(job_id):
                 self._update_status_if_not_terminal(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
                 return

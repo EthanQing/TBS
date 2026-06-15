@@ -6,6 +6,8 @@
   Precision, Recall, F1, mAP50, and mAP50-95 on labeled YOLO detection datasets.
 - Fixed model evaluation cancellation so cancelling an active job immediately
   releases the active-job guard and late worker updates cannot revive it.
+- Switched Ultralytics model evaluation to the native `YOLO.val()` worker path
+  and validate labeled images before creating a job.
 - Fixed intermittent training-run ONNX export failures by treating empty ONNX
   files as invalid and resolving the actual Ultralytics output before download.
 - Added optional `include_report` model export packaging, returning a ZIP with

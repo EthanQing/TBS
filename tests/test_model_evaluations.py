@@ -4,11 +4,13 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from train_platform.models.v3.enums import DatasetSplit
 from train_platform.models.v3.standard_dataset import StandardDatasetImage
 from train_platform.services.v3.model_evaluation_metrics import box_iou, compute_detection_metrics
 from train_platform.services.v3.model_evaluation_service import ModelEvaluationService
+from train_platform.workers.inference_worker import _extract_ultralytics_val_metrics
 
 
 def test_box_iou_identical_and_disjoint() -> None:
@@ -101,6 +103,48 @@ def test_select_image_rows_all_keeps_unsplit_uploaded_test_dataset() -> None:
     assert [r.path for r in selected] == ["images/a.jpg", "images/b.jpg", "images/c.jpg"]
 
 
+def test_select_labeled_image_rows_skips_missing_and_empty_labels(tmp_path) -> None:
+    root = tmp_path
+    (root / "images").mkdir()
+    (root / "labels").mkdir()
+    (root / "images" / "ok.jpg").write_bytes(b"x")
+    (root / "labels" / "ok.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    (root / "images" / "empty.jpg").write_bytes(b"x")
+    (root / "labels" / "empty.txt").write_text("\n", encoding="utf-8")
+    (root / "images" / "missing.jpg").write_bytes(b"x")
+    svc = ModelEvaluationService()
+
+    labeled, skipped = svc._select_labeled_image_rows(
+        root,
+        [
+            _image("images/ok.jpg", None),
+            _image("images/empty.jpg", None),
+            _image("images/missing.jpg", None),
+        ],
+    )
+
+    assert [r.path for r in labeled] == ["images/ok.jpg"]
+    assert skipped == 2
+
+
+def test_write_ultralytics_eval_data_yaml_uses_labeled_images(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "dataset"
+    (root / "images").mkdir(parents=True)
+    (root / "labels").mkdir(parents=True)
+    (root / "images" / "a.jpg").write_bytes(b"x")
+    (root / "labels" / "a.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    svc = ModelEvaluationService()
+    monkeypatch.setattr(svc, "jobs_root", lambda: tmp_path / "jobs")
+
+    data_yaml = svc._write_ultralytics_eval_data_yaml("job-yolo", root, [_image("images/a.jpg", None)], ["person"])
+
+    payload = yaml.safe_load(data_yaml.read_text(encoding="utf-8"))
+    eval_list = data_yaml.parent / "eval_images.txt"
+    assert payload["val"] == eval_list.resolve(strict=False).as_posix()
+    assert payload["names"] == ["person"]
+    assert eval_list.read_text(encoding="utf-8").strip().endswith("images/a.jpg")
+
+
 def test_get_active_job_returns_none_without_running_status(tmp_path, monkeypatch) -> None:
     svc = ModelEvaluationService()
     monkeypatch.setattr(svc, "jobs_root", lambda: tmp_path)
@@ -144,3 +188,33 @@ def test_cancelled_evaluation_job_cannot_be_reactivated(tmp_path, monkeypatch) -
     assert final.status == "cancelled"
     assert final.phase == "cancelled"
     assert final.cancel_requested is True
+
+
+class _FakeBoxMetrics:
+    mp = 0.75
+    mr = 0.6
+    map50 = 0.7
+    map = 0.55
+    ap_class_index = [0]
+    p = [0.75]
+    r = [0.6]
+    maps = [0.55]
+    all_ap = [[0.7, 0.6]]
+
+
+class _FakeValResults:
+    box = _FakeBoxMetrics()
+    names = {0: "person"}
+    nt_per_class = [10]
+
+
+def test_extract_ultralytics_val_metrics() -> None:
+    metrics = _extract_ultralytics_val_metrics(_FakeValResults(), elapsed_ms=1234.5)
+
+    assert metrics["precision"] == pytest.approx(0.75)
+    assert metrics["recall"] == pytest.approx(0.6)
+    assert metrics["f1"] == pytest.approx(2 * 0.75 * 0.6 / (0.75 + 0.6))
+    assert metrics["map50"] == pytest.approx(0.7)
+    assert metrics["map50_95"] == pytest.approx(0.55)
+    assert metrics["total_targets"] == 10
+    assert metrics["class_metrics"][0]["class_name"] == "person"

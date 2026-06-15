@@ -53,6 +53,21 @@ class ModelStatsRequest(BaseModel):
     iters: int = Field(5, ge=1)
 
 
+class YoloValidationRequest(BaseModel):
+    weights_path: str = Field(..., min_length=1)
+    data_yaml: str = Field(..., min_length=1)
+    conf: float = 0.25
+    iou: float = 0.5
+    imgsz: Optional[int] = None
+    batch: Optional[int] = None
+
+
+class YoloValidationResponse(BaseModel):
+    output: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    elapsed_ms: Optional[float] = None
+
+
 class InferenceJobRequest(BaseModel):
     job_id: str = Field(..., min_length=1)
     mode: str = Field("image", min_length=1)
@@ -319,6 +334,111 @@ def _benchmark_ultralytics_yolo(
     return round(float(statistics.median(timings)), 4)
 
 
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _to_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    try:
+        if hasattr(value, "tolist"):
+            out = value.tolist()
+            return out if isinstance(out, list) else [out]
+    except Exception:
+        pass
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
+
+
+def _extract_ultralytics_val_metrics(results: Any, elapsed_ms: float) -> Dict[str, Any]:
+    box = getattr(results, "box", None)
+    names = getattr(results, "names", None) or {}
+    if not isinstance(names, dict):
+        names = {}
+
+    precision = _as_float(getattr(box, "mp", 0.0))
+    recall = _as_float(getattr(box, "mr", 0.0))
+    map50 = _as_float(getattr(box, "map50", 0.0))
+    map50_95 = _as_float(getattr(box, "map", 0.0))
+    f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+
+    ap_class_index = [int(x) for x in _to_list(getattr(box, "ap_class_index", []))]
+    p_values = [_as_float(x) for x in _to_list(getattr(box, "p", []))]
+    r_values = [_as_float(x) for x in _to_list(getattr(box, "r", []))]
+    maps = [_as_float(x) for x in _to_list(getattr(box, "maps", []))]
+
+    all_ap = _to_list(getattr(box, "all_ap", []))
+    ap50_values: list[float] = []
+    if all_ap:
+        for row in all_ap:
+            values = _to_list(row)
+            ap50_values.append(_as_float(values[0] if values else 0.0))
+
+    nt_per_class = [int(_as_float(x)) for x in _to_list(getattr(results, "nt_per_class", []))]
+
+    class_ids = sorted(set(ap_class_index) | set(range(len(nt_per_class))) | set(int(k) for k in names.keys() if str(k).isdigit()))
+    class_metrics: list[dict[str, Any]] = []
+    total_targets = 0
+    total_predictions = 0
+    est_tp_total = 0
+    est_fp_total = 0
+    est_fn_total = 0
+
+    for idx, class_id in enumerate(class_ids):
+        metric_idx = ap_class_index.index(class_id) if class_id in ap_class_index else idx
+        p = p_values[metric_idx] if metric_idx < len(p_values) else 0.0
+        r = r_values[metric_idx] if metric_idx < len(r_values) else 0.0
+        ap50 = ap50_values[metric_idx] if metric_idx < len(ap50_values) else 0.0
+        ap5095 = maps[class_id] if 0 <= class_id < len(maps) else (maps[metric_idx] if metric_idx < len(maps) else 0.0)
+        gt_count = nt_per_class[class_id] if 0 <= class_id < len(nt_per_class) else 0
+        est_tp = int(round(r * gt_count)) if gt_count > 0 else 0
+        pred_count = int(round(est_tp / p)) if p > 0 else 0
+        est_fp = max(0, pred_count - est_tp)
+        est_fn = max(0, gt_count - est_tp)
+        cf1 = (2.0 * p * r / (p + r)) if (p + r) else 0.0
+        total_targets += gt_count
+        total_predictions += pred_count
+        est_tp_total += est_tp
+        est_fp_total += est_fp
+        est_fn_total += est_fn
+        class_metrics.append(
+            {
+                "class_id": int(class_id),
+                "class_name": str(names.get(class_id)) if class_id in names else str(class_id),
+                "gt_count": int(gt_count),
+                "pred_count": int(pred_count),
+                "tp": int(est_tp),
+                "fp": int(est_fp),
+                "fn": int(est_fn),
+                "precision": float(p),
+                "recall": float(r),
+                "f1": float(cf1),
+                "ap50": float(ap50),
+                "ap50_95": float(ap5095),
+            }
+        )
+
+    return {
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "map50": float(map50),
+        "map50_95": float(map50_95),
+        "tp": int(est_tp_total),
+        "fp": int(est_fp_total),
+        "fn": int(est_fn_total),
+        "total_targets": int(total_targets),
+        "total_predictions": int(total_predictions),
+        "elapsed_ms": round(float(elapsed_ms), 2),
+        "class_metrics": class_metrics,
+    }
+
+
 @app.post("/internal/inference/yolo", response_model=InferenceResponse)
 def run_inference(
     req: InferenceRequest,
@@ -376,6 +496,47 @@ def model_stats(
         inference_time_ms=latency,
         device=device,
     )
+
+
+@app.post("/internal/model-evaluations/yolo-val", response_model=YoloValidationResponse)
+def run_yolo_validation(
+    req: YoloValidationRequest,
+    _: None = Depends(_verify_internal_auth),
+) -> YoloValidationResponse:
+    weights_path = Path(req.weights_path)
+    if not weights_path.exists() or not weights_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Weights not found: {weights_path}")
+
+    data_yaml = Path(req.data_yaml)
+    if not data_yaml.exists() or not data_yaml.is_file():
+        raise HTTPException(status_code=404, detail=f"Evaluation data YAML not found: {data_yaml}")
+
+    device = _select_ultralytics_device()
+    t0 = time.perf_counter()
+    try:
+        model = _load_ultralytics_yolo(weights_path)
+        kwargs: Dict[str, Any] = {
+            "data": str(data_yaml),
+            "split": "val",
+            "conf": float(req.conf),
+            "iou": float(req.iou),
+            "device": device,
+            "verbose": False,
+            "plots": False,
+            "save": False,
+        }
+        if req.imgsz is not None:
+            kwargs["imgsz"] = int(req.imgsz)
+        if req.batch is not None:
+            kwargs["batch"] = int(req.batch)
+        results = model.val(**kwargs)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return YoloValidationResponse(
+            output=_extract_ultralytics_val_metrics(results, elapsed_ms),
+            elapsed_ms=round(elapsed_ms, 2),
+        )
+    except Exception as e:
+        return YoloValidationResponse(error=f"{type(e).__name__}: {e}", elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2))
 
 
 @app.post("/internal/inference-jobs/run", response_model=WorkerStatusResponse)

@@ -67,7 +67,7 @@ GPU 绑定由容器运行时和训练参数共同决定。`device=auto` 会继�
 - API 入口为 `/api/v3/model-evaluations`，服务位于 `services/v3/model_evaluation_service.py`。
 - 任务状态和结果落在 `BASE_TEMP_DIR/model_evaluations/<job_id>/`，不写数据库表。
 - 首版只支持标准 YOLO 检测数据集；`scope=all` 会评估所有有标签图片，`test`/`val`/`train` 按数据集 split 过滤。
-- 评估逐图调用现有 YOLO/Paddle 推理 worker 的单图预测能力，再按类别和 IoU 计算 Precision、Recall、F1、mAP50、mAP50-95。
+- Ultralytics YOLO 评估会先生成仅包含有标签图片的临时 `eval_images.txt` / `eval_data.yaml`，再调用 YOLO inference worker 的 `/internal/model-evaluations/yolo-val`，由 `YOLO(...).val()` 计算 Precision、Recall、F1、mAP50、mAP50-95；没有任何有效 YOLO 标签时创建任务阶段直接失败。Paddle 或非原生路径保留逐图推理回退。
 - 取消评估会立即把状态文件置为 `cancelled` 并释放 active job；后台线程后续的进度、结果或异常写入必须检查终态，不能把已取消任务覆盖为 running/completed/failed。
 
 ## 模型转换
