@@ -222,8 +222,6 @@ class ModelEvaluationService:
                 run_id=payload.run_id,
             )
             ctx = self._infer.resolve_model_context(db, model_version_id=mv_id)
-            if str(ctx.get("engine") or "").strip().lower() == "ultralytics-yolo":
-                self._infer.ensure_inference_worker_ready()
             rows = self._select_image_rows(db, dataset, scope=payload.scope)
             if not rows:
                 raise ValidationError("No images found for selected evaluation scope")

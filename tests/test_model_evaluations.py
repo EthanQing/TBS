@@ -11,6 +11,7 @@ from train_platform.models.v3.standard_dataset import StandardDatasetImage
 from train_platform.services.v3.model_evaluation_metrics import box_iou, compute_detection_metrics
 from train_platform.services.v3.model_evaluation_service import ModelEvaluationService
 from train_platform.workers.inference_worker import _extract_ultralytics_val_metrics
+from train_platform.workers.yolo_worker import _inference_worker_endpoint
 
 
 def test_box_iou_identical_and_disjoint() -> None:
@@ -218,3 +219,12 @@ def test_extract_ultralytics_val_metrics() -> None:
     assert metrics["map50_95"] == pytest.approx(0.55)
     assert metrics["total_targets"] == 10
     assert metrics["class_metrics"][0]["class_name"] == "person"
+
+
+def test_yolo_worker_inference_sidecar_endpoint_uses_env_url(monkeypatch) -> None:
+    monkeypatch.delenv("INFERENCE_WORKER_HOST", raising=False)
+    monkeypatch.delenv("INFERENCE_WORKER_PORT", raising=False)
+    monkeypatch.delenv("WORKER_BIND_HOST", raising=False)
+    monkeypatch.setenv("INFERENCE_WORKER_URL", "http://127.0.0.1:19002")
+
+    assert _inference_worker_endpoint() == ("127.0.0.1", 19002)
