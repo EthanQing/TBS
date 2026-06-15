@@ -99,3 +99,7 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 ## Worker 镜像 pyc 编译版本必须匹配运行时
 
 `Dockerfile.worker.yolo` 的源码保护阶段可能在 PyArmor 失败时回退到 pyc-only protection。生成 `.pyc` 的 Python 版本必须与最终 `pytorch/pytorch` 运行时里的 Python 版本一致；否则容器启动或导入 worker 模块会报 `bad magic number`。当前 YOLO worker runtime 是 Python 3.11，因此 source-protector stage 也应使用 Python 3.11。
+
+## Worker 镜像 entrypoint 要去除 CRLF
+
+Windows 工作区里的 `docker/entrypoint.sh` 可能带 CRLF 行尾。Linux 容器中即使 `/entrypoint.sh` 存在，也会因为 shebang 解释器路径带 `\r` 而报 `exec /entrypoint.sh: no such file or directory`。Worker Dockerfile 和 backend Dockerfile 一样，应在复制入口脚本后执行 `sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh`。
