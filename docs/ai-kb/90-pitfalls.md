@@ -96,6 +96,10 @@ Ultralytics `model.export(format="onnx")` 可能返回实际输出路径，也�
 
 训练、推理、部署和转换都有排队、运行、取消、失败、完成等状态。修改某个状态时要同步检查 API 响应、数据库/文件状态、WebSocket 或轮询查询逻辑。
 
+## 文件状态任务取消后不能复活
+
+模型评估等基于 `temp/<job_id>/status.json` 的后台任务可能在取消请求后仍收到迟到推理结果、进度或异常。取消接口应立即写入终态并释放 active job；后台线程后续写 completed/failed/progress 前必须检查终态，避免前端恢复进度后取消无效或任务从 cancelled 变回 running/completed。
+
 ## 多 YOLO worker 要同时核对 ID 和 GPU 可见性
 
 `workers/yolo_worker.py` 应尊重 `WORKER_ID`；该值可以是任意稳定且唯一的字符串，不要求匹配容器名格式。多容器部署时如果日志仍显示相同 `worker_id`，训练任务事件和数据库领取记录会看起来像同一个 worker 在工作。`WORKER_ID` 只影响队列身份，不负责 GPU 隔离。Docker compose 中配置 GPU 后仍要进入每个 worker 容器检查 `NVIDIA_VISIBLE_DEVICES`、`CUDA_VISIBLE_DEVICES`、`nvidia-smi -L` 和 `torch.cuda.device_count()`；如果每个容器都能看到所有 GPU，多个 worker 可能会争抢同一张卡，表现为“多 worker 没有效果”或更慢。

@@ -281,10 +281,33 @@ class ModelEvaluationService:
             _write_json_atomic(self.status_path(job_id), current)
             return current
 
+    def _update_status_if_not_terminal(
+        self,
+        job_id: str,
+        patch: Dict[str, Any],
+        *,
+        bump_seq: bool = True,
+    ) -> Dict[str, Any]:
+        lock = _job_lock(job_id)
+        with lock:
+            current = self._read_status(job_id)
+            if str(current.get("status") or "").strip().lower() in self.TERMINAL_STATUSES:
+                return current
+            current.update(dict(patch or {}))
+            current["progress"] = max(0, min(100, int(current.get("progress") or 0)))
+            current["processed"] = max(0, int(current.get("processed") or 0))
+            current["total"] = max(0, int(current.get("total") or 0))
+            if bump_seq:
+                current["seq"] = int(current.get("seq") or 0) + 1
+            _write_json_atomic(self.status_path(job_id), current)
+            return current
+
     def _append_item(self, job_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
         lock = _job_lock(job_id)
         with lock:
             status = self._read_status(job_id)
+            if str(status.get("status") or "").strip().lower() in self.TERMINAL_STATUSES:
+                return dict(item or {})
             rid = int(status.get("last_result_id") or 0) + 1
             row = dict(item or {})
             row["result_id"] = rid
@@ -324,9 +347,18 @@ class ModelEvaluationService:
             return True
 
     def cancel_job(self, job_id: str) -> ModelEvaluationOut:
-        st = self._update_status(job_id, {"cancel_requested": True}, bump_seq=True)
-        if str(st.get("status")) == "queued":
-            self._update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+        st = self._read_status(job_id)
+        if str(st.get("status") or "").strip().lower() not in self.TERMINAL_STATUSES:
+            self._update_status(
+                job_id,
+                {
+                    "cancel_requested": True,
+                    "status": "cancelled",
+                    "phase": "cancelled",
+                    "error_message": None,
+                },
+                bump_seq=True,
+            )
         return self.get_job(job_id, include_items=False)
 
     def get_job(self, job_id: str, *, include_items: bool = True) -> ModelEvaluationOut:
@@ -345,7 +377,7 @@ class ModelEvaluationService:
             self._run_job(db, job_id)
         except Exception as e:
             try:
-                self._update_status(
+                self._update_status_if_not_terminal(
                     job_id,
                     {
                         "status": "failed",
@@ -376,7 +408,7 @@ class ModelEvaluationService:
         gt_by_image: dict[str, list[dict[str, Any]]] = {}
         pred_by_image: dict[str, list[dict[str, Any]]] = {}
 
-        self._update_status(
+        self._update_status_if_not_terminal(
             job_id,
             {"status": "running", "phase": "inferring", "total": total, "processed": 0, "progress": 0},
             bump_seq=True,
@@ -384,7 +416,7 @@ class ModelEvaluationService:
 
         for idx, row in enumerate(rows, start=1):
             if self._is_cancel_requested(job_id):
-                self._update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+                self._update_status_if_not_terminal(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
                 return
 
             rel_path = str(row.path or "")
@@ -402,7 +434,7 @@ class ModelEvaluationService:
                     job_id,
                     {**base_item, "status": "skipped", "gt_count": 0, "prediction_count": 0, "error_message": "Image file not found"},
                 )
-                self._update_status(job_id, {"processed": idx, "progress": progress}, bump_seq=True)
+                self._update_status_if_not_terminal(job_id, {"processed": idx, "progress": progress}, bump_seq=True)
                 continue
 
             if not label_path.exists() or not label_path.is_file():
@@ -411,7 +443,7 @@ class ModelEvaluationService:
                     job_id,
                     {**base_item, "status": "skipped", "gt_count": 0, "prediction_count": 0, "error_message": "YOLO label file not found"},
                 )
-                self._update_status(job_id, {"processed": idx, "progress": progress}, bump_seq=True)
+                self._update_status_if_not_terminal(job_id, {"processed": idx, "progress": progress}, bump_seq=True)
                 continue
 
             _w, _h, gt_boxes = read_yolo_boxes(root, rel_path, class_names)
@@ -421,11 +453,14 @@ class ModelEvaluationService:
                     job_id,
                     {**base_item, "status": "skipped", "gt_count": 0, "prediction_count": 0, "error_message": "No valid YOLO boxes"},
                 )
-                self._update_status(job_id, {"processed": idx, "progress": progress}, bump_seq=True)
+                self._update_status_if_not_terminal(job_id, {"processed": idx, "progress": progress}, bump_seq=True)
                 continue
 
             t0 = time.perf_counter()
             try:
+                if self._is_cancel_requested(job_id):
+                    self._update_status_if_not_terminal(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+                    return
                 output = self._infer._run_by_engine(
                     engine=str(ctx.get("engine") or "ultralytics-yolo"),
                     weights_path=Path(str(ctx["weights_path"])),
@@ -464,12 +499,19 @@ class ModelEvaluationService:
                     },
                 )
 
-            self._update_status(job_id, {"processed": idx, "progress": progress}, bump_seq=True)
+            if self._is_cancel_requested(job_id):
+                self._update_status_if_not_terminal(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+                return
+            self._update_status_if_not_terminal(job_id, {"processed": idx, "progress": progress}, bump_seq=True)
 
         if evaluated <= 0:
             raise ValidationError("No labeled images were available for evaluation")
 
-        self._update_status(job_id, {"phase": "calculating", "progress": 99}, bump_seq=True)
+        if self._is_cancel_requested(job_id):
+            self._update_status_if_not_terminal(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+            return
+
+        self._update_status_if_not_terminal(job_id, {"phase": "calculating", "progress": 99}, bump_seq=True)
         metrics = compute_detection_metrics(
             gt_by_image,
             pred_by_image,
@@ -484,7 +526,7 @@ class ModelEvaluationService:
                 "elapsed_ms": round((time.perf_counter() - start) * 1000.0, 2),
             }
         )
-        self._update_status(
+        self._update_status_if_not_terminal(
             job_id,
             {
                 "status": "completed",

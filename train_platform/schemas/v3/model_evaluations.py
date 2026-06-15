@@ -10,7 +10,7 @@ from train_platform.schemas.v3.inference_jobs import InferenceModelCandidate
 
 EvaluationScope = Literal["all", "test", "val", "train"]
 EvaluationStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
-EvaluationPhase = Literal["preparing", "inferring", "calculating", "done", "failed", "cancelled"]
+EvaluationPhase = Literal["preparing", "inferring", "calculating", "cancelling", "done", "failed", "cancelled"]
 
 
 class ModelEvaluationCreate(BaseModel):

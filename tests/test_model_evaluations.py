@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -105,3 +106,41 @@ def test_get_active_job_returns_none_without_running_status(tmp_path, monkeypatc
     monkeypatch.setattr(svc, "jobs_root", lambda: tmp_path)
 
     assert svc.get_active_job() is None
+
+
+def test_cancelled_evaluation_job_cannot_be_reactivated(tmp_path, monkeypatch) -> None:
+    svc = ModelEvaluationService()
+    monkeypatch.setattr(svc, "jobs_root", lambda: tmp_path)
+    job_id = "job-cancel"
+    job_dir = tmp_path / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    status = {
+        "job_id": job_id,
+        "status": "running",
+        "phase": "inferring",
+        "progress": 20,
+        "processed": 1,
+        "total": 5,
+        "seq": 1,
+        "last_result_id": 0,
+        "standard_dataset_id": 1001,
+        "scope": "all",
+        "conf": 0.25,
+        "iou": 0.5,
+        "cancel_requested": False,
+        "result": {"metrics": None},
+    }
+    (job_dir / "status.json").write_text(json.dumps(status), encoding="utf-8")
+
+    cancelled = svc.cancel_job(job_id)
+    svc._update_status_if_not_terminal(
+        job_id,
+        {"status": "completed", "phase": "done", "progress": 100},
+        bump_seq=True,
+    )
+
+    assert cancelled.status == "cancelled"
+    final = svc.get_job(job_id, include_items=False)
+    assert final.status == "cancelled"
+    assert final.phase == "cancelled"
+    assert final.cancel_requested is True
