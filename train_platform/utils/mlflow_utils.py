@@ -220,6 +220,7 @@ def init_mlflow_logger(run: Any, *, dataset_path: Optional[str] = None, run_dir:
                     "batch_size": getattr(p, "batch_size", None),
                     "image_size": getattr(p, "image_size", None),
                     "learning_rate": getattr(p, "learning_rate", None),
+                    "lr_scheduler": getattr(p, "lr_scheduler", "linear"),
                     "patience": getattr(p, "patience", None),
                     "device": getattr(p, "device", None),
                     "workers": getattr(p, "workers", None),

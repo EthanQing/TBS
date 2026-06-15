@@ -83,6 +83,7 @@ class TrainingRunParameters(Base):
     batch_size: Mapped[int] = mapped_column(Integer, nullable=False, default=16)
     image_size: Mapped[int] = mapped_column(Integer, nullable=False, default=640)
     learning_rate: Mapped[Optional[float]] = mapped_column(DECIMAL(10, 8), nullable=True)
+    lr_scheduler: Mapped[str] = mapped_column(String(32), nullable=False, default="linear")
     patience: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     device: Mapped[str] = mapped_column(String(32), nullable=False, default="auto")
     workers: Mapped[int] = mapped_column(Integer, nullable=False, default=8)

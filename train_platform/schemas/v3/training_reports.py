@@ -47,6 +47,7 @@ class ReportParameters(BaseModel):
     batch_size: int
     image_size: int
     learning_rate: Optional[float] = None
+    lr_scheduler: str = "linear"
     patience: int
     device: str
     workers: int

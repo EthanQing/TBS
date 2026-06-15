@@ -28,7 +28,7 @@ from train_platform.training.plugins.base import TrainContext
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
-from train_platform.utils.training_params import extract_selected_gpu_ids, normalize_device_spec
+from train_platform.utils.training_params import extract_selected_gpu_ids, normalize_device_spec, normalize_lr_scheduler
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +548,45 @@ def _apply_warmup_epochs_to_cfg(cfg: dict, warmup_epochs: int | None) -> bool:
     return False
 
 
+def _is_warmup_scheduler(scheduler: Any) -> bool:
+    if isinstance(scheduler, dict):
+        name = str(scheduler.get("name") or scheduler.get("type") or scheduler.get("_type_") or "").lower()
+        return "warmup" in name
+    return "warmup" in type(scheduler).__name__.lower()
+
+
+def _apply_lr_scheduler_to_cfg(cfg: dict, scheduler: Any, *, epochs: int) -> bool:
+    if normalize_lr_scheduler(scheduler) == "linear":
+        return False
+
+    lr_cfg = cfg.get("LearningRate")
+    if not isinstance(lr_cfg, dict):
+        lr_cfg = {}
+        cfg["LearningRate"] = lr_cfg
+
+    schedulers = lr_cfg.get("schedulers")
+    if not isinstance(schedulers, list):
+        schedulers = []
+
+    cosine_scheduler = {
+        "name": "CosineDecay",
+        "max_epochs": int(max(1, int(epochs or 1))),
+    }
+    next_schedulers: list[Any] = []
+    inserted = False
+    for item in schedulers:
+        if _is_warmup_scheduler(item):
+            next_schedulers.append(item)
+            continue
+        if not inserted:
+            next_schedulers.append(cosine_scheduler)
+            inserted = True
+    if not inserted:
+        next_schedulers.insert(0, cosine_scheduler)
+    lr_cfg["schedulers"] = next_schedulers
+    return True
+
+
 def _normalize_yolo_names(names_obj: Any, nc_obj: Any) -> list[str]:
     if isinstance(names_obj, list):
         return [str(x) for x in names_obj if str(x).strip()]
@@ -1036,6 +1075,11 @@ class PaddleDetTrainer:
             eval_interval = 1
 
         _apply_cfg_overrides(cfg, overrides)
+        _apply_lr_scheduler_to_cfg(
+            cfg,
+            getattr(job.parameters, "lr_scheduler", "linear"),
+            epochs=epochs,
+        )
         _apply_warmup_epochs_to_cfg(cfg, warmup_epochs)
         cfg["snapshot_epoch"] = int(max(1, eval_interval))
         _bind_ppdet_dataset_cfg(

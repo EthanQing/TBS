@@ -13,6 +13,7 @@ class TrainingRunParametersIn(BaseModel):
     batch_size: int = Field(16, description=">0 for fixed batch size; set -1 for Ultralytics auto batch")
     image_size: int = Field(640, gt=0)
     learning_rate: float = Field(0.01, gt=0)
+    lr_scheduler: Literal["linear", "cosine"] = Field("linear", description="learning-rate decay scheduler")
     patience: int = Field(50, ge=0)
     device: str = Field("auto", description="auto | cpu | gpu | cuda:0 | 0,1")
     workers: int = Field(8, ge=-1)

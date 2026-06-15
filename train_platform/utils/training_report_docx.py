@@ -334,6 +334,7 @@ def _document_xml(report: dict[str, Any]) -> str:
                     ("batch_size", parameters.get("batch_size")),
                     ("image_size", parameters.get("image_size")),
                     ("learning_rate", parameters.get("learning_rate")),
+                    ("lr_scheduler", parameters.get("lr_scheduler")),
                     ("patience", parameters.get("patience")),
                     ("device", parameters.get("device")),
                     ("workers", parameters.get("workers")),

@@ -15,9 +15,13 @@ from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
 from train_platform.utils.training_augmentations import ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY
 from train_platform.utils.training_loss_weights import ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY
-from train_platform.utils.training_params import AUTO_BATCH_SIZE, extract_selected_gpu_ids, normalize_device_spec
+from train_platform.utils.training_params import AUTO_BATCH_SIZE, extract_selected_gpu_ids, normalize_device_spec, normalize_lr_scheduler
 
 logger = logging.getLogger("train_platform.training.ultralytics")
+
+
+def _lr_scheduler_to_ultralytics_args(value: Any) -> Dict[str, bool]:
+    return {"cos_lr": normalize_lr_scheduler(value) == "cosine"}
 
 
 def _apply_torch_safe_load_patches() -> None:
@@ -406,6 +410,7 @@ class UltralyticsYOLOTrainer:
                 train_args.update(
                     {
                         "lr0": float(job.parameters.learning_rate),
+                        **_lr_scheduler_to_ultralytics_args(getattr(job.parameters, "lr_scheduler", "linear")),
                         "optimizer": str(job.parameters.optimizer or "auto"),
                         "patience": int(getattr(job.parameters, "patience", 50) or 50),
                         "weight_decay": float(add.get("weight_decay", 0.0005)),
@@ -415,6 +420,7 @@ class UltralyticsYOLOTrainer:
                 train_args.update(
                     {
                         "lr0": float(job.parameters.learning_rate),
+                        **_lr_scheduler_to_ultralytics_args(getattr(job.parameters, "lr_scheduler", "linear")),
                         "optimizer": str(job.parameters.optimizer or "auto"),
                         "patience": int(getattr(job.parameters, "patience", 50) or 50),
                         "momentum": float(add.get("momentum", 0.937)),

@@ -4,6 +4,9 @@ from typing import Any
 
 
 AUTO_BATCH_SIZE = -1
+LR_SCHEDULER_LINEAR = "linear"
+LR_SCHEDULER_COSINE = "cosine"
+SUPPORTED_LR_SCHEDULERS = {LR_SCHEDULER_LINEAR, LR_SCHEDULER_COSINE}
 
 
 def normalize_batch_size(value: Any) -> int:
@@ -15,6 +18,17 @@ def normalize_batch_size(value: Any) -> int:
     if batch_size == 0 or batch_size < AUTO_BATCH_SIZE:
         raise ValueError("batch_size must be > 0, or -1 for auto batch")
     return batch_size
+
+
+def normalize_lr_scheduler(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return LR_SCHEDULER_LINEAR
+    if raw in {"linear", "linearlr", "linear_lr"}:
+        return LR_SCHEDULER_LINEAR
+    if raw in {"cosine", "cos", "cos_lr", "cosinelr", "cosine_lr"}:
+        return LR_SCHEDULER_COSINE
+    raise ValueError("lr_scheduler must be one of: linear, cosine")
 
 
 def normalize_device_spec(value: Any) -> str:
@@ -159,6 +173,7 @@ def validate_training_params_for_engine(engine: str, params: dict[str, Any]) -> 
 
     normalized["batch_size"] = batch_size
     normalized["device"] = device
+    normalized["lr_scheduler"] = normalize_lr_scheduler(normalized.get("lr_scheduler", LR_SCHEDULER_LINEAR))
     return normalized
 
 
