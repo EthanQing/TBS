@@ -8,6 +8,8 @@
   releases the active-job guard and late worker updates cannot revive it.
 - Switched Ultralytics model evaluation to the native `YOLO.val()` worker path
   and validate labeled images before creating a job.
+- Added an inference-worker health check before creating native YOLO evaluation
+  jobs, so a stopped worker returns a clear startup error.
 - Fixed intermittent training-run ONNX export failures by treating empty ONNX
   files as invalid and resolving the actual Ultralytics output before download.
 - Added optional `include_report` model export packaging, returning a ZIP with

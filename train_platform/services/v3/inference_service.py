@@ -294,6 +294,18 @@ class InferenceService:
             return {}
         return {self.INTERNAL_TOKEN_HEADER: token}
 
+    def ensure_inference_worker_ready(self) -> None:
+        worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
+        timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "120"))
+        try:
+            resp = requests.get(f"{worker_url}/internal/health", timeout=min(5.0, timeout), headers=self._internal_request_headers())
+            if resp.status_code != 200:
+                raise RuntimeError(f"Inference worker health check failed: {resp.status_code}")
+        except Exception as e:
+            raise ValidationError(
+                f"Inference worker is unavailable at {worker_url}. Start train_platform.workers.inference_worker first."
+            ) from e
+
     def _run_by_engine(
         self,
         *,

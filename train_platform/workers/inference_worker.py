@@ -109,6 +109,11 @@ def _verify_internal_auth(x_internal_token: Optional[str] = Header(default=None,
         raise HTTPException(status_code=401, detail="Unauthorized internal request")
 
 
+@app.get("/internal/health")
+def health(_: None = Depends(_verify_internal_auth)) -> Dict[str, Any]:
+    return {"status": "ok"}
+
+
 def _resolve_training_path(raw: str, *, label: str, must_exist: bool = True) -> Path:
     base = settings.training_dir.resolve()
     path = Path(str(raw)).resolve(strict=False)
