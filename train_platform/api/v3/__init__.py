@@ -14,6 +14,7 @@ from train_platform.api.v3.frameworks import router as frameworks_router
 from train_platform.api.v3.illegal_datasets import router as illegal_datasets_router
 from train_platform.api.v3.inference import router as inference_router
 from train_platform.api.v3.inference_jobs import router as inference_jobs_router
+from train_platform.api.v3.model_evaluations import router as model_evaluations_router
 from train_platform.api.v3.model_conversions import router as model_conversions_router
 from train_platform.api.v3.model_versions import router as model_versions_router
 from train_platform.api.v3.pretrain_models import router as pretrain_models_router
@@ -47,6 +48,7 @@ router.include_router(deployment_runs_router)
 router.include_router(model_conversions_router)
 router.include_router(inference_router)
 router.include_router(inference_jobs_router)
+router.include_router(model_evaluations_router)
 router.include_router(serving_router)
 router.include_router(pretrain_models_router)
 router.include_router(stats_router)

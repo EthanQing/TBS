@@ -62,6 +62,13 @@ GPU 绑定由容器运行时和训练参数共同决定。`device=auto` 会继�
 - 内部 worker HTTP 请求可能需要 `INTERNAL_API_TOKEN`。
 - Paddle 推理的配置 YAML 解析与 Paddle 训练共用 `utils/paddledet_paths.py`，默认使用 `PADDLE_DET_DIR` 或后端目录下的 `PaddleDetection/`。
 
+## 模型评估任务
+
+- API 入口为 `/api/v3/model-evaluations`，服务位于 `services/v3/model_evaluation_service.py`。
+- 任务状态和结果落在 `BASE_TEMP_DIR/model_evaluations/<job_id>/`，不写数据库表。
+- 首版只支持标准 YOLO 检测数据集；`scope=all` 会评估所有有标签图片，`test`/`val`/`train` 按数据集 split 过滤。
+- 评估逐图调用现有 YOLO/Paddle 推理 worker 的单图预测能力，再按类别和 IoU 计算 Precision、Recall、F1、mAP50、mAP50-95。
+
 ## 模型转换
 
 - API 创建转换任务后，任务状态文件位于 `temp/model_conversions`。

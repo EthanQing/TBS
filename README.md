@@ -11,6 +11,7 @@ TBS Backend is a training platform backend built with **FastAPI**, **SQLAlchemy*
 - Training run orchestration
 - Pluggable training framework architecture
 - Deployment and inference workflows
+- Post-training model evaluation on labeled YOLO detection datasets
 - Alert rules and alert event management
 - System resource monitoring for CPU, memory, and GPU
 - Static asset serving for datasets, thumbnails, training artifacts, and pre-trained models
@@ -172,6 +173,10 @@ Paddle inference worker:
 ```bash
 python -m train_platform.workers.paddle_inference_worker
 ```
+
+Model evaluation jobs under `/api/v3/model-evaluations` reuse the same inference
+workers. Keep the appropriate YOLO or Paddle inference worker running before
+starting an evaluation from the deployment center.
 
 ## Configuration
 

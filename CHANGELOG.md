@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added model evaluation jobs under `/api/v3/model-evaluations` for computing
+  Precision, Recall, F1, mAP50, and mAP50-95 on labeled YOLO detection datasets.
 - Fixed intermittent training-run ONNX export failures by treating empty ONNX
   files as invalid and resolving the actual Ultralytics output before download.
 - Added optional `include_report` model export packaging, returning a ZIP with
