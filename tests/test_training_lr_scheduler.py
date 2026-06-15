@@ -47,6 +47,21 @@ def test_ultralytics_lr_scheduler_mapping(scheduler, expected):
     assert _lr_scheduler_to_ultralytics_args(scheduler) == {"cos_lr": expected}
 
 
+def test_ultralytics_pin_memory_wrapper_overrides_existing_value():
+    from train_platform.training.plugins.ultralytics_yolo import _wrap_build_dataloader_pin_memory
+
+    seen = {}
+
+    def fake_build_dataloader(*args, **kwargs):
+        seen["pin_memory"] = kwargs.get("pin_memory")
+        return "loader"
+
+    wrapped = _wrap_build_dataloader_pin_memory(fake_build_dataloader, False)
+
+    assert wrapped(pin_memory=True) == "loader"
+    assert seen["pin_memory"] is False
+
+
 def test_paddle_linear_scheduler_keeps_existing_schedulers():
     from train_platform.training.plugins.paddle_det import _apply_lr_scheduler_to_cfg
 

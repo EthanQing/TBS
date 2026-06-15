@@ -96,6 +96,10 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 
 `workers/yolo_worker.py` 应尊重 `WORKER_ID`；该值可以是任意稳定且唯一的字符串，不要求匹配容器名格式。多容器部署时如果日志仍显示相同 `worker_id`，训练任务事件和数据库领取记录会看起来像同一个 worker 在工作。`WORKER_ID` 只影响队列身份，不负责 GPU 隔离。Docker compose 中配置 GPU 后仍要进入每个 worker 容器检查 `NVIDIA_VISIBLE_DEVICES`、`CUDA_VISIBLE_DEVICES`、`nvidia-smi -L` 和 `torch.cuda.device_count()`；如果每个容器都能看到所有 GPU，多个 worker 可能会争抢同一张卡，表现为“多 worker 没有效果”或更慢。
 
+## Windows YOLO 训练可能在 pin_memory 线程报 CUDA resource already mapped
+
+Windows + CUDA + PyTorch DataLoader pinned memory 组合可能在 Ultralytics 验证阶段报 `CUDA error: resource already mapped`，栈里通常出现 `torch/utils/data/_utils/pin_memory.py`。平台 YOLO 插件在 Windows 默认关闭 Ultralytics dataloader `pin_memory`；如确需恢复，可通过训练任务 `additional_params.pin_memory=true` 覆盖。遇到该错误时优先重试新任务，并确认 worker 日志中的 `Ultralytics dataloader pin_memory=false`。
+
 ## Worker 镜像 pyc 编译版本必须匹配运行时
 
 `Dockerfile.worker.yolo` 的源码保护阶段可能在 PyArmor 失败时回退到 pyc-only protection。生成 `.pyc` 的 Python 版本必须与最终 `pytorch/pytorch` 运行时里的 Python 版本一致；否则容器启动或导入 worker 模块会报 `bad magic number`。当前 YOLO worker runtime 是 Python 3.11，因此 source-protector stage 也应使用 Python 3.11。

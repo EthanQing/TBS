@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import time
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict
 
@@ -22,6 +23,74 @@ logger = logging.getLogger("train_platform.training.ultralytics")
 
 def _lr_scheduler_to_ultralytics_args(value: Any) -> Dict[str, bool]:
     return {"cos_lr": normalize_lr_scheduler(value) == "cosine"}
+
+
+def _coerce_bool_config(value: Any, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off", ""):
+            return False
+    return bool(value)
+
+
+def _wrap_build_dataloader_pin_memory(func: Any, pin_memory_enabled: bool) -> Any:
+    if not callable(func):
+        return func
+    if (
+        getattr(func, "_train_platform_pin_memory_wrapped", False)
+        and getattr(func, "_train_platform_pin_memory_enabled", None) == bool(pin_memory_enabled)
+    ):
+        return func
+    original = getattr(func, "_train_platform_original", func)
+
+    @wraps(original)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        kwargs["pin_memory"] = bool(pin_memory_enabled)
+        return original(*args, **kwargs)
+
+    wrapped._train_platform_pin_memory_wrapped = True
+    wrapped._train_platform_pin_memory_enabled = bool(pin_memory_enabled)
+    wrapped._train_platform_original = original
+    return wrapped
+
+
+def _patch_ultralytics_dataloader_pin_memory(pin_memory_enabled: bool) -> None:
+    """
+    Force Ultralytics dataloaders to use a stable pin_memory policy.
+
+    PyTorch on Windows can fail in the pin-memory thread with
+    `CUDA error: resource already mapped` during validation. Ultralytics 8.4
+    does not expose pin_memory as a public train argument, so patch the imported
+    builder functions in-process before `model.train()`.
+    """
+    module_names = (
+        "ultralytics.data",
+        "ultralytics.data.build",
+        "ultralytics.models.yolo.detect.train",
+        "ultralytics.models.yolo.detect.val",
+        "ultralytics.models.yolo.segment.train",
+        "ultralytics.models.yolo.segment.val",
+        "ultralytics.models.yolo.classify.train",
+        "ultralytics.models.yolo.classify.val",
+    )
+    for module_name in module_names:
+        try:
+            module = __import__(module_name, fromlist=["build_dataloader"])
+        except Exception:
+            continue
+        if hasattr(module, "build_dataloader"):
+            module.build_dataloader = _wrap_build_dataloader_pin_memory(
+                getattr(module, "build_dataloader"),
+                pin_memory_enabled,
+            )
 
 
 def _apply_torch_safe_load_patches() -> None:
@@ -383,6 +452,16 @@ class UltralyticsYOLOTrainer:
                     f"Ultralytics multi-GPU batch_size ({batch_size}) must be divisible by the "
                     f"selected GPU count ({len(selected_gpu_ids)})"
                 )
+
+            pin_memory_default = os.name != "nt"
+            pin_memory_enabled = _coerce_bool_config(add.get("pin_memory"), pin_memory_default)
+            _patch_ultralytics_dataloader_pin_memory(pin_memory_enabled)
+            logger.info(
+                "Ultralytics dataloader pin_memory=%s run_id=%s default=%s",
+                pin_memory_enabled,
+                ctx.job_id,
+                pin_memory_default,
+            )
 
             train_args: Dict[str, Any] = {
                 "data": str(run_data_yaml),
