@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed intermittent training-run ONNX export failures by treating empty ONNX
+  files as invalid and resolving the actual Ultralytics output before download.
 - Added optional `include_report` model export packaging, returning a ZIP with
   the exported weights and an on-demand DOCX training report.
 - Added `lr_scheduler` to training run parameters, supporting `linear` and

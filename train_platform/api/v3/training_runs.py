@@ -316,7 +316,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
     if settings.training_dir.resolve() not in out_onnx.parents:
         raise ValidationError("Unsafe output path")
 
-    if not out_onnx.exists():
+    if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
         _export_onnx_via_worker(
             src_weights,
             out_onnx,
@@ -325,17 +325,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
             imgsz=payload.imgsz,
         )
 
-        exported = None
-
-        # Ultralytics may return a path; ensure the canonical output exists at out_onnx.
-        exported_path: Path | None = None
-        try:
-            if exported:
-                exported_path = Path(str(exported)).resolve(strict=False)
-        except Exception:
-            exported_path = None
-
-        if not out_onnx.exists():
+        if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
             newest: Path | None = None
             run_root = (settings.training_dir / str(run.run_id)).resolve(strict=False)
             try:
@@ -349,19 +339,16 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
             except Exception:
                 newest = None
 
-            if exported_path and exported_path.exists():
-                newest = exported_path
-
-            if newest and newest.exists() and newest != out_onnx:
+            if newest and newest.exists() and newest != out_onnx and newest.stat().st_size > 0:
                 try:
-                    newest.replace(out_onnx)
-                except Exception:
                     import shutil
 
                     shutil.copy2(newest, out_onnx)
+                except Exception:
+                    pass
 
-        if not out_onnx.exists():
-            raise ValidationError("ONNX export failed: output file not found")
+        if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
+            raise ValidationError("ONNX export failed: non-empty output file not found")
 
     # Upsert an artifact row so UI can list/download it later.
     rel = out_onnx.relative_to(settings.training_dir).as_posix()

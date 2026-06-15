@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import statistics
 import threading
 import time
@@ -149,6 +150,63 @@ def _load_ultralytics_yolo(weights_path: Path):
 
     _apply_ultralytics_safe_load_patches()
     return YOLO(str(weights_path))
+
+
+def _onnx_snapshot(*roots: Path) -> dict[Path, tuple[float, int]]:
+    snapshot: dict[Path, tuple[float, int]] = {}
+    for root in roots:
+        try:
+            candidates = list(root.glob("*.onnx"))
+        except Exception:
+            candidates = []
+        for cand in candidates:
+            try:
+                stat = cand.stat()
+                snapshot[cand.resolve(strict=False)] = (float(stat.st_mtime), int(stat.st_size))
+            except Exception:
+                continue
+    return snapshot
+
+
+def _newest_changed_onnx(*, roots: list[Path], before: dict[Path, tuple[float, int]], preferred: Optional[Path] = None) -> Optional[Path]:
+    candidates: list[Path] = []
+    if preferred is not None:
+        try:
+            if preferred.exists() and preferred.is_file():
+                candidates.append(preferred.resolve(strict=False))
+        except Exception:
+            pass
+
+    for root in roots:
+        try:
+            root_candidates = list(root.glob("*.onnx"))
+        except Exception:
+            root_candidates = []
+        for cand in root_candidates:
+            try:
+                resolved = cand.resolve(strict=False)
+                stat = resolved.stat()
+                old = before.get(resolved)
+                if old is None or old[0] != float(stat.st_mtime) or old[1] != int(stat.st_size):
+                    candidates.append(resolved)
+            except Exception:
+                continue
+
+    newest: Optional[Path] = None
+    for cand in candidates:
+        try:
+            if newest is None or cand.stat().st_mtime > newest.stat().st_mtime:
+                newest = cand
+        except Exception:
+            continue
+    return newest
+
+
+def _copy_exported_onnx(src: Path, dst: Path) -> None:
+    if src.resolve(strict=False) == dst.resolve(strict=False):
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
 
 
 def _ensure_benchmark_image() -> Path:
@@ -442,6 +500,8 @@ def export_training_onnx(
     src_pt = _resolve_training_path(req.src_pt, label="weights", must_exist=True)
     out_onnx = _resolve_training_path(req.out_onnx, label="output", must_exist=False)
     out_onnx.parent.mkdir(parents=True, exist_ok=True)
+    search_roots = [src_pt.parent, out_onnx.parent]
+    before = _onnx_snapshot(*search_roots)
 
     try:
         model = _load_ultralytics_yolo(src_pt)
@@ -456,24 +516,26 @@ def export_training_onnx(
 
         exported = model.export(format="onnx", **export_kwargs)
 
-        if not out_onnx.exists():
-            exported_path: Optional[Path] = None
-            try:
-                if exported:
-                    exported_path = Path(str(exported)).resolve(strict=False)
-            except Exception:
-                exported_path = None
+        exported_path: Optional[Path] = None
+        try:
+            if exported:
+                exported_path = Path(str(exported)).resolve(strict=False)
+        except Exception:
+            exported_path = None
 
-            if exported_path and exported_path.exists():
-                try:
-                    exported_path.replace(out_onnx)
-                except Exception:
-                    pass
+        if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
+            newest = _newest_changed_onnx(
+                roots=search_roots,
+                before=before,
+                preferred=exported_path,
+            )
+            if newest and newest.exists() and newest.stat().st_size > 0:
+                _copy_exported_onnx(newest, out_onnx)
     except Exception as e:
         return WorkerStatusResponse(status="error", error=f"{type(e).__name__}: {e}")
 
-    if not out_onnx.exists():
-        return WorkerStatusResponse(status="error", error=f"ONNX export did not produce {out_onnx.name}")
+    if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
+        return WorkerStatusResponse(status="error", error=f"ONNX export did not produce a non-empty {out_onnx.name}")
 
     return WorkerStatusResponse(status="ok")
 

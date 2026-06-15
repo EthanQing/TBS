@@ -84,6 +84,10 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 
 模型转换任务通过 `temp/model_conversions` 下的状态文件和锁文件协调。排查卡住任务时检查 stale lock、worker 是否启动、GPU/ONNX provider 是否可用。
 
+## 训练任务 ONNX 导出路径不一定稳定
+
+Ultralytics `model.export(format="onnx")` 可能返回实际输出路径，也可能只在权重目录落盘同名 ONNX。训练任务导出不要只检查目标文件名；应在导出前后记录权重目录/目标目录的 ONNX 快照，优先使用返回路径，其次使用新生成或更新的 ONNX，并把 0 字节 ONNX 视为失败后重新导出。Windows 下不要依赖 `Path.replace()` 作为唯一搬移方式，文件被短暂占用时应允许 `copy2` 兜底。
+
 ## Windows 下轮询状态文件可能碰到短暂文件锁
 
 违规数据集发布任务状态以数据库表 `illegal_dataset_publish_jobs` 为准，同时镜像写入 `temp/illegal_dataset_publish_jobs/<dataset_id>/<job_id>/status.json` 便于排查。后台线程会频繁原子写入镜像，前端会频繁轮询；Windows 下 `replace` / `read_text` 可能短暂互斥。状态文件读写应使用同一 job 级锁并对 `PermissionError`、短暂 `JSONDecodeError` 做小间隔重试，避免轮询接口偶发 500 或进度任务被状态写入异常带崩。
