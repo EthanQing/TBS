@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
 from sqlalchemy.orm import Session
 
@@ -263,6 +265,11 @@ def create_illegal_dataset_publish_job(
     if job.status == "queued":
         publish_job_svc.start_job(int(illegal_dataset_id), str(job.job_id))
     return job
+
+
+@router.get("/{illegal_dataset_id}/publish-jobs/active", response_model=Optional[IllegalDatasetPublishJobOut])
+def get_active_illegal_dataset_publish_job(illegal_dataset_id: int):
+    return publish_job_svc.get_active_job(int(illegal_dataset_id))
 
 
 @router.get("/{illegal_dataset_id}/publish-jobs/{job_id}", response_model=IllegalDatasetPublishJobOut)

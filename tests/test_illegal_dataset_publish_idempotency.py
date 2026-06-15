@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -32,7 +31,23 @@ def _make_db():
         IllegalDatasetPublishJob.__table__,
     ):
         table.create(engine, checkfirst=True)
-    return sessionmaker(bind=engine)()
+    factory = sessionmaker(bind=engine)
+    return factory()
+
+
+def _make_db_factory():
+    engine = create_engine("sqlite:///:memory:")
+    for table in (
+        StandardDataset.__table__,
+        StandardDatasetEvent.__table__,
+        StandardDatasetImage.__table__,
+        IllegalDataset.__table__,
+        IllegalDatasetVersion.__table__,
+        IllegalDatasetLabelMapping.__table__,
+        IllegalDatasetPublishJob.__table__,
+    ):
+        table.create(engine, checkfirst=True)
+    return sessionmaker(bind=engine)
 
 
 def _seed_illegal_dataset(db):
@@ -177,3 +192,89 @@ def test_failed_publish_job_is_reset_for_retry(monkeypatch, tmp_path: Path) -> N
     assert retry.status == "queued"
     assert retry.error_message is None
     assert retry.progress == 0
+
+
+def test_get_active_publish_job_returns_latest_running_job(monkeypatch, tmp_path: Path) -> None:
+    factory = _make_db_factory()
+    db = factory()
+    _seed_illegal_dataset(db)
+    svc = IllegalDatasetPublishJobService()
+    monkeypatch.setattr(
+        "train_platform.services.v3.illegal_dataset_publish_job_service.SessionLocal",
+        factory,
+    )
+    monkeypatch.setattr(svc, "jobs_root", lambda dataset_id: tmp_path / "jobs" / str(dataset_id))
+
+    older = svc.create_job(db, 1000001, _payload(publish_config={"conversion": {"slice": {"enabled": False}}}))
+    newer = svc.create_job(
+        db,
+        1000001,
+        _payload(publish_config={"conversion": {"slice": {"enabled": True, "slice_size": 1024}}}),
+    )
+    base = datetime.utcnow()
+    older_row = db.query(IllegalDatasetPublishJob).filter_by(job_id=older.job_id).one()
+    newer_row = db.query(IllegalDatasetPublishJob).filter_by(job_id=newer.job_id).one()
+    older_row.status = "running"
+    older_row.phase = "converting"
+    older_row.progress = 30
+    older_row.updated_at = base
+    newer_row.status = "running"
+    newer_row.phase = "publishing"
+    newer_row.progress = 80
+    newer_row.updated_at = base + timedelta(seconds=10)
+    db.commit()
+
+    active = svc.get_active_job(1000001)
+
+    assert active is not None
+    assert active.job_id == newer.job_id
+    assert active.progress == 80
+    db.close()
+
+
+def test_get_active_publish_job_returns_latest_queued_job(monkeypatch, tmp_path: Path) -> None:
+    factory = _make_db_factory()
+    db = factory()
+    _seed_illegal_dataset(db)
+    svc = IllegalDatasetPublishJobService()
+    monkeypatch.setattr(
+        "train_platform.services.v3.illegal_dataset_publish_job_service.SessionLocal",
+        factory,
+    )
+    monkeypatch.setattr(svc, "jobs_root", lambda dataset_id: tmp_path / "jobs" / str(dataset_id))
+
+    job = svc.create_job(db, 1000001, _payload())
+    row = db.query(IllegalDatasetPublishJob).filter_by(job_id=job.job_id).one()
+    row.status = "queued"
+    row.phase = "queued"
+    row.progress = 0
+    db.commit()
+
+    active = svc.get_active_job(1000001)
+
+    assert active is not None
+    assert active.job_id == job.job_id
+    assert active.status == "queued"
+    db.close()
+
+
+def test_get_active_publish_job_ignores_terminal_jobs(monkeypatch, tmp_path: Path) -> None:
+    factory = _make_db_factory()
+    db = factory()
+    _seed_illegal_dataset(db)
+    svc = IllegalDatasetPublishJobService()
+    monkeypatch.setattr(
+        "train_platform.services.v3.illegal_dataset_publish_job_service.SessionLocal",
+        factory,
+    )
+    monkeypatch.setattr(svc, "jobs_root", lambda dataset_id: tmp_path / "jobs" / str(dataset_id))
+
+    job = svc.create_job(db, 1000001, _payload())
+    row = db.query(IllegalDatasetPublishJob).filter_by(job_id=job.job_id).one()
+    row.status = "completed"
+    row.phase = "done"
+    row.progress = 100
+    db.commit()
+
+    assert svc.get_active_job(1000001) is None
+    db.close()

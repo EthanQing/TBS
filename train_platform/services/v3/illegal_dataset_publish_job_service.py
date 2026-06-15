@@ -388,6 +388,27 @@ class IllegalDatasetPublishJobService:
         finally:
             db.close()
 
+    def get_active_job(self, illegal_dataset_id: int) -> IllegalDatasetPublishJobOut | None:
+        db = SessionLocal()
+        try:
+            job = (
+                db.query(IllegalDatasetPublishJob)
+                .filter(
+                    IllegalDatasetPublishJob.illegal_dataset_id == int(illegal_dataset_id),
+                    IllegalDatasetPublishJob.status.in_(("queued", "running")),
+                )
+                .order_by(
+                    IllegalDatasetPublishJob.updated_at.desc(),
+                    IllegalDatasetPublishJob.created_at.desc(),
+                )
+                .first()
+            )
+            if job is None:
+                return None
+            return self._job_out(job)
+        finally:
+            db.close()
+
     def start_job(self, illegal_dataset_id: int, job_id: str) -> None:
         thread = threading.Thread(
             target=self._run_job,
