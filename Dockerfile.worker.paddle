@@ -51,8 +51,6 @@ WORKDIR /app
 COPY requirements/ ./requirements/
 RUN pip install --no-cache-dir -r requirements/worker.paddle.txt
 
-# paddledet is installed without deps to avoid pulling conflicting opencv wheels.
-RUN pip install --no-cache-dir --no-deps paddledet==2.6.0
 RUN pip install --no-cache-dir \
     "numpy==1.23.5" \
     "protobuf<=3.20.3" \
@@ -67,18 +65,21 @@ RUN pip install --no-cache-dir \
     terminaltables \
     Cython
 
+# Clone PaddleDetection repo. The platform imports ppdet and official configs
+# from this checkout instead of the incomplete paddledet wheel.
+RUN git clone --branch release/2.6 --depth 1 https://github.com/PaddlePaddle/PaddleDetection.git /app/PaddleDetection \
+    && rm -rf /app/PaddleDetection/.git /app/PaddleDetection/deploy /app/PaddleDetection/docs \
+              /app/PaddleDetection/test /app/PaddleDetection/benchmark /app/PaddleDetection/demo_input
+ENV PADDLE_DET_DIR=/app/PaddleDetection
+ENV PYTHONPATH=/app/PaddleDetection:${PYTHONPATH}
+
 RUN python - <<'PY'
 import paddle
 print("paddle:", paddle.__version__)
 from ppdet.core.workspace import load_config
-print("ppdet: OK")
+load_config("/app/PaddleDetection/configs/ppyoloe/ppyoloe_plus_crn_s_80e_coco.yml")
+print("ppdet source checkout: OK")
 PY
-
-# Clone PaddleDetection repo (configs only, shallow clone)
-RUN git clone --depth 1 https://github.com/PaddlePaddle/PaddleDetection.git /app/PaddleDetection \
-    && rm -rf /app/PaddleDetection/.git /app/PaddleDetection/deploy /app/PaddleDetection/docs \
-              /app/PaddleDetection/test /app/PaddleDetection/benchmark /app/PaddleDetection/demo_input
-ENV PADDLE_DET_DIR=/app/PaddleDetection
 
 COPY --from=source-protector /protected-runtime/ ./
 COPY alembic.ini .
@@ -91,7 +92,7 @@ RUN --mount=type=secret,id=train_platform_license,required=false \
     fi
 
 COPY docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "-m", "train_platform.workers.paddle_worker"]

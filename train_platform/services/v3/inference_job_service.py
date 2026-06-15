@@ -25,6 +25,7 @@ from train_platform.schemas.v3.inference_jobs import (
 from train_platform.services.v3.inference_service import InferenceService
 from train_platform.services.v3.model_version_service import ModelVersionService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
+from train_platform.utils.paddledet_paths import resolve_paddledet_config_path
 
 _LOCKS_GUARD = threading.Lock()
 _JOB_LOCKS: Dict[str, threading.Lock] = {}
@@ -171,18 +172,7 @@ class InferenceJobService:
         txt = str(raw).strip().replace("\\", "/")
         if not txt:
             return None
-        p = Path(txt)
-        if p.is_absolute() and p.exists():
-            return p.resolve(strict=False)
-
-        candidates = [
-            (settings.paddle_det_dir / txt).resolve(strict=False),
-            (settings.home_dir / txt).resolve(strict=False),
-        ]
-        for c in candidates:
-            if c.exists() and c.is_file():
-                return c
-        return None
+        return resolve_paddledet_config_path(txt)
 
     def _build_candidate(
         self,

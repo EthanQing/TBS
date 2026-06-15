@@ -5,8 +5,9 @@
 #   pip install paddlepaddle==2.6.2
 #   pip install paddlepaddle-gpu==2.6.2
 #
-# Install PaddleDetection manually to avoid opencv dependency conflicts:
-#   pip install --no-deps paddledet==2.6.0
+# PaddleDetection is loaded from a release/2.6 source checkout:
+#   git clone --branch release/2.6 --depth 1 https://github.com/PaddlePaddle/PaddleDetection.git PaddleDetection
+#   set PADDLE_DET_DIR=%CD%\PaddleDetection
 
 pycocotools
 typeguard

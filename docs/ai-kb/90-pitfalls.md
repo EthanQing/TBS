@@ -26,11 +26,11 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 
 ## 依赖版本有强约束
 
-`pyproject.toml` 为 Windows CUDA 11.8 生态固定了 Torch、PaddlePaddle、PaddleDetection、numpy、opencv、protobuf 等版本，并通过 `tool.uv.override-dependencies` 覆盖 opencv 冲突。升级依赖前要同时验证 YOLO、PaddleDetection 和 ONNX Runtime。
+`pyproject.toml` 为 Windows CUDA 11.8 生态固定了 Torch、PaddlePaddle、numpy、opencv、protobuf 等版本，并通过 `tool.uv.override-dependencies` 覆盖 opencv 冲突。PaddleDetection 不再使用 `paddledet` pip 包，而是从本地源码 checkout 导入。升级依赖前要同时验证 YOLO、PaddleDetection 和 ONNX Runtime。
 
 ## PaddleDetection 本地路径
 
-`PADDLE_DET_DIR` 默认指向仓库下 `PaddleDetection/`。该目录通常是本地 checkout 且被忽略。Paddle 相关代码可能依赖本地 ppdet 可导入。
+`PADDLE_DET_DIR` 默认指向仓库下 `PaddleDetection/`。该目录必须是完整 PaddleDetection `release/2.6` 源码 checkout，至少包含 `ppdet/__init__.py`、`configs/` 和 `configs/ppyoloe/ppyoloe_plus_crn_s_80e_coco.yml`，并且被 `.gitignore` 忽略不提交。`paddledet==2.6.0` pip 包不包含官方 YAML 配置树，不能作为平台 PaddleDetection 来源。
 
 ## 内部推理鉴权
 

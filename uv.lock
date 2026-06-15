@@ -998,33 +998,6 @@ wheels = [
 ]
 
 [[package]]
-name = "paddledet"
-version = "2.6.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "cython", marker = "sys_platform == 'win32'" },
-    { name = "lap", marker = "sys_platform == 'win32'" },
-    { name = "motmetrics", marker = "sys_platform == 'win32'" },
-    { name = "numpy", marker = "sys_platform == 'win32'" },
-    { name = "opencv-python", marker = "sys_platform == 'win32'" },
-    { name = "pyclipper", marker = "sys_platform == 'win32'" },
-    { name = "pycocotools", marker = "sys_platform == 'win32'" },
-    { name = "pyyaml", marker = "sys_platform == 'win32'" },
-    { name = "scipy", marker = "sys_platform == 'win32'" },
-    { name = "setuptools", marker = "sys_platform == 'win32'" },
-    { name = "shapely", marker = "sys_platform == 'win32'" },
-    { name = "sklearn", marker = "sys_platform == 'win32'" },
-    { name = "terminaltables", marker = "sys_platform == 'win32'" },
-    { name = "tqdm", marker = "sys_platform == 'win32'" },
-    { name = "typeguard", marker = "sys_platform == 'win32'" },
-    { name = "visualdl", marker = "sys_platform == 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/60/16/72a2abb1014395f4db9b5a988f350e8a434a1b3bc871273d6c26185933ea/paddledet-2.6.0.tar.gz", hash = "sha256:f6adeba4982d7bba31a313e07f55500c056f4b011d31777b4d145c5578f7eb31", size = 594026, upload_time = "2023-02-24T08:12:33.074Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5b/b3/9d4335ef2a6bc53665bd262fe0288399ae4c9fc2cac3f6604bc50573ae61/paddledet-2.6.0-py3-none-any.whl", hash = "sha256:a3cf717d61c771be000a7cd7f3cc6b254724aacf24db6bfcba1443c2f409deff", size = 812768, upload_time = "2023-02-24T08:12:29.281Z" },
-]
-
-[[package]]
 name = "paddlepaddle-gpu"
 version = "3.2.2"
 source = { registry = "https://www.paddlepaddle.org.cn/packages/stable/cu118/" }
@@ -1475,12 +1448,6 @@ wheels = [
 ]
 
 [[package]]
-name = "sklearn"
-version = "0.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/1e/7a/dbb3be0ce9bd5c8b7e3d87328e79063f8b263b2b1bfa4774cb1147bfcd3f/sklearn-0.0.tar.gz", hash = "sha256:e23001573aa194b834122d2b9562459bf5ae494a2d59ca6b8aa22c85a44c0e31", size = 1148, upload_time = "2015-07-15T14:17:46.609Z" }
-
-[[package]]
 name = "smmap"
 version = "5.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1608,14 +1575,14 @@ wheels = [
 
 [[package]]
 name = "tqdm"
-version = "4.67.3"
+version = "4.68.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload_time = "2026-02-03T17:35:53.048Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/85/05/0d5260f1f1ca784f4a4a0def9cbe6affe587f5b4025328d446c3d67765f4/tqdm-4.68.2.tar.gz", hash = "sha256:89c230e8dbc67c7615c142487111222f878c77427ea09549960f62389e258add", size = 171923, upload_time = "2026-06-09T13:26:42.539Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/16/e1/3079a9ff9b8e11b846c6ac5c8b5bfb7ff225eee721825310c91b3b50304f/tqdm-4.67.3-py3-none-any.whl", hash = "sha256:ee1e4c0e59148062281c49d80b25b67771a127c85fc9676d3be5f243206826bf", size = 78374, upload_time = "2026-02-03T17:35:50.982Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/75/1a0392bcc21c44dcdf87b3cf2d137e7829be2c083a1e38d44efca3d57a16/tqdm-4.68.2-py3-none-any.whl", hash = "sha256:d4240441fb5353290b87d6a85968c9decc131a99b8c7faa28269d829de669ede", size = 78578, upload_time = "2026-06-09T13:26:40.731Z" },
 ]
 
 [[package]]
@@ -1637,12 +1604,12 @@ dependencies = [
     { name = "onnx", marker = "sys_platform == 'win32'" },
     { name = "onnxruntime-gpu", marker = "sys_platform == 'win32'" },
     { name = "opencv-python", marker = "sys_platform == 'win32'" },
-    { name = "paddledet", marker = "sys_platform == 'win32'" },
     { name = "paddlepaddle-gpu", marker = "sys_platform == 'win32'" },
     { name = "pandas", marker = "sys_platform == 'win32'" },
     { name = "pillow", marker = "sys_platform == 'win32'" },
     { name = "protobuf", marker = "sys_platform == 'win32'" },
     { name = "psutil", marker = "sys_platform == 'win32'" },
+    { name = "pyclipper", marker = "sys_platform == 'win32'" },
     { name = "pycocotools", marker = "sys_platform == 'win32'" },
     { name = "pymysql", marker = "sys_platform == 'win32'" },
     { name = "python-dotenv", marker = "sys_platform == 'win32'" },
@@ -1650,11 +1617,15 @@ dependencies = [
     { name = "pyyaml", marker = "sys_platform == 'win32'" },
     { name = "rasterio", marker = "sys_platform == 'win32'" },
     { name = "requests", marker = "sys_platform == 'win32'" },
+    { name = "scikit-learn", marker = "sys_platform == 'win32'" },
+    { name = "scipy", marker = "sys_platform == 'win32'" },
     { name = "setuptools", marker = "sys_platform == 'win32'" },
+    { name = "shapely", marker = "sys_platform == 'win32'" },
     { name = "sqlalchemy", marker = "sys_platform == 'win32'" },
     { name = "terminaltables", marker = "sys_platform == 'win32'" },
     { name = "torch", marker = "sys_platform == 'win32'" },
     { name = "torchvision", marker = "sys_platform == 'win32'" },
+    { name = "tqdm", marker = "sys_platform == 'win32'" },
     { name = "typeguard", marker = "sys_platform == 'win32'" },
     { name = "ultralytics", marker = "sys_platform == 'win32'" },
     { name = "uvicorn", extra = ["standard"], marker = "sys_platform == 'win32'" },
@@ -1678,13 +1649,13 @@ requires-dist = [
     { name = "onnx", specifier = "<=1.16.0" },
     { name = "onnxruntime-gpu", specifier = ">=1.23.2" },
     { name = "opencv-python", specifier = "==4.9.0.80" },
-    { name = "paddledet", specifier = "==2.6.0" },
     { name = "paddlepaddle-gpu", marker = "sys_platform != 'win32'", specifier = "==3.2.2" },
     { name = "paddlepaddle-gpu", marker = "sys_platform == 'win32'", specifier = "==3.2.2", index = "https://www.paddlepaddle.org.cn/packages/stable/cu118/" },
     { name = "pandas", specifier = "==2.2.2" },
     { name = "pillow", specifier = "==10.4.0" },
     { name = "protobuf", specifier = "<=3.20.3" },
     { name = "psutil", specifier = ">=7.2.2" },
+    { name = "pyclipper", specifier = ">=1.4.0" },
     { name = "pycocotools", specifier = ">=2.0.7" },
     { name = "pymysql", specifier = "==1.1.0" },
     { name = "python-dotenv", specifier = "==1.0.1" },
@@ -1692,13 +1663,17 @@ requires-dist = [
     { name = "pyyaml", specifier = "==6.0.1" },
     { name = "rasterio", specifier = ">=1.3.10,<1.4.0" },
     { name = "requests", specifier = "==2.32.3" },
+    { name = "scikit-learn", specifier = ">=1.7.2" },
+    { name = "scipy", specifier = ">=1.15.3" },
     { name = "setuptools", specifier = ">=65,<81" },
+    { name = "shapely", specifier = ">=2.1.2" },
     { name = "sqlalchemy", specifier = "==2.0.30" },
     { name = "terminaltables", specifier = ">=3.1.10" },
     { name = "torch", marker = "sys_platform != 'win32'", specifier = "==2.4.1" },
     { name = "torch", marker = "sys_platform == 'win32'", specifier = "==2.4.1", index = "https://download.pytorch.org/whl/cu118" },
     { name = "torchvision", marker = "sys_platform != 'win32'", specifier = "==0.19.1" },
     { name = "torchvision", marker = "sys_platform == 'win32'", specifier = "==0.19.1", index = "https://download.pytorch.org/whl/cu118" },
+    { name = "tqdm", specifier = ">=4.67.1" },
     { name = "typeguard", specifier = ">=2.13.3" },
     { name = "ultralytics", specifier = "==8.4.14" },
     { name = "uvicorn", extras = ["standard"], specifier = "==0.29.0" },

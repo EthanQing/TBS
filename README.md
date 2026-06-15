@@ -45,7 +45,7 @@ datasets/          dataset storage
 training_runs/     training artifacts
 temp/              temporary files
 pretrain_models/   pre-trained model storage
-PaddleDetection/   local PaddleDetection checkout (optional)
+PaddleDetection/   local PaddleDetection release/2.6 checkout for Paddle workers
 ```
 
 ## Requirements
@@ -83,6 +83,20 @@ Or install from the project metadata:
 
 ```bash
 pip install -e .
+```
+
+For PaddleDetection training or inference, clone the official source checkout.
+The `paddledet` pip package is not used because it does not bundle the official
+`configs/` tree required by the platform:
+
+```bash
+git clone --branch release/2.6 --depth 1 https://github.com/PaddlePaddle/PaddleDetection.git PaddleDetection
+```
+
+Set `PADDLE_DET_DIR` if the checkout is not under this backend directory:
+
+```bash
+set PADDLE_DET_DIR=C:\path\to\PaddleDetection
 ```
 
 ### 3. Initialize the database
@@ -141,6 +155,11 @@ Paddle training worker:
 ```bash
 python -m train_platform.workers.paddle_worker
 ```
+
+Paddle workers require a complete PaddleDetection `release/2.6` source checkout
+containing both `ppdet/` and `configs/`. By default the backend resolves
+`PaddleDetection/` under this directory; Docker paddle worker images clone the
+same checkout into `/app/PaddleDetection`.
 
 Generic inference worker:
 

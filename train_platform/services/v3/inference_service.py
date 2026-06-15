@@ -18,6 +18,7 @@ from train_platform.models.v3.inference import InferenceRun
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.training_run import TrainingRun
 from train_platform.utils.exceptions import NotFoundError, ValidationError
+from train_platform.utils.paddledet_paths import resolve_paddledet_config_path
 from train_platform.utils.path_utils import resolve_temp_path, resolve_training_path
 
 
@@ -194,18 +195,7 @@ class InferenceService:
         if not txt:
             return None
 
-        p = Path(txt)
-        if p.is_absolute() and p.exists():
-            return p.resolve(strict=False)
-
-        candidates = [
-            (settings.paddle_det_dir / txt).resolve(strict=False),
-            (settings.home_dir / txt).resolve(strict=False),
-        ]
-        for c in candidates:
-            if c.exists() and c.is_file():
-                return c
-        return None
+        return resolve_paddledet_config_path(txt)
 
     def _materialize_input(self, *, input_path: Optional[str], image_url: Optional[str]) -> tuple[Path, str, Dict[str, Any]]:
         meta: Dict[str, Any] = {}

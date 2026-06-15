@@ -13,7 +13,7 @@ opencv-python-headless==4.9.0.80
 mlflow==2.15.1
 ultralytics==8.4.14
 paddlepaddle-gpu==2.6.2
-# paddledet 通过 Dockerfile 单独 --no-deps 安装（与 ultralytics 的 opencv 版本冲突）
+# PaddleDetection is loaded from the source checkout configured by PADDLE_DET_DIR.
 cryptography>=46.0.3
 onnxruntime-gpu>=1.23.2
 onnx>=1.19.0

@@ -27,6 +27,11 @@ from train_platform.core.config import settings
 from train_platform.training.plugins.base import TrainContext
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ValidationError
+from train_platform.utils.paddledet_paths import (
+    ensure_paddledet_repo_on_syspath,
+    paddledet_missing_message,
+    resolve_paddledet_config_path,
+)
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
 from train_platform.utils.training_params import extract_selected_gpu_ids, normalize_device_spec, normalize_lr_scheduler
 
@@ -104,42 +109,6 @@ def _apply_metric_aliases(raw_metrics: Dict[str, Any] | None) -> Dict[str, float
     _alias("precision", "metrics/precision(B)")
     _alias("recall", "metrics/recall(B)")
     return out
-
-
-def _ensure_local_ppdet_on_syspath() -> Path | None:
-    """
-    Best-effort: add a local PaddleDetection repo to sys.path.
-
-    This enables local development where PaddleDetection is cloned but not
-    installed as a wheel/package.
-    """
-    roots = []
-    raw = settings.paddle_det_dir
-    roots.append(raw)
-    # Allow pointing either to repo root or to its parent directory.
-    roots.append(raw / "PaddleDetection")
-
-    for candidate in roots:
-        try:
-            root = candidate.resolve(strict=False)
-        except Exception:
-            root = candidate
-        if not root.exists() or not root.is_dir():
-            continue
-
-        # Typical PaddleDetection repo root contains ./ppdet package directory.
-        if not (root / "ppdet").is_dir():
-            # Also allow PADDLE_DET_DIR directly pointing to ./ppdet.
-            if root.name.lower() == "ppdet" and root.parent.is_dir():
-                root = root.parent
-            else:
-                continue
-
-        s = str(root)
-        if s not in sys.path:
-            sys.path.insert(0, s)
-        return root
-    return None
 
 
 def _set_cfg_by_path(root: Any, dotted_key: str, value: Any) -> bool:
@@ -846,24 +815,13 @@ class PaddleDetTrainer:
                     f"{hint} Original error: {type(e).__name__}: {msg}"
                 ) from e
 
-        ppdet_module = None
+        ppdet_repo = None
         try:
-            import ppdet as ppdet_module  # type: ignore
+            ppdet_repo = ensure_paddledet_repo_on_syspath()
             from ppdet.core.workspace import load_config
             from ppdet.engine import Trainer as PPTrainer
-        except Exception as first_error:
-            # Local-dev fallback: use source repo via PADDLE_DET_DIR without pip install.
-            _ensure_local_ppdet_on_syspath()
-            try:
-                import ppdet as ppdet_module  # type: ignore
-                from ppdet.core.workspace import load_config
-                from ppdet.engine import Trainer as PPTrainer
-            except Exception as second_error:
-                root_error = second_error or first_error
-                raise RuntimeError(
-                    "PaddleDetection (ppdet) is not available. "
-                    "Install paddledet, or set PADDLE_DET_DIR to a local PaddleDetection repo."
-                ) from root_error
+        except Exception as e:
+            raise RuntimeError(paddledet_missing_message()) from e
 
         job = ctx.job
         add = getattr(getattr(job, "parameters", None), "additional_params", None) or {}
@@ -888,43 +846,12 @@ class PaddleDetTrainer:
                 f"Please provide config_path in additional_params or architecture default_params."
             )
 
-        cfg_path = Path(str(config_path))
-        if not cfg_path.is_absolute():
-            # 1) Try PaddleDetection repo clone (settings.paddle_det_dir)
-            repo_roots = [settings.paddle_det_dir, settings.paddle_det_dir / "PaddleDetection"]
-            if ppdet_module is not None:
-                try:
-                    pkg_init = Path(ppdet_module.__file__).resolve()
-                    repo_roots.extend([pkg_init.parent.parent, pkg_init.parent])
-                except Exception:
-                    pass
+        cfg_path = resolve_paddledet_config_path(config_path)
 
-            seen_roots: set[str] = set()
-            for root in repo_roots:
-                key = str(root)
-                if key in seen_roots:
-                    continue
-                seen_roots.add(key)
-                cand = (root / cfg_path).resolve(strict=False)
-                if cand.exists():
-                    cfg_path = cand
-                    break
-            else:
-                # 2) Try temp / pretrain_models / cwd
-                for resolver in (resolve_temp_path, resolve_pretrain_path):
-                    cand = resolver(str(config_path))
-                    if cand.exists():
-                        cfg_path = cand
-                        break
-                else:
-                    cfg_path = (Path.cwd() / cfg_path).resolve(strict=False)
-
-        if not cfg_path.exists():
+        if cfg_path is None or not cfg_path.exists():
             raise ValidationError(
-                f"PaddleDetection config not found: {cfg_path}. "
-                f"The installed `paddledet` package does not bundle the official YAML config tree. "
-                f"Please clone PaddleDetection v2.6.x and set PADDLE_DET_DIR, "
-                f"or place the `configs/` directory under {settings.paddle_det_dir}."
+                f"PaddleDetection config not found: {config_path}. "
+                f"{paddledet_missing_message()}"
             )
 
         # ---- Dataset: YOLO → COCO ----

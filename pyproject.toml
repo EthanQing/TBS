@@ -30,18 +30,20 @@ dependencies = [
   # PaddleDetection 2.6.0 需要 numpy<1.24
   "numpy==1.23.5",
 
-  # ultralytics 需要 opencv-python>=4.6
-  # paddledet 2.6.0 的 opencv 上限通过 tool.uv.override-dependencies 覆盖
+  # ultralytics 需要 opencv-python>=4.6；PaddleDetection 从本地源码 checkout 导入，
+  # 不再安装 paddledet wheel，避免其旧 opencv 依赖约束。
   "opencv-python==4.9.0.80",
 
-  # 提供 ppdet
-  "paddledet==2.6.0",
-
-  # PaddleDetection 常用依赖
+  # PaddleDetection release/2.6 源码运行依赖
   "pycocotools>=2.0.7",
   "typeguard>=2.13.3",
   "visualdl>=2.2.0",
   "lap>=0.5.12",
+  "tqdm>=4.67.1",
+  "shapely>=2.1.2",
+  "pyclipper>=1.4.0",
+  "scipy>=1.15.3",
+  "scikit-learn>=1.7.2",
   "terminaltables>=3.1.10",
 
   "cryptography>=46.0.3",
@@ -76,11 +78,8 @@ environments = [
   "sys_platform == 'win32'",
 ]
 
-# 关键：
-# paddledet==2.6.0 声明 opencv-python<4.6
-# ultralytics==8.4.14 需要 opencv-python>=4.6
-# 这里强制使用 4.9.0.80，让 uv 解析通过。
-# uv 官方说明 override-dependencies 会直接替换依赖声明，是解决这种元数据冲突的最后手段。
+# 关键：统一使用 PaddleDetection 源码 checkout，不安装 paddledet wheel。
+# 这里仍固定 opencv-python 4.9.0.80，以匹配 ultralytics 和当前推理/图像处理代码。
 override-dependencies = [
   "opencv-python==4.9.0.80",
 ]
