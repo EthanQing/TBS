@@ -135,6 +135,41 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
             label_mapping_norm[nk] = v
     missing_labels: set[str] = set()
 
+    def mapping_value_is_discard(value: Any) -> bool:
+        return str(value if value is not None else "").strip() in {"", "__DISCARD__"}
+
+    def lookup_mapping_value(label: str) -> tuple[Any, bool]:
+        if label_mapping is None:
+            return None, False
+        if label in label_mapping:
+            return label_mapping.get(label), True
+        if label_mapping_norm is not None:
+            norm_key = _normalize_label_key(label)
+            if norm_key in label_mapping_norm:
+                return label_mapping_norm.get(norm_key), True
+        return None, False
+
+    def iter_parent_labels(label: str):
+        if not label_sep:
+            return
+        seen: set[str] = set()
+        for candidate in (str(label or "").strip(), _normalize_label_key(label)):
+            parts = [part.strip() for part in str(candidate).split(label_sep) if part.strip()]
+            for index in range(1, len(parts)):
+                parent = label_sep.join(parts[:index])
+                if parent and parent not in seen:
+                    seen.add(parent)
+                    yield parent
+
+    def has_discarded_parent(label: str) -> bool:
+        if label_mapping is None:
+            return False
+        for parent in iter_parent_labels(label):
+            value, found = lookup_mapping_value(parent)
+            if found and mapping_value_is_discard(value):
+                return True
+        return False
+
     try:
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -175,17 +210,13 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
             continue
 
         if label_mapping is not None:
-            mapped_label = None
-            if raw_label_stripped in label_mapping:
-                mapped_label = label_mapping.get(raw_label_stripped)
-            elif label_mapping_norm is not None:
-                norm_key = _normalize_label_key(raw_label_stripped)
-                if norm_key in label_mapping_norm:
-                    mapped_label = label_mapping_norm.get(norm_key)
+            mapped_label, matched_mapping = lookup_mapping_value(raw_label_stripped)
 
-            if mapped_label == "__DISCARD__" or mapped_label == "":
+            if matched_mapping and mapping_value_is_discard(mapped_label):
                 continue
-            if mapped_label is not None:
+            if has_discarded_parent(raw_label_stripped):
+                continue
+            if matched_mapping:
                 raw_label_stripped = str(mapped_label).strip()
             elif label_strategy_norm == "mapping":
                 missing_labels.add(raw_label_stripped)
@@ -883,14 +914,47 @@ class IllegalDatasetPublishService:
         self,
         label_mapping: Optional[dict[str, str]],
         label_filters: Optional[list[str]],
+        *,
+        label_separator: str = "%",
     ) -> dict[str, str]:
-        mapping = {str(k): str(v) for k, v in (label_mapping or {}).items() if str(k).strip() and str(v).strip()}
+        mapping = {
+            str(k).strip(): str(v).strip()
+            for k, v in (label_mapping or {}).items()
+            if str(k).strip()
+        }
         filters = {str(item).strip() for item in (label_filters or []) if str(item).strip()}
-        if not filters:
-            return mapping
         effective: dict[str, str] = {}
         for raw_label, mapped_label in mapping.items():
-            effective[raw_label] = mapped_label if mapped_label in filters else "__DISCARD__"
+            if mapped_label in {"", "__DISCARD__"}:
+                effective[raw_label] = "__DISCARD__"
+            elif filters:
+                effective[raw_label] = mapped_label if mapped_label in filters else "__DISCARD__"
+            else:
+                effective[raw_label] = mapped_label
+
+        separator = str(label_separator or "%")
+        deleted_roots = [
+            raw_label
+            for raw_label, mapped_label in effective.items()
+            if mapped_label in {"", "__DISCARD__"}
+        ]
+        if not deleted_roots:
+            return effective
+
+        def is_descendant(label: str, parent: str) -> bool:
+            if label == parent:
+                return False
+            if separator:
+                label_norm = _normalize_label_key(label)
+                parent_norm = _normalize_label_key(parent)
+                return label.startswith(f"{parent}{separator}") or label_norm.startswith(f"{parent_norm}{separator}")
+            return False
+
+        for raw_label in list(effective.keys()):
+            if effective.get(raw_label) in {"", "__DISCARD__"}:
+                continue
+            if any(is_descendant(raw_label, parent) for parent in deleted_roots):
+                effective[raw_label] = "__DISCARD__"
         return effective
 
     def _build_pair_cfg(
@@ -1138,9 +1202,13 @@ class IllegalDatasetPublishService:
         if not source_root.exists() or not source_root.is_dir():
             raise ValidationError("Dataset root not found for conversion")
 
-        output_root.mkdir(parents=True, exist_ok=True)
-        effective_mapping = self._build_effective_mapping(label_mapping, label_filters)
         slice_config = self._normalize_slice_config(publish_config)
+        output_root.mkdir(parents=True, exist_ok=True)
+        effective_mapping = self._build_effective_mapping(
+            label_mapping,
+            label_filters,
+            label_separator=str(slice_config["label_separator"]),
+        )
 
         pairs, warnings, unmatched_files = self._collect_pairs(source_root)
         if not pairs:

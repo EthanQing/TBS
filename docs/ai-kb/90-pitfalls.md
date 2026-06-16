@@ -80,6 +80,8 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 
 `illegal_dataset_label_mappings` 对 `illegal_dataset_id + raw_label` 有唯一约束。原始标签可能混入全角百分号、零宽字符或首尾空白；保存映射时后端会按规范化 key 合并重复项，并在事务内替换当前数据集的旧映射。MySQL 下写入使用 `ON DUPLICATE KEY UPDATE` 兜底，避免 MySQL collation 认为重复的标签触发 duplicate key。若日志仍出现该表的 `uq_illegal_dataset_label_mapping_raw_label`，优先检查是否存在多实例并发保存或数据库中已手工插入的异常记录。
 
+前端和发布端都不能把未保存标签自动补成 `raw -> raw` 的保存映射，否则用户删除的类别会被默认保留覆盖。树形映射里父节点删除表示当前标签和所有 descendants 都过滤；发布转换会按 `label_separator` 对 `status=delete` / `__DISCARD__` 做同样兜底。
+
 ## 模型转换依赖本地队列文件
 
 模型转换任务通过 `temp/model_conversions` 下的状态文件和锁文件协调。排查卡住任务时检查 stale lock、worker 是否启动、GPU/ONNX provider 是否可用。

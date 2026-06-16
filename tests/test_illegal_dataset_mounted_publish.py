@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import yaml
 from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -60,7 +61,7 @@ def test_convert_dataset_skips_truncated_image_and_keeps_valid_pairs(tmp_path: P
         source_root,
         output_root,
         label_mapping={"car": "car"},
-        publish_config={"slice": {"enabled": False, "output_format": "jpg"}},
+        publish_config={"conversion": {"slice": {"enabled": False, "output_format": "jpg"}}},
         progress_callback=lambda phase, info: events.append((phase, info)),
     )
 
@@ -70,6 +71,75 @@ def test_convert_dataset_skips_truncated_image_and_keeps_valid_pairs(tmp_path: P
     assert any("bad.jpg / bad.json" in item for item in result["warnings"])
     assert any("跳过 bad.jpg / bad.json" in str(info.get("message", "")) for _phase, info in events)
     assert len(list((output_root / "images").glob("*.jpg"))) == 1
+
+
+def test_convert_dataset_excludes_deleted_mappings_from_yolo_outputs(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "output"
+    source_root.mkdir()
+
+    Image.new("RGB", (100, 100), (255, 255, 255)).save(source_root / "sample.jpg")
+    annotation = {
+        "shapes": [
+            {"label": "keep", "shape_type": "rectangle", "points": [[5, 5], [30, 30]]},
+            {"label": "drop_status", "shape_type": "rectangle", "points": [[35, 35], [60, 60]]},
+            {"label": "drop_sentinel", "shape_type": "rectangle", "points": [[65, 65], [90, 90]]},
+        ]
+    }
+    (source_root / "sample.json").write_text(json.dumps(annotation), encoding="utf-8")
+
+    result = IllegalDatasetPublishService().convert_dataset(
+        source_root,
+        output_root,
+        label_mapping={
+            "keep": "vehicle",
+            "drop_status": "",
+            "drop_sentinel": "__DISCARD__",
+        },
+        publish_config={"slice": {"enabled": False, "output_format": "jpg"}},
+    )
+
+    assert result["class_names"] == ["vehicle"]
+    assert (output_root / "classes.txt").read_text(encoding="utf-8").splitlines() == ["vehicle"]
+    data_yaml = yaml.safe_load((output_root / "data.yaml").read_text(encoding="utf-8"))
+    assert data_yaml["nc"] == 1
+    assert data_yaml["names"] == ["vehicle"]
+    label_lines = list((output_root / "labels").glob("*.txt"))[0].read_text(encoding="utf-8").splitlines()
+    assert len(label_lines) == 1
+    assert label_lines[0].startswith("0 ")
+
+
+def test_convert_dataset_parent_delete_excludes_descendant_labels(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "output"
+    source_root.mkdir()
+
+    Image.new("RGB", (100, 100), (255, 255, 255)).save(source_root / "sample.jpg")
+    annotation = {
+        "shapes": [
+            {"label": "keep", "shape_type": "rectangle", "points": [[5, 5], [30, 30]]},
+            {"label": "车辆%轿车", "shape_type": "rectangle", "points": [[35, 35], [60, 60]]},
+        ]
+    }
+    (source_root / "sample.json").write_text(json.dumps(annotation), encoding="utf-8")
+
+    result = IllegalDatasetPublishService().convert_dataset(
+        source_root,
+        output_root,
+        label_mapping={
+            "keep": "vehicle",
+            "车辆": "__DISCARD__",
+        },
+        publish_config={"conversion": {"slice": {"enabled": False, "output_format": "jpg", "label_separator": "%"}}},
+    )
+
+    assert result["class_names"] == ["vehicle"]
+    assert (output_root / "classes.txt").read_text(encoding="utf-8").splitlines() == ["vehicle"]
+    data_yaml = yaml.safe_load((output_root / "data.yaml").read_text(encoding="utf-8"))
+    assert data_yaml["names"] == ["vehicle"]
+    label_lines = list((output_root / "labels").glob("*.txt"))[0].read_text(encoding="utf-8").splitlines()
+    assert len(label_lines) == 1
+    assert label_lines[0].startswith("0 ")
 
 
 def test_publish_uses_original_source_for_mounted_json_versions(tmp_path: Path, monkeypatch) -> None:
@@ -113,7 +183,7 @@ def test_publish_uses_original_source_for_mounted_json_versions(tmp_path: Path, 
         def materialize_from_source_tree(self, *_args, name: str, **_kwargs):
             return SimpleNamespace(standard_dataset_id=30, name=name)
 
-    fake_db = SimpleNamespace(commit=lambda: None)
+    fake_db = SimpleNamespace(commit=lambda: None, refresh=lambda _row: None)
     svc = service_module.IllegalDatasetService()
     monkeypatch.setattr(svc, "get_dataset", lambda _db, _dataset_id: dataset)
     monkeypatch.setattr(svc, "_selected_version", lambda _db, _row, version_id=None: version)
@@ -172,6 +242,7 @@ def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -
         storage_root = tmp_path / "datasets"
         source_root = tmp_path / "imports" / "train"
         source_root.mkdir(parents=True)
+        (source_root / "sample.jpg").write_bytes(b"fake-source-image")
 
         def fake_link_source_tree(target_root: Path, source_root: Path, *, prefer_yolo: bool = True):
             target_root.mkdir(parents=True, exist_ok=True)
@@ -197,13 +268,17 @@ def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -
         monkeypatch.setattr(svc, "_root_path", lambda dataset: storage_root / str(dataset.storage_path))
         monkeypatch.setattr(
             service_module,
+            "illegal_manifest_path",
+            lambda dataset_id, version: storage_root / "illegal" / ".versions" / str(int(dataset_id)) / f"v{int(version)}.manifest.json",
+        )
+        monkeypatch.setattr(
+            service_module,
             "to_storage_token",
             lambda path: Path(path).resolve(strict=False).relative_to(storage_root.resolve(strict=False)).as_posix(),
         )
         monkeypatch.setattr(service_module, "resolve_storage_token", lambda token: storage_root / str(token))
         monkeypatch.setattr(service_module, "link_source_tree", fake_link_source_tree)
         monkeypatch.setattr(svc, "_refresh_version_raw_labels_cache", lambda *_args, **_kwargs: [])
-        monkeypatch.setattr(svc, "_refresh_version_statistics_cache", lambda *_args, **_kwargs: {})
 
         result = svc.import_mounted_source_tree(db, 1000004, source_root, append=True, filename="train")
 

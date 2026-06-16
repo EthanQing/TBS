@@ -141,6 +141,27 @@ def test_publish_job_different_conversion_config_gets_new_job(monkeypatch, tmp_p
     assert db.query(IllegalDatasetPublishJob).count() == 2
 
 
+def test_publish_job_mapping_delete_change_gets_new_job(monkeypatch, tmp_path: Path) -> None:
+    db = _make_db()
+    _seed_illegal_dataset(db)
+    svc = IllegalDatasetPublishJobService()
+    monkeypatch.setattr(svc, "jobs_root", lambda dataset_id: tmp_path / "jobs" / str(dataset_id))
+
+    first = svc.create_job(
+        db,
+        1000001,
+        _payload(label_mapping_overrides={"raw": {"mapped_label": "mapped", "status": "keep"}}),
+    )
+    second = svc.create_job(
+        db,
+        1000001,
+        _payload(label_mapping_overrides={"raw": {"mapped_label": "", "status": "delete"}}),
+    )
+
+    assert first.job_id != second.job_id
+    assert db.query(IllegalDatasetPublishJob).count() == 2
+
+
 def test_completed_publish_job_returns_existing_result(monkeypatch, tmp_path: Path) -> None:
     db = _make_db()
     _seed_illegal_dataset(db)
