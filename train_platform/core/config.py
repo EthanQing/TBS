@@ -55,6 +55,10 @@ def _default_dataset_import_max_workers() -> int:
     return max(1, min(8, os.cpu_count() or 1))
 
 
+def _default_illegal_dataset_publish_max_workers() -> int:
+    return max(1, min(4, os.cpu_count() or 1))
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url_override: str | None = os.getenv("DATABASE_URL")
@@ -89,6 +93,16 @@ class Settings:
     dataset_import_max_workers: int = max(
         1,
         int(os.getenv("DATASET_IMPORT_MAX_WORKERS", str(_default_dataset_import_max_workers())) or str(_default_dataset_import_max_workers())),
+    )
+    illegal_dataset_publish_max_workers: int = max(
+        1,
+        int(
+            os.getenv(
+                "ILLEGAL_DATASET_PUBLISH_MAX_WORKERS",
+                str(_default_illegal_dataset_publish_max_workers()),
+            )
+            or str(_default_illegal_dataset_publish_max_workers())
+        ),
     )
     upload_chunk_size_mb: int = max(1, int(os.getenv("UPLOAD_CHUNK_SIZE_MB", "64") or "64"))
     upload_session_ttl_hours: int = max(1, int(os.getenv("UPLOAD_SESSION_TTL_HOURS", "24") or "24"))

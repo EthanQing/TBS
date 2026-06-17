@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Sped up illegal dataset publish conversion by processing LabelMe/JSON
+  image pairs in parallel with configurable
+  `ILLEGAL_DATASET_PUBLISH_MAX_WORKERS`.
 - Added detailed dataset import task progress fields and sped up illegal
   mounted LabelMe/JSON imports with parallel JSON parsing plus batched image
   indexing.

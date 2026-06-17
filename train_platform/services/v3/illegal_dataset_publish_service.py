@@ -6,6 +6,7 @@ import math
 import os
 import random
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from numbers import Real
 from pathlib import Path
@@ -17,6 +18,7 @@ import yaml
 from PIL import Image, UnidentifiedImageError
 from rasterio.windows import Window
 
+from train_platform.core.config import settings
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
 
@@ -1033,7 +1035,7 @@ class IllegalDatasetPublishService:
         cfg["label_mapping"] = label_mapping
         return cfg
 
-    def _run_single(self, cfg: dict) -> tuple[dict[str, int], Dict[str, int]]:
+    def _run_single(self, cfg: dict) -> tuple[dict[str, int], Dict[str, int], set[str]]:
         with open_image_reader(cfg["image_path"], slice_size=int(cfg["slice_size"])) as reader:
             img_w, img_h = int(reader.width), int(reader.height)
             cfg["image_height"] = img_h
@@ -1094,7 +1096,42 @@ class IllegalDatasetPublishService:
                 ]
 
             stats = save_slices(cfg, slices, reader)
-            return stats, label_map
+            return stats, label_map, {str(bbox.label) for bbox in bboxes if str(bbox.label).strip()}
+
+    def _remap_label_files(self, output_root: Path, old_to_new_class_ids: dict[int, int]) -> None:
+        if not old_to_new_class_ids:
+            return
+        label_roots = [output_root / "labels"]
+        for split_name in ("train", "val", "test"):
+            split_dir = output_root / "labels" / split_name
+            if split_dir.exists():
+                label_roots.append(split_dir)
+
+        for label_root in label_roots:
+            if not label_root.exists() or not label_root.is_dir():
+                continue
+            for label_path in sorted(label_root.glob("*.txt")):
+                lines = label_path.read_text(encoding="utf-8").splitlines()
+                remapped: list[str] = []
+                changed = False
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    parts = stripped.split()
+                    try:
+                        old_class_id = int(float(parts[0]))
+                    except (TypeError, ValueError):
+                        remapped.append(stripped)
+                        continue
+                    new_class_id = old_to_new_class_ids.get(old_class_id)
+                    if new_class_id is None:
+                        continue
+                    if new_class_id != old_class_id:
+                        changed = True
+                    remapped.append(" ".join([str(new_class_id), *parts[1:]]))
+                if changed or len(remapped) != len([line for line in lines if line.strip()]):
+                    label_path.write_text(("\n".join(remapped) + "\n") if remapped else "", encoding="utf-8")
 
     def _write_class_files(self, output_root: Path, label_map: Dict[str, int], successful_labels: set[str], split_summary: Optional[dict]) -> list[str]:
         class_names = [
@@ -1133,6 +1170,160 @@ class IllegalDatasetPublishService:
         with open(output_root / "data.yaml", "w", encoding="utf-8") as f:
             yaml.safe_dump(yaml_payload, f, allow_unicode=True, sort_keys=False)
         return class_names
+
+    def _scan_label_map(
+        self,
+        *,
+        source_root: Path,
+        output_root: Path,
+        pairs: list[tuple[Path, Path]],
+        label_mapping: Optional[dict[str, str]],
+        slice_config: dict,
+    ) -> Dict[str, int]:
+        label_map: Dict[str, int] = {}
+        for image_path, json_path in pairs:
+            cfg = self._build_pair_cfg(
+                source_root=source_root,
+                output_root=output_root,
+                image_path=image_path,
+                json_path=json_path,
+                label_mapping=label_mapping,
+                slice_config=slice_config,
+                label_map=label_map,
+            )
+            try:
+                label_map = self._scan_annotation_labels(cfg)
+            except SKIPPABLE_CONVERSION_ERRORS as exc:
+                logger.warning(
+                    "Skipped illegal dataset publish label pre-scan sample %s / %s: %s",
+                    image_path.name,
+                    json_path.name,
+                    exc,
+                )
+                continue
+            except FATAL_CONVERSION_ERRORS:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Skipped illegal dataset publish label pre-scan sample %s / %s: %s",
+                    image_path.name,
+                    json_path.name,
+                    exc,
+                )
+                continue
+        return label_map
+
+    def _scan_annotation_labels(self, cfg: dict) -> Dict[str, int]:
+        json_path = cfg["annotation_path"]
+        label_map = cfg["label_map"]
+        label_strategy = cfg["label_strategy"]
+        label_sep = cfg["label_separator"]
+        min_prob = cfg["min_probability"]
+        skip_hidden = cfg["skip_hidden"]
+        skip_outside = cfg["skip_outside"]
+        label_strategy_norm = str(label_strategy or "").strip().lower()
+
+        raw_mapping = cfg.get("label_mapping")
+        label_mapping: Optional[Dict[str, str]] = None
+        label_mapping_norm: Optional[Dict[str, str]] = None
+        if isinstance(raw_mapping, dict) and raw_mapping:
+            label_mapping = {str(k): v for k, v in raw_mapping.items()}
+            label_mapping_norm = {}
+            for k, v in label_mapping.items():
+                nk = _normalize_label_key(k)
+                if nk in label_mapping_norm and label_mapping_norm[nk] != v:
+                    raise ValidationError(f"Conflicting label mappings for normalized key: {nk}")
+                label_mapping_norm[nk] = v
+
+        def mapping_value_is_discard(value: Any) -> bool:
+            return str(value if value is not None else "").strip() in {"", "__DISCARD__"}
+
+        def lookup_mapping_value(label: str) -> tuple[Any, bool]:
+            if label_mapping is None:
+                return None, False
+            if label in label_mapping:
+                return label_mapping.get(label), True
+            if label_mapping_norm is not None:
+                norm_key = _normalize_label_key(label)
+                if norm_key in label_mapping_norm:
+                    return label_mapping_norm.get(norm_key), True
+            return None, False
+
+        def iter_parent_labels(label: str):
+            if not label_sep:
+                return
+            seen: set[str] = set()
+            for candidate in (str(label or "").strip(), _normalize_label_key(label)):
+                parts = [part.strip() for part in str(candidate).split(label_sep) if part.strip()]
+                for index in range(1, len(parts)):
+                    parent = label_sep.join(parts[:index])
+                    if parent and parent not in seen:
+                        seen.add(parent)
+                        yield parent
+
+        def has_discarded_parent(label: str) -> bool:
+            if label_mapping is None:
+                return False
+            for parent in iter_parent_labels(label):
+                value, found = lookup_mapping_value(parent)
+                if found and mapping_value_is_discard(value):
+                    return True
+            return False
+
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            with open(json_path, "r", encoding="gbk", errors="ignore") as f:
+                data = json.load(f)
+
+        if isinstance(data, dict) and "shapes" in data:
+            shapes = data["shapes"]
+        elif isinstance(data, list):
+            shapes = data
+        else:
+            raise ValidationError(f"Unrecognized json structure: {json_path}")
+
+        auto_map: Dict[str, int] = label_map.copy() if label_map else {}
+        missing_labels: set[str] = set()
+
+        for shape in shapes:
+            if skip_hidden and shape.get("hidden", False):
+                continue
+            if skip_outside and shape.get("outside", False):
+                continue
+            if shape.get("probability", 1.0) < min_prob:
+                continue
+            pts = shape.get("points", [])
+            if not pts or len(pts) < 2:
+                continue
+
+            raw_label = str(shape.get("label", "unknown"))
+            raw_label_stripped = raw_label.strip()
+            if not raw_label_stripped:
+                continue
+            if label_mapping is not None:
+                mapped_label, matched_mapping = lookup_mapping_value(raw_label_stripped)
+                if matched_mapping and mapping_value_is_discard(mapped_label):
+                    continue
+                if has_discarded_parent(raw_label_stripped):
+                    continue
+                if matched_mapping:
+                    raw_label_stripped = str(mapped_label).strip()
+                elif label_strategy_norm == "mapping":
+                    missing_labels.add(raw_label_stripped)
+                    continue
+
+            label_name = extract_label(raw_label_stripped, label_strategy, label_sep).strip()
+            if label_name and label_name not in auto_map:
+                auto_map[label_name] = len(auto_map)
+
+        if missing_labels:
+            sample = ", ".join(list(missing_labels)[:10])
+            raise ValidationError(
+                f"Missing label mappings for {len(missing_labels)} labels in {json_path}: {sample}"
+            )
+        return auto_map
 
     def _normalize_split_config(self, split_config: Optional[dict]) -> dict[str, Any]:
         raw = split_config if isinstance(split_config, dict) else {}
@@ -1283,7 +1474,13 @@ class IllegalDatasetPublishService:
                 },
             )
 
-        global_label_map: Dict[str, int] = {}
+        global_label_map = self._scan_label_map(
+            source_root=source_root,
+            output_root=output_root,
+            pairs=pairs,
+            label_mapping=effective_mapping if effective_mapping else None,
+            slice_config=slice_config,
+        )
         processed = 0
         completed = 0
         skipped_files: List[str] = list(unmatched_files)
@@ -1310,7 +1507,7 @@ class IllegalDatasetPublishService:
                     },
                 )
 
-        for image_path, json_path in pairs:
+        def convert_pair(image_path: Path, json_path: Path) -> tuple[Path, Path, dict[str, int], set[str]]:
             cfg = self._build_pair_cfg(
                 source_root=source_root,
                 output_root=output_root,
@@ -1320,23 +1517,18 @@ class IllegalDatasetPublishService:
                 slice_config=slice_config,
                 label_map=global_label_map,
             )
-            try:
-                stats, global_label_map = self._run_single(cfg)
-            except SKIPPABLE_CONVERSION_ERRORS as exc:
-                skip_pair(image_path, json_path, exc)
-                continue
-            except FATAL_CONVERSION_ERRORS:
-                raise
-            except Exception as exc:
-                skip_pair(image_path, json_path, exc)
-                continue
+            stats, _label_map, labels = self._run_single(cfg)
+            return image_path, json_path, stats, labels
 
+        def apply_success(json_path: Path, stats: dict[str, int], labels: set[str]) -> None:
+            nonlocal processed, completed
             processed += 1
             completed += 1
             aggregate_stats["images"] += 1
             aggregate_stats["slices"] += int(stats.get("total", 0))
             aggregate_stats["labels"] += int(stats.get("total_labels", 0))
             aggregate_stats["empty_slices"] += int(stats.get("empty", 0))
+            successful_labels.update({str(label) for label in labels if str(label).strip()})
             if callable(progress_callback):
                 progress_callback(
                     "converting",
@@ -1350,11 +1542,55 @@ class IllegalDatasetPublishService:
                     },
                 )
 
-            try:
-                raw_bboxes, _ = parse_annotations({**cfg, "label_map": dict(global_label_map)})
-                successful_labels.update({str(bbox.label) for bbox in raw_bboxes if str(bbox.label).strip()})
-            except Exception:
-                pass
+        max_workers = min(max(1, int(settings.illegal_dataset_publish_max_workers or 1)), len(pairs))
+        if max_workers <= 1:
+            for image_path, json_path in pairs:
+                try:
+                    _image_path, _json_path, stats, labels = convert_pair(image_path, json_path)
+                except SKIPPABLE_CONVERSION_ERRORS as exc:
+                    skip_pair(image_path, json_path, exc)
+                    continue
+                except FATAL_CONVERSION_ERRORS:
+                    raise
+                except Exception as exc:
+                    skip_pair(image_path, json_path, exc)
+                    continue
+                apply_success(json_path, stats, labels)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="illegal-publish") as executor:
+                futures = {
+                    executor.submit(convert_pair, image_path, json_path): (image_path, json_path)
+                    for image_path, json_path in pairs
+                }
+                for future in as_completed(futures):
+                    image_path, json_path = futures[future]
+                    try:
+                        _image_path, _json_path, stats, labels = future.result()
+                    except SKIPPABLE_CONVERSION_ERRORS as exc:
+                        skip_pair(image_path, json_path, exc)
+                        continue
+                    except FATAL_CONVERSION_ERRORS:
+                        raise
+                    except Exception as exc:
+                        skip_pair(image_path, json_path, exc)
+                        continue
+                    apply_success(json_path, stats, labels)
+
+        final_label_map = {
+            label: idx
+            for idx, label in enumerate(
+                label
+                for label, _cid in sorted(global_label_map.items(), key=lambda item: item[1])
+                if label and label.strip() and label in successful_labels
+            )
+        }
+        if final_label_map:
+            old_to_new_class_ids = {
+                int(old_cid): int(final_label_map[label])
+                for label, old_cid in global_label_map.items()
+                if label in final_label_map
+            }
+            self._remap_label_files(output_root, old_to_new_class_ids)
 
         if processed == 0:
             skipped_summary = "; ".join(skipped_files[:5])
@@ -1376,7 +1612,7 @@ class IllegalDatasetPublishService:
                 },
             )
         split_summary = self.apply_split(output_root, split_config=split_config)
-        class_names = self._write_class_files(output_root, global_label_map, successful_labels, split_summary)
+        class_names = self._write_class_files(output_root, final_label_map, successful_labels, split_summary)
 
         return {
             "pairs_total": len(pairs),

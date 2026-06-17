@@ -77,6 +77,86 @@ def test_convert_dataset_skips_truncated_image_and_keeps_valid_pairs(tmp_path: P
     assert len(list((output_root / "images").glob("*.jpg"))) == 1
 
 
+def test_convert_dataset_parallel_remaps_class_ids_after_skipped_pair(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "output"
+    source_root.mkdir()
+
+    Image.new("RGB", (80, 80), (255, 255, 255)).save(source_root / "bad-first.jpg")
+    (source_root / "bad-first.json").write_text(
+        json.dumps({"shapes": [{"label": "dropped", "shape_type": "rectangle", "points": [[5, 5], [30, 30]]}]}),
+        encoding="utf-8",
+    )
+    (source_root / "bad-first.jpg").write_bytes((source_root / "bad-first.jpg").read_bytes()[:-11])
+
+    for name, label in (("good-a", "keep-a"), ("good-b", "keep-b"), ("good-c", "keep-a")):
+        Image.new("RGB", (80, 80), (255, 255, 255)).save(source_root / f"{name}.jpg")
+        (source_root / f"{name}.json").write_text(
+            json.dumps({"shapes": [{"label": label, "shape_type": "rectangle", "points": [[10, 10], [40, 40]]}]}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        "train_platform.services.v3.illegal_dataset_publish_service.settings",
+        SimpleNamespace(illegal_dataset_publish_max_workers=3),
+    )
+
+    result = IllegalDatasetPublishService().convert_dataset(
+        source_root,
+        output_root,
+        label_mapping={"dropped": "dropped", "keep-a": "keep-a", "keep-b": "keep-b"},
+        publish_config={"conversion": {"slice": {"enabled": False, "output_format": "jpg"}}},
+    )
+
+    assert result["pairs_total"] == 4
+    assert result["pairs_processed"] == 3
+    assert result["pairs_skipped"] == 1
+    assert result["class_names"] == ["keep-a", "keep-b"]
+    assert yaml.safe_load((output_root / "data.yaml").read_text(encoding="utf-8"))["names"] == ["keep-a", "keep-b"]
+    class_ids = {
+        int(line.split()[0])
+        for label_path in (output_root / "labels").glob("*.txt")
+        for line in label_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    assert class_ids == {0, 1}
+
+
+def test_convert_dataset_publish_max_workers_one_keeps_serial_outputs(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "output"
+    source_root.mkdir()
+
+    for idx in range(2):
+        Image.new("RGB", (64, 64), (255, 255, 255)).save(source_root / f"sample-{idx}.jpg")
+        (source_root / f"sample-{idx}.json").write_text(
+            json.dumps({"shapes": [{"label": "car", "shape_type": "rectangle", "points": [[5, 5], [30, 30]]}]}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        "train_platform.services.v3.illegal_dataset_publish_service.settings",
+        SimpleNamespace(illegal_dataset_publish_max_workers=1),
+    )
+
+    result = IllegalDatasetPublishService().convert_dataset(
+        source_root,
+        output_root,
+        label_mapping={"car": "vehicle"},
+        publish_config={"conversion": {"slice": {"enabled": False, "output_format": "jpg"}}},
+    )
+
+    assert result["pairs_processed"] == 2
+    assert result["class_names"] == ["vehicle"]
+    assert len(list((output_root / "images").glob("*.jpg"))) == 2
+    assert all(
+        line.startswith("0 ")
+        for label_path in (output_root / "labels").glob("*.txt")
+        for line in label_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+
+
 def test_convert_dataset_excludes_deleted_mappings_from_yolo_outputs(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     output_root = tmp_path / "output"
