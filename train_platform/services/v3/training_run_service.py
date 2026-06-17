@@ -678,6 +678,41 @@ class TrainingRunService:
         db.refresh(meta)
         return meta
 
+    def mark_project_card_reviewed(self, db: Session, run_id: str, *, source: str | None = None) -> dict:
+        run = self.get_run(db, run_id)
+        if bool(getattr(run, "hidden", False)) or run.status != TrainingRunStatus.COMPLETED:
+            raise ValidationError("Only visible completed training runs can be marked as reviewed")
+
+        meta = self.meta_repo.get_by_run_id(db, run_id)
+        if not meta:
+            meta = TrainingRunMeta(run_id=str(run_id))
+            db.add(meta)
+            db.flush()
+
+        extra = dict(meta.extra) if isinstance(meta.extra, dict) else {}
+        reviewed_at = str(extra.get("project_card_reviewed_at") or "").strip()
+        if not reviewed_at:
+            reviewed_at = _utcnow().isoformat()
+            extra["project_card_reviewed_at"] = reviewed_at
+        source_norm = str(source or "").strip()
+        if source_norm:
+            extra["project_card_review_source"] = source_norm[:64]
+        meta.extra = extra
+
+        db.commit()
+        db.refresh(meta)
+
+        try:
+            reviewed_dt = datetime.fromisoformat(reviewed_at)
+        except Exception:
+            reviewed_dt = _utcnow()
+        return {
+            "run_id": str(run.run_id),
+            "reviewed": True,
+            "reviewed_at": reviewed_dt,
+            "source": extra.get("project_card_review_source"),
+        }
+
     # --------------------
     # logs
     # --------------------

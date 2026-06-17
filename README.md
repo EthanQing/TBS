@@ -10,6 +10,7 @@ TBS Backend is a training platform backend built with **FastAPI**, **SQLAlchemy*
 - Cancellable illegal dataset publish jobs for long-running LabelMe/JSON conversion
 - Project and model version management
 - Training run orchestration
+- Project card training alerts for running and completed-unreviewed runs
 - Pluggable training framework architecture
 - Deployment and inference workflows
 - Post-training model evaluation on labeled YOLO detection datasets

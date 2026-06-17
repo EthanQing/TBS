@@ -15,6 +15,7 @@ from train_platform.schemas.v3.projects import (
     ProjectCreate,
     ProjectModelSizeOut,
     ProjectOut,
+    ProjectTrainingAlertOut,
     ProjectUpdate,
 )
 from train_platform.services.v3.project_service import ProjectService
@@ -22,6 +23,37 @@ from train_platform.utils.exceptions import ValidationError
 
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+def _parse_project_ids(project_ids: str | None) -> list[int]:
+    ids: list[int] = []
+    if not project_ids:
+        return ids
+    seen: set[int] = set()
+    for part in str(project_ids).split(","):
+        s = part.strip()
+        if not s:
+            continue
+        try:
+            pid = int(s)
+        except Exception:
+            continue
+        if pid <= 0 or pid in seen:
+            continue
+        seen.add(pid)
+        ids.append(pid)
+    return ids
+
+
+@router.get("/training-alerts", response_model=list[ProjectTrainingAlertOut])
+def list_project_training_alerts(
+    project_ids: str | None = Query(
+        None,
+        description="Comma separated project_id list. If omitted, returns alerts for all projects.",
+    ),
+    db: Session = Depends(get_db),
+):
+    return ProjectService().list_training_alerts(db, _parse_project_ids(project_ids) if project_ids else None)
 
 
 @router.get("/model-sizes", response_model=list[ProjectModelSizeOut])

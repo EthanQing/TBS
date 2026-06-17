@@ -38,6 +38,8 @@ from train_platform.schemas.v3.training_runs import (
     TrainingRunMetaOut,
     TrainingRunMetaUpdate,
     TrainingRunOut,
+    TrainingRunReviewOut,
+    TrainingRunReviewRequest,
     TrainingRunUpdate,
 )
 from train_platform.services.v3.training_run_service import FrameworkCompareConflict, TrainingRunService
@@ -238,6 +240,15 @@ def resume_training_run(run_id: str, db: Session = Depends(get_db)):
 @router.post("/{run_id}/cancel", response_model=TrainingRunOut)
 def cancel_training_run(run_id: str, reason: str | None = Body(None), db: Session = Depends(get_db)):
     return TrainingRunService().request_cancel(db, run_id, reason=reason)
+
+
+@router.post("/{run_id}/review", response_model=TrainingRunReviewOut)
+def review_training_run(
+    run_id: str,
+    payload: TrainingRunReviewRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    return TrainingRunService().mark_project_card_reviewed(db, run_id, source=payload.source if payload else None)
 
 
 @router.delete("/{run_id}", response_model=TrainingRunOut)

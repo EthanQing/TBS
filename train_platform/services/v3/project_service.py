@@ -9,11 +9,13 @@ from sqlalchemy.orm import Session
 from train_platform.core.config import settings
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.deployment import Deployment
+from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.inference import InferenceRun
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.project import Project
 from train_platform.models.v3.standard_dataset import StandardDataset
 from train_platform.models.v3.training_run import TrainingRun
+from train_platform.models.v3.training_run_meta import TrainingRunMeta
 from train_platform.repositories.v3.project_repo import ProjectRepository
 from train_platform.repositories.v3.standard_dataset_repo import StandardDatasetRepository
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
@@ -27,6 +29,35 @@ def _safe_remove_dir(path: Path) -> None:
         pass
 
 
+def _reviewed_at_from_extra(extra: dict | None) -> str | None:
+    data = extra if isinstance(extra, dict) else {}
+    value = data.get("project_card_reviewed_at")
+    return str(value).strip() if value else None
+
+
+def _alert_run_payload(run: TrainingRun | None) -> dict | None:
+    if not run:
+        return None
+    return {
+        "run_id": str(run.run_id),
+        "name": run.name,
+        "status": str(getattr(run.status, "value", run.status) or ""),
+        "progress": int(getattr(run, "progress", 0) or 0),
+        "current_epoch": int(getattr(run, "current_epoch", 0) or 0),
+        "total_epochs": getattr(run, "total_epochs", None),
+        "updated_at": getattr(run, "updated_at", None),
+        "finished_at": getattr(run, "finished_at", None),
+    }
+
+
+def _is_newer(sort_key: object, current_key: object) -> bool:
+    if current_key is None:
+        return True
+    if sort_key is None:
+        return False
+    return sort_key > current_key
+
+
 class ProjectService:
     def __init__(self) -> None:
         self.projects = ProjectRepository()
@@ -37,6 +68,73 @@ class ProjectService:
         if standard_dataset_id is not None:
             q = q.filter(Project.standard_dataset_id == int(standard_dataset_id))
         return q.order_by(Project.updated_at.desc()).offset(skip).limit(limit).all()
+
+    def list_training_alerts(self, db: Session, project_ids: list[int] | None = None) -> list[dict]:
+        ids: list[int] = []
+        if project_ids:
+            seen: set[int] = set()
+            for raw in project_ids:
+                try:
+                    pid = int(raw)
+                except Exception:
+                    continue
+                if pid <= 0 or pid in seen:
+                    continue
+                seen.add(pid)
+                ids.append(pid)
+        else:
+            ids = [int(x[0]) for x in db.query(Project.project_id).order_by(Project.project_id.asc()).all()]
+
+        if not ids:
+            return []
+
+        rows = (
+            db.query(TrainingRun, TrainingRunMeta)
+            .outerjoin(TrainingRunMeta, TrainingRunMeta.run_id == TrainingRun.run_id)
+            .filter(TrainingRun.project_id.in_(ids))
+            .filter(TrainingRun.hidden == False)  # noqa: E712
+            .filter(TrainingRun.status.in_([TrainingRunStatus.RUNNING, TrainingRunStatus.COMPLETED]))
+            .all()
+        )
+
+        by_project = {
+            int(pid): {
+                "project_id": int(pid),
+                "running_count": 0,
+                "latest_running_run": None,
+                "unreviewed_completed_count": 0,
+                "latest_unreviewed_completed_run": None,
+            }
+            for pid in ids
+        }
+        latest_running_sort: dict[int, object] = {}
+        latest_completed_sort: dict[int, object] = {}
+
+        for run, meta in rows:
+            pid = int(getattr(run, "project_id", 0) or 0)
+            bucket = by_project.get(pid)
+            if not bucket:
+                continue
+
+            if run.status == TrainingRunStatus.RUNNING:
+                bucket["running_count"] = int(bucket["running_count"]) + 1
+                sort_key = getattr(run, "updated_at", None) or getattr(run, "started_at", None) or getattr(run, "created_at", None)
+                if bucket["latest_running_run"] is None or _is_newer(sort_key, latest_running_sort.get(pid)):
+                    latest_running_sort[pid] = sort_key
+                    bucket["latest_running_run"] = _alert_run_payload(run)
+                continue
+
+            if run.status == TrainingRunStatus.COMPLETED:
+                extra = getattr(meta, "extra", None) if meta is not None else None
+                if _reviewed_at_from_extra(extra):
+                    continue
+                bucket["unreviewed_completed_count"] = int(bucket["unreviewed_completed_count"]) + 1
+                sort_key = getattr(run, "finished_at", None) or getattr(run, "updated_at", None) or getattr(run, "created_at", None)
+                if bucket["latest_unreviewed_completed_run"] is None or _is_newer(sort_key, latest_completed_sort.get(pid)):
+                    latest_completed_sort[pid] = sort_key
+                    bucket["latest_unreviewed_completed_run"] = _alert_run_payload(run)
+
+        return [by_project[int(pid)] for pid in ids]
 
     def get_project(self, db: Session, project_id: int) -> Project:
         row = self.projects.get(db, int(project_id))

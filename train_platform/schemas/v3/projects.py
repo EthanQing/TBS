@@ -47,6 +47,25 @@ class ProjectModelSizeOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ProjectTrainingAlertRunOut(BaseModel):
+    run_id: str
+    name: Optional[str] = None
+    status: Optional[str] = None
+    progress: int = 0
+    current_epoch: int = 0
+    total_epochs: Optional[int] = None
+    updated_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class ProjectTrainingAlertOut(BaseModel):
+    project_id: int
+    running_count: int = 0
+    latest_running_run: Optional[ProjectTrainingAlertRunOut] = None
+    unreviewed_completed_count: int = 0
+    latest_unreviewed_completed_run: Optional[ProjectTrainingAlertRunOut] = None
+
+
 class ProjectCompareBaselineRunOut(BaseModel):
     run_id: str
     name: Optional[str] = None

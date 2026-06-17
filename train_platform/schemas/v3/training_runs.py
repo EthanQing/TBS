@@ -125,6 +125,17 @@ class TrainingRunMetaUpdate(BaseModel):
     extra: Optional[Dict[str, Any]] = None
 
 
+class TrainingRunReviewRequest(BaseModel):
+    source: Optional[str] = Field(None, max_length=64)
+
+
+class TrainingRunReviewOut(BaseModel):
+    run_id: str
+    reviewed: bool = True
+    reviewed_at: datetime
+    source: Optional[str] = None
+
+
 class TrainingRunOut(BaseModel):
     run_id: str
     project_id: int
