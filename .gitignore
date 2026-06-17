@@ -30,6 +30,7 @@ training_runs/
 temp/
 runs/
 PaddleDetection/
+imports/
 *.log
 *.json
 .tmp_*/
