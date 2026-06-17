@@ -330,7 +330,7 @@ class DatasetImportService:
                 rel = child.resolve(strict=False).relative_to(root).as_posix()
             except Exception:
                 continue
-            counts = self._quick_counts(child, max_items=800)
+            counts = self._quick_counts(child, max_items=1_000_000)
             is_candidate = counts["image_count"] > 0 and (counts["json_count"] > 0 or counts["label_count"] > 0 or counts["has_data_yaml"])
             entries.append(
                 DatasetImportEntryOut(
