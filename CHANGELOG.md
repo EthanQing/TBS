@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Mounted host `./TBS/imports` to backend container `/app/imports` in the
+  compose files so the default offline import directory is visible in Docker.
 - Made illegal dataset mounted LabelMe/JSON imports lightweight by recording
   paired source files and raw labels in the version manifest, deferring image
   size reads and YOLO label generation until publish conversion.

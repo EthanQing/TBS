@@ -222,7 +222,7 @@ For offline deployments, place large ZIP files or extracted dataset directories 
 - `UPLOAD_CHUNK_SIZE_MB` defaults to `64`.
 - `UPLOAD_SESSION_TTL_HOURS` defaults to `24`.
 - Mount `BASE_DATASETS_DIR`, `BASE_UPLOAD_SESSIONS_DIR`, `BASE_DATASET_STAGING_DIR`, and `BASE_IMPORTS_DIR` on large-capacity storage.
-- Directory import and mounted-link import only see paths visible to the backend process or container. Mount network shares into the host/container first, then expose them through `BASE_IMPORTS_DIR` or `DATASET_IMPORT_ROOTS`.
+- Directory import and mounted-link import only see paths visible to the backend process or container. The outer Docker Compose files mount host `./TBS/imports` to container `/app/imports`, the default `BASE_IMPORTS_DIR`. Mount network shares into the host/container first, then expose them through `BASE_IMPORTS_DIR` or `DATASET_IMPORT_ROOTS`.
 - Configure Nginx upload routes with enough `proxy_read_timeout` / `proxy_send_timeout`, and keep request-body temp storage off the container overlay filesystem.
 
 ### Inference restrictions
