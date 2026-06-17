@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Improved dataset management list performance by adding a lightweight
+  `include_statistics=false` mode for illegal dataset lists and supporting
+  front-end tab caching with lazy per-dataset statistics loading.
 - Added cancellation for illegal dataset publish jobs so stuck conversions can
   be stopped after backend restarts.
 - Sped up illegal dataset publish conversion by processing LabelMe/JSON

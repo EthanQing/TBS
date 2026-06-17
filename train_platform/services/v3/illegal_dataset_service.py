@@ -458,11 +458,20 @@ class IllegalDatasetService:
             "used_class_count": 0,
         }
 
-    def _dataset_with_statistics(self, db: Session, dataset: IllegalDataset) -> dict[str, Any]:
-        try:
-            statistics = self._build_dataset_statistics(db, dataset)
-        except (NotFoundError, ValidationError):
-            statistics = self._empty_dataset_statistics()
+    def _dataset_with_statistics(
+        self,
+        db: Session,
+        dataset: IllegalDataset,
+        *,
+        include_statistics: bool = True,
+    ) -> dict[str, Any]:
+        if include_statistics:
+            try:
+                statistics = self._build_dataset_statistics(db, dataset)
+            except (NotFoundError, ValidationError):
+                statistics = self._empty_dataset_statistics()
+        else:
+            statistics = None
         preview_image_url = None
         return {
             "illegal_dataset_id": int(dataset.illegal_dataset_id),
@@ -478,12 +487,23 @@ class IllegalDatasetService:
             "preview_image_url": preview_image_url,
         }
 
-    def list_datasets(self, db: Session, *, skip: int = 0, limit: int = 100, format: str | None = None) -> list[dict[str, Any]]:
+    def list_datasets(
+        self,
+        db: Session,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+        format: str | None = None,
+        include_statistics: bool = True,
+    ) -> list[dict[str, Any]]:
         q = db.query(IllegalDataset)
         if format:
             q = q.filter(IllegalDataset.format == str(format))
         rows = q.order_by(IllegalDataset.updated_at.desc()).offset(skip).limit(limit).all()
-        return [self._dataset_with_statistics(db, row) for row in rows]
+        return [
+            self._dataset_with_statistics(db, row, include_statistics=bool(include_statistics))
+            for row in rows
+        ]
 
     def create_dataset(self, db: Session, *, obj: dict) -> IllegalDataset:
         name = str(obj.get("name") or "").strip()
