@@ -14,11 +14,15 @@ from train_platform.models.v3.illegal_dataset import (
     IllegalDataset,
     IllegalDatasetEvent,
     IllegalDatasetImage,
+    IllegalDatasetLabelMapping,
     IllegalDatasetVersion,
 )
 from train_platform.services.v3 import illegal_dataset_service as service_module
+from train_platform.services.v3 import illegal_dataset_cas as cas_module
 from train_platform.services.v3.dataset_import_service import DatasetImportService
+from train_platform.services.v3.illegal_dataset_cas import load_manifest_token
 from train_platform.services.v3.illegal_dataset_publish_service import IllegalDatasetPublishService
+from train_platform.services.v3.mounted_dataset_service import build_illegal_mounted_manifest
 
 
 def test_collect_pairs_ignores_mounted_manifest(tmp_path: Path) -> None:
@@ -284,6 +288,33 @@ def test_publish_uses_original_source_for_mounted_json_versions(tmp_path: Path, 
     assert result["standard_dataset_id"] == 30
 
 
+def test_build_illegal_mounted_manifest_is_lightweight_for_json(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "imports" / "illegal-json"
+    source_root.mkdir(parents=True)
+    (source_root / "sample.jpg").write_bytes(b"not-a-real-image")
+    (source_root / "sample.json").write_text(
+        json.dumps({"shapes": [{"label": "person"}, {"label": "helmet"}]}),
+        encoding="utf-8",
+    )
+
+    def fail_image_size(_path):
+        raise AssertionError("mounted illegal import must not read image dimensions")
+
+    monkeypatch.setattr("train_platform.services.v3.mounted_dataset_service.image_size", fail_image_size)
+
+    manifest = build_illegal_mounted_manifest(source_root)
+
+    assert manifest["format"] == "json"
+    assert manifest["image_count"] == 1
+    assert manifest["json_count"] == 1
+    assert manifest["raw_labels"] == ["helmet", "person"]
+    assert manifest["object_count"] == 2
+    assert "images/source/sample.jpg" in manifest["files"]
+    assert "sample.json" in manifest["files"]
+    assert not (source_root / "labels").exists()
+    assert not (source_root / "data.yaml").exists()
+
+
 def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:")
     for table in (
@@ -321,19 +352,22 @@ def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -
         source_root.mkdir(parents=True)
         (source_root / "sample.jpg").write_bytes(b"fake-source-image")
 
-        def fake_link_source_tree(target_root: Path, source_root: Path, *, prefer_yolo: bool = True):
-            target_root.mkdir(parents=True, exist_ok=True)
-            (target_root / "images").mkdir(parents=True, exist_ok=True)
-            (target_root / "images" / "sample.jpg").write_bytes(b"fake")
+        def fake_build_illegal_mounted_manifest(source_root: Path, *, prefer_yolo: bool = True):
             manifest = {
                 "source_type": "mounted_dir_link",
                 "format": "yolo",
                 "source_root": str(source_root),
-                "link_type": "copy",
                 "image_count": 1,
                 "image_paths": ["images/sample.jpg"],
+                "files": {
+                    "images/sample.jpg": {
+                        "storage": "mounted",
+                        "source_path": str(source_root / "sample.jpg"),
+                        "size": 1,
+                        "mtime": 1.0,
+                    }
+                },
             }
-            (target_root / ".mounted_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             return manifest
 
         svc = service_module.IllegalDatasetService()
@@ -354,7 +388,8 @@ def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -
             lambda path: Path(path).resolve(strict=False).relative_to(storage_root.resolve(strict=False)).as_posix(),
         )
         monkeypatch.setattr(service_module, "resolve_storage_token", lambda token: storage_root / str(token))
-        monkeypatch.setattr(service_module, "link_source_tree", fake_link_source_tree)
+        monkeypatch.setattr(cas_module, "resolve_storage_token", lambda token: storage_root / str(token))
+        monkeypatch.setattr(service_module, "build_illegal_mounted_manifest", fake_build_illegal_mounted_manifest)
         monkeypatch.setattr(svc, "_refresh_version_raw_labels_cache", lambda *_args, **_kwargs: [])
 
         result = svc.import_mounted_source_tree(db, 1000004, source_root, append=True, filename="train")
@@ -368,5 +403,146 @@ def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -
         assert [int(item.version) for item in versions] == [1, 2]
         assert int(result.active_version_id) == int(versions[-1].version_id)
         assert versions[-1].parent_version_id == int(first_version.version_id)
+    finally:
+        db.close()
+
+
+def test_mounted_json_import_records_manifest_labels_and_images(tmp_path: Path, monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    for table in (
+        IllegalDataset.__table__,
+        IllegalDatasetVersion.__table__,
+        IllegalDatasetEvent.__table__,
+        IllegalDatasetImage.__table__,
+        IllegalDatasetLabelMapping.__table__,
+    ):
+        table.create(engine, checkfirst=True)
+    SessionLocal = sessionmaker(bind=engine)
+    db = SessionLocal()
+    try:
+        dataset = IllegalDataset(
+            illegal_dataset_id=1000005,
+            name="mounted json",
+            dataset_type=DatasetType.DETECTION,
+            format="yolo",
+            storage_path="illegal/1000005",
+        )
+        db.add(dataset)
+        db.commit()
+
+        storage_root = tmp_path / "datasets"
+        source_root = tmp_path / "imports" / "train"
+        source_root.mkdir(parents=True)
+        (source_root / "sample.jpg").write_bytes(b"fake-image")
+        (source_root / "sample.json").write_text(
+            json.dumps({"shapes": [{"label": "person"}, {"label": "helmet"}]}),
+            encoding="utf-8",
+        )
+        progress: list[tuple[int, str]] = []
+
+        svc = service_module.IllegalDatasetService()
+        monkeypatch.setattr(svc, "_root_path", lambda dataset: storage_root / str(dataset.storage_path))
+        monkeypatch.setattr(
+            service_module,
+            "illegal_manifest_path",
+            lambda dataset_id, version: storage_root / "illegal" / ".versions" / str(int(dataset_id)) / f"v{int(version)}.manifest.json",
+        )
+        monkeypatch.setattr(
+            service_module,
+            "to_storage_token",
+            lambda path: Path(path).resolve(strict=False).relative_to(storage_root.resolve(strict=False)).as_posix(),
+        )
+        monkeypatch.setattr(service_module, "resolve_storage_token", lambda token: storage_root / str(token))
+        monkeypatch.setattr(cas_module, "resolve_storage_token", lambda token: storage_root / str(token))
+
+        result = svc.import_mounted_source_tree(
+            db,
+            1000005,
+            source_root,
+            progress_callback=lambda value, stage: progress.append((value, stage)),
+        )
+
+        version = db.query(IllegalDatasetVersion).filter(IllegalDatasetVersion.version_id == result.active_version_id).one()
+        manifest = load_manifest_token(str(version.manifest_path))
+        assert manifest["format"] == "json"
+        assert manifest["raw_labels"] == ["helmet", "person"]
+        assert manifest["stats"]["image_count"] == 1
+        assert manifest["stats"]["object_count"] == 2
+        assert db.query(IllegalDatasetImage).filter(IllegalDatasetImage.version_id == version.version_id).count() == 1
+        assert not (storage_root / "illegal" / "1000005" / "labels").exists()
+        assert not (storage_root / "illegal" / "1000005" / "data.yaml").exists()
+        assert "indexing" in [stage for _value, stage in progress]
+        assert svc.get_raw_labels(db, 1000005) == ["helmet", "person"]
+    finally:
+        db.close()
+
+
+def test_activate_mounted_lightweight_version_does_not_materialize_files(tmp_path: Path, monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    for table in (
+        IllegalDataset.__table__,
+        IllegalDatasetVersion.__table__,
+        IllegalDatasetEvent.__table__,
+        IllegalDatasetImage.__table__,
+        IllegalDatasetLabelMapping.__table__,
+    ):
+        table.create(engine, checkfirst=True)
+    SessionLocal = sessionmaker(bind=engine)
+    db = SessionLocal()
+    try:
+        dataset = IllegalDataset(
+            illegal_dataset_id=1000006,
+            name="activate mounted",
+            dataset_type=DatasetType.DETECTION,
+            format="yolo",
+            storage_path="illegal/1000006",
+        )
+        db.add(dataset)
+        db.flush()
+
+        storage_root = tmp_path / "datasets"
+        source_root = tmp_path / "imports" / "train"
+        source_root.mkdir(parents=True)
+        image_path = source_root / "sample.jpg"
+        image_path.write_bytes(b"fake-image")
+        manifest_path = storage_root / "illegal" / ".versions" / "1000006" / "v1.manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "files": {
+                        "images/source/sample.jpg": {
+                            "storage": "mounted",
+                            "source_path": str(image_path),
+                            "size": 10,
+                            "mtime": 1.0,
+                        }
+                    },
+                    "stats": {"image_count": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
+        version = IllegalDatasetVersion(
+            illegal_dataset_id=1000006,
+            version=1,
+            status=DatasetVersionStatus.FINALIZED,
+            manifest_path="illegal/.versions/1000006/v1.manifest.json",
+            meta={"source_type": "mounted_dir_link", "lightweight_import": True},
+        )
+        db.add(version)
+        db.commit()
+
+        svc = service_module.IllegalDatasetService()
+        monkeypatch.setattr(svc, "_root_path", lambda dataset: storage_root / str(dataset.storage_path))
+        monkeypatch.setattr(service_module, "resolve_storage_token", lambda token: storage_root / str(token))
+        monkeypatch.setattr(cas_module, "resolve_storage_token", lambda token: storage_root / str(token))
+
+        svc.activate_version(db, 1000006, int(version.version_id))
+
+        active_root = storage_root / "illegal" / "1000006"
+        assert active_root.exists()
+        assert not (active_root / "images" / "source" / "sample.jpg").exists()
     finally:
         db.close()

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Made illegal dataset mounted LabelMe/JSON imports lightweight by recording
+  paired source files and raw labels in the version manifest, deferring image
+  size reads and YOLO label generation until publish conversion.
 - Fixed illegal dataset publish regressions so numeric `version: 1.0`
   LabelMe/JSON annotations use the same bottom-left-origin conversion as
   `version: 1`, and saved parent-label deletes remain part of publish job

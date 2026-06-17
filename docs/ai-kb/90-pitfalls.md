@@ -58,7 +58,7 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 
 ## 违规数据集版本必须有 manifest
 
-详情统计和发布都依赖 `illegal_dataset_versions.manifest_path`。挂载导入也必须生成 manifest，图片条目可以引用挂载源文件。违规数据集已取消文件列表、原图打开、图片标注查看、样本预览和缩略图生成，不要为了恢复浏览能力而恢复 `snapshot_path`、无 manifest 历史版本目录扫描或逐文件 exists 检查，否则 200-300G 或大量小文件数据集会重新出现每次进详情等待十几秒的问题。
+详情统计和发布都依赖 `illegal_dataset_versions.manifest_path`。挂载导入也必须生成 manifest，图片和 JSON 条目可以引用挂载源文件；LabelMe/JSON 挂载导入应保持轻量，只配对文件、解析原始标签并记录统计，不要在导入阶段读图片尺寸或生成 YOLO label/data.yaml。违规数据集已取消文件列表、原图打开、图片标注查看、样本预览和缩略图生成，不要为了恢复浏览能力而恢复 `snapshot_path`、无 manifest 历史版本目录扫描或逐文件 exists 检查，否则 200-300G 或大量小文件数据集会重新出现每次进详情等待十几秒的问题。
 
 ## 违规数据集列表应容忍坏版本
 
@@ -74,7 +74,7 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 
 ## 挂载导入的内部清单不是业务标注
 
-通过文件挂载导入的 LabelMe/JSON 违规数据集会生成 `.mounted_manifest.json`，它只记录原始挂载路径、链接方式和图片列表。发布标准数据集或排查 `No image/json pairs found` 时不要把它当标注 JSON；发布逻辑应回到版本 `meta.source_root` 指向的原始挂载目录做图片/JSON 配对和标签映射。若原始挂载目录已移走或不在允许导入根下，应先恢复挂载路径或重新导入。
+通过文件挂载导入的 LabelMe/JSON 违规数据集会生成轻量 manifest，记录原始挂载路径、图片/JSON 配对、源文件条目和原始标签。它不是 YOLO 训练目录，不应包含导入阶段新生成的 `labels/*.txt` 或 `data.yaml`。发布标准数据集或排查 `No image/json pairs found` 时不要把内部清单当标注 JSON；发布逻辑应回到版本 `meta.source_root` 指向的原始挂载目录做图片/JSON 配对和标签映射。若原始挂载目录已移走或不在允许导入根下，应先恢复挂载路径或重新导入。
 
 ## 违规数据集标签映射要按规范化 key 去重
 

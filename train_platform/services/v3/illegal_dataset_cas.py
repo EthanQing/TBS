@@ -590,7 +590,9 @@ def build_manifest_stats(
     total_size = sum(int((entry or {}).get("size") or (entry or {}).get("size_bytes") or 0) for entry in files.values())
     image_count = len(image_rel_paths_from_manifest(manifest))
     target_count, used_class_ids = scan_yolo_annotation_summary_from_manifest(manifest)
-    declared_class_count = len(read_class_names_from_manifest(manifest))
+    raw_labels = manifest.get("raw_labels") if isinstance(manifest, Mapping) else None
+    raw_label_count = len({str(label).strip() for label in raw_labels if str(label).strip()}) if isinstance(raw_labels, list) else 0
+    declared_class_count = len(read_class_names_from_manifest(manifest)) or raw_label_count
     class_count = declared_class_count if declared_class_count > 0 else len(used_class_ids)
     parent_files = parent_files or {}
     unchanged_files = sum(

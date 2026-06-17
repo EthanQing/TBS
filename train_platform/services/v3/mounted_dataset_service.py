@@ -61,6 +61,39 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _mounted_entry(path: Path) -> dict[str, Any]:
+    src = Path(path).resolve(strict=False)
+    if not src.exists() or not src.is_file():
+        raise NotFoundError(f"Mounted source file not found: {src}")
+    try:
+        st = src.stat()
+    except Exception as exc:
+        raise ValidationError(f"Cannot stat mounted source file: {src}") from exc
+    return {
+        "storage": "mounted",
+        "source_path": str(src),
+        "size": int(st.st_size),
+        "mtime": float(st.st_mtime),
+    }
+
+
+def _read_json_shapes(path: Path) -> tuple[list[Any], list[str]]:
+    try:
+        with Path(path).open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        try:
+            with Path(path).open("r", encoding="gbk", errors="ignore") as f:
+                data = json.load(f)
+        except Exception as exc:
+            return [], [f"{Path(path).name}: {exc}"]
+    if isinstance(data, dict) and isinstance(data.get("shapes"), list):
+        return data["shapes"], []
+    if isinstance(data, list):
+        return data, []
+    return [], []
+
+
 def _remove_path(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -204,6 +237,87 @@ def collect_image_json_pairs(source_root: Path) -> tuple[list[tuple[Path, Path]]
     if len(json_by_key) > len(keys):
         warnings.append(f"Unmatched json: {len(json_by_key) - len(keys)}")
     return [(image_by_key[key], json_by_key[key]) for key in keys], warnings
+
+
+def build_illegal_mounted_manifest(source_root: Path, *, prefer_yolo: bool = True) -> dict[str, Any]:
+    """Build a lightweight illegal-dataset manifest without converting labels."""
+    source_root = Path(source_root).resolve(strict=False)
+    if not source_root.exists() or not source_root.is_dir():
+        raise NotFoundError("Mounted source directory not found")
+
+    has_yolo = (source_root / "labels").exists() or any((source_root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml"))
+    if prefer_yolo and has_yolo:
+        files: dict[str, dict[str, Any]] = {}
+        image_paths: list[str] = []
+        label_count = 0
+        for path in sorted(_iter_regular_files(source_root), key=lambda p: p.relative_to(source_root).as_posix()):
+            rel = path.relative_to(source_root).as_posix()
+            ext = path.suffix.lower()
+            lower_name = path.name.lower()
+            if ext in IMAGE_EXTS:
+                image_paths.append(rel)
+            if ext == ".txt" and lower_name not in {"classes.txt", "train.txt", "val.txt", "test.txt"}:
+                label_count += 1
+            files[rel] = _mounted_entry(path)
+        return {
+            "schema_version": 1,
+            "source_type": "mounted_dir_link",
+            "format": "yolo",
+            "source_root": str(source_root),
+            "created_at": _utcnow_iso(),
+            "image_count": len(image_paths),
+            "image_paths": sorted(image_paths),
+            "label_count": label_count,
+            "files": files,
+            "warnings": [],
+        }
+
+    source_image_root, image_rel_prefix = choose_image_link(source_root)
+    pairs, warnings = collect_image_json_pairs(source_root)
+    if not pairs:
+        raise ValidationError("No image/json pairs found in mounted directory")
+
+    files: dict[str, dict[str, Any]] = {}
+    image_rels: list[str] = []
+    raw_labels: set[str] = set()
+    object_count = 0
+    for image_path, json_path in pairs:
+        try:
+            image_rel = image_rel_for_source(source_root, source_image_root, image_path, image_rel_prefix)
+        except Exception:
+            warnings.append(f"{image_path.name}: image is outside linked image root")
+            continue
+        json_rel = json_path.relative_to(source_root).as_posix()
+        files[image_rel] = _mounted_entry(image_path)
+        files[json_rel] = _mounted_entry(json_path)
+        image_rels.append(image_rel)
+        shapes, shape_warnings = _read_json_shapes(json_path)
+        warnings.extend(shape_warnings)
+        for shape in shapes:
+            if not isinstance(shape, dict):
+                continue
+            label = str(shape.get("label") or "").strip()
+            if label:
+                raw_labels.add(label)
+                object_count += 1
+    if not image_rels:
+        raise ValidationError("No valid image/json pairs imported")
+    return {
+        "schema_version": 1,
+        "source_type": "mounted_dir_link",
+        "format": "json",
+        "source_root": str(source_root),
+        "source_image_root": str(source_image_root),
+        "image_rel_prefix": image_rel_prefix,
+        "created_at": _utcnow_iso(),
+        "image_count": len(image_rels),
+        "image_paths": sorted(image_rels),
+        "json_count": len(pairs),
+        "object_count": object_count,
+        "raw_labels": sorted(raw_labels),
+        "files": files,
+        "warnings": warnings[:50],
+    }
 
 
 def choose_image_link(source_root: Path) -> tuple[Path, str]:

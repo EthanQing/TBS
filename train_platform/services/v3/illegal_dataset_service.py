@@ -40,15 +40,16 @@ from train_platform.services.v3.illegal_dataset_cas import (
     manifest_files,
     manifest_stats_to_dataset_statistics,
     materialize_manifest_to_dir,
-    mounted_file_entry,
+    normalize_manifest_file_entry,
     read_class_names_from_manifest,
     remove_tree,
     replace_dir_from_manifest,
+    safe_manifest_rel,
     scan_tree_to_cas_files,
     write_manifest,
 )
 from train_platform.services.v3.illegal_dataset_publish_service import IllegalDatasetPublishService
-from train_platform.services.v3.mounted_dataset_service import link_source_tree
+from train_platform.services.v3.mounted_dataset_service import build_illegal_mounted_manifest
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -205,8 +206,15 @@ class IllegalDatasetService:
     ) -> list[str]:
         labels: set[str] = set()
         if manifest is not None:
+            raw_labels = manifest.get("raw_labels") if isinstance(manifest, dict) else None
+            if isinstance(raw_labels, list):
+                labels.update(str(label).strip() for label in raw_labels if str(label).strip())
+                json_labels_loaded = True
+            else:
+                json_labels_loaded = False
             labels.update(str(label).strip() for label in read_class_names_from_manifest(manifest) if str(label).strip())
-            labels.update(str(label).strip() for label in extract_json_labels_from_manifest(manifest) if str(label).strip())
+            if not json_labels_loaded:
+                labels.update(str(label).strip() for label in extract_json_labels_from_manifest(manifest) if str(label).strip())
         payload = {"labels": sorted(label for label in labels if label)}
         write_cached_json_file(self._version_raw_labels_cache_path(dataset, version), payload)
         return list(payload["labels"])
@@ -602,43 +610,59 @@ class IllegalDatasetService:
         created_by: str | None = None,
         append: bool = False,
         filename: str | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> IllegalDataset:
+        def _progress(progress: int, stage: str) -> None:
+            if progress_callback:
+                progress_callback(progress, stage)
+
         row = self.get_dataset(db, illegal_dataset_id)
         with self._dataset_lock(int(row.illegal_dataset_id)):
+            _progress(60, "linking")
             row = self._lock_dataset_for_version_create(db, row)
             latest = self.version_repo.get_latest(db, int(row.illegal_dataset_id))
             version_no = self._next_version_no(db, row)
             parent_version_id = int(latest.version_id) if latest and append else None
-            version_root = self._version_root(int(row.illegal_dataset_id), version_no)
             active_root = self._root_path(row)
-            try:
-                remove_tree(version_root)
-            except Exception:
-                pass
-            version_root.mkdir(parents=True, exist_ok=True)
-            mounted = link_source_tree(version_root, Path(source_root), prefer_yolo=True)
-            files = scan_tree_to_cas_files(version_root)
-            source_image_root = Path(str(mounted.get("source_image_root") or source_root)).resolve(strict=False)
-            image_prefix = str(mounted.get("image_rel_prefix") or "images").strip().replace("\\", "/").strip("/")
-            image_rels = [
-                str(item).strip().replace("\\", "/").strip("/")
-                for item in (mounted.get("image_paths") or [])
-                if str(item).strip()
-            ]
-            for rel in image_rels:
-                image_suffix = rel
-                if image_prefix and rel == image_prefix:
-                    image_suffix = ""
-                elif image_prefix and rel.startswith(f"{image_prefix}/"):
-                    image_suffix = rel[len(image_prefix) + 1:]
-                source_path = source_image_root / image_suffix
-                files[rel] = mounted_file_entry(source_path)
+            mounted = build_illegal_mounted_manifest(Path(source_root), prefer_yolo=True)
+            _progress(75, "validating")
+            files = {
+                safe_manifest_rel(rel): normalize_manifest_file_entry(entry)
+                for rel, entry in (mounted.get("files") or {}).items()
+                if isinstance(entry, dict)
+            }
             manifest = build_manifest(
                 dataset_id=int(row.illegal_dataset_id),
                 version=version_no,
                 parent_version_id=parent_version_id,
                 files=files,
             )
+            raw_labels = [str(label).strip() for label in (mounted.get("raw_labels") or []) if str(label).strip()]
+            image_count = int(mounted.get("image_count") or 0)
+            object_count = int(mounted.get("object_count") or 0)
+            manifest["source_type"] = "mounted_dir_link"
+            manifest["format"] = mounted.get("format")
+            manifest["source_root"] = mounted.get("source_root")
+            manifest["source_image_root"] = mounted.get("source_image_root")
+            manifest["image_rel_prefix"] = mounted.get("image_rel_prefix")
+            manifest["image_paths"] = mounted.get("image_paths") or []
+            manifest["raw_labels"] = raw_labels
+            manifest["warnings"] = mounted.get("warnings") or []
+            manifest["stats"] = {
+                **(manifest.get("stats") or {}),
+                "image_count": image_count,
+                "total_images": image_count,
+                "num_images": image_count,
+                "json_count": int(mounted.get("json_count") or 0),
+                "target_count": object_count,
+                "annotations_count": object_count,
+                "total_targets": object_count,
+                "object_count": object_count,
+                "total_objects": object_count,
+                "class_count": len(raw_labels),
+                "num_classes": len(raw_labels),
+                "declared_class_count": len(raw_labels),
+            }
             manifest_path = illegal_manifest_path(int(row.illegal_dataset_id), version_no)
             write_manifest(manifest, manifest_path)
             stats = manifest_stats_to_dataset_statistics(manifest)
@@ -656,26 +680,30 @@ class IllegalDatasetService:
                     "source_type": "mounted_dir_link",
                     "source_root": str(Path(source_root).resolve(strict=False)),
                     "format": mounted.get("format"),
-                    "link_type": mounted.get("link_type"),
+                    "link_type": "manifest",
                     "image_count": int(mounted.get("image_count") or 0),
+                    "json_count": int(mounted.get("json_count") or 0),
                     "filename": str(filename or ""),
                     "append": bool(append),
                     "append_semantics": "new_mounted_version",
                     "manifest_schema_version": int(manifest.get("schema_version") or 1),
+                    "lightweight_import": True,
                 },
                 created_by=created_by,
             )
             db.add(version_row)
             db.flush()
             row.active_version_id = int(version_row.version_id)
+            _progress(88, "materializing")
             try:
                 remove_tree(active_root)
             except Exception:
                 pass
             active_root.mkdir(parents=True, exist_ok=True)
-            link_source_tree(active_root, Path(source_root), prefer_yolo=True)
+            _progress(92, "indexing")
             self._index_version_images(db, row, version_row)
             self._refresh_version_raw_labels_cache(row, version_row, manifest=manifest)
+            _progress(98, "finalizing")
             self._add_event(
                 db,
                 int(row.illegal_dataset_id),
@@ -699,7 +727,16 @@ class IllegalDatasetService:
             if not version:
                 raise NotFoundError("Illegal dataset version not found")
             manifest = load_version_manifest(version)
-            replace_dir_from_manifest(manifest, self._root_path(row))
+            meta = version.meta if isinstance(version.meta, dict) else {}
+            if str(meta.get("source_type") or "") == "mounted_dir_link":
+                active_root = self._root_path(row)
+                try:
+                    remove_tree(active_root)
+                except Exception:
+                    pass
+                active_root.mkdir(parents=True, exist_ok=True)
+            else:
+                replace_dir_from_manifest(manifest, self._root_path(row))
             row.active_version_id = int(version.version_id)
             self._add_event(
                 db,

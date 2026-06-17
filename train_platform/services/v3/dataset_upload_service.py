@@ -399,6 +399,7 @@ class DatasetUploadService:
                             created_by=task.created_by,
                             append=(task.mode == "append"),
                             filename=source.name,
+                            progress_callback=import_progress,
                         )
                     elif task.source_type == "dir":
                         self._update_task(db, task, status="validating", stage="validating", progress=30)
