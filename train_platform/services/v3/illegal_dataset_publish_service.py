@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 from dataclasses import dataclass, field
+from numbers import Real
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -115,8 +116,8 @@ def _normalize_label_key(value: Any) -> str:
 def _uses_bottom_left_origin(version: Any) -> bool:
     if isinstance(version, bool):
         return False
-    if isinstance(version, int):
-        return version == 1
+    if isinstance(version, Real):
+        return float(version) == 1.0
     if isinstance(version, str):
         return version.strip() == "1"
     return False

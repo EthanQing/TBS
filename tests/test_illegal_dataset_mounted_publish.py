@@ -185,6 +185,23 @@ def test_convert_dataset_version_1_converts_bottom_left_points(tmp_path: Path) -
     assert string_version_cy == 0.8
 
 
+def test_convert_dataset_version_1_float_converts_bottom_left_points(tmp_path: Path) -> None:
+    annotation = {
+        "version": 1.0,
+        "shapes": [
+            {"label": "car", "shape_type": "rectangle", "points": [[10, 10], [30, 30]]},
+        ],
+    }
+
+    class_id, cx, cy, width, height = _convert_single_annotation(tmp_path, annotation, "v1_float")
+
+    assert class_id == 0
+    assert cx == 0.2
+    assert cy == 0.8
+    assert width == 0.2
+    assert height == 0.2
+
+
 def test_convert_dataset_newer_version_keeps_top_left_points(tmp_path: Path) -> None:
     annotation = {
         "version": "5.0.1",

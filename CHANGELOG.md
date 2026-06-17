@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed illegal dataset publish regressions so numeric `version: 1.0`
+  LabelMe/JSON annotations use the same bottom-left-origin conversion as
+  `version: 1`, and saved parent-label deletes remain part of publish job
+  idempotency snapshots.
 - Fixed illegal dataset LabelMe/JSON conversion to adapt `version: 1`
   bottom-left-origin points with `y = image_height - y` while leaving newer
   LabelMe versions unchanged.

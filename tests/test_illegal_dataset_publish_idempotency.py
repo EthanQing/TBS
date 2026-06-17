@@ -162,6 +162,28 @@ def test_publish_job_mapping_delete_change_gets_new_job(monkeypatch, tmp_path: P
     assert db.query(IllegalDatasetPublishJob).count() == 2
 
 
+def test_publish_job_snapshot_keeps_saved_parent_delete_mapping() -> None:
+    db = _make_db()
+    _seed_illegal_dataset(db)
+    db.add(
+        IllegalDatasetLabelMapping(
+            illegal_dataset_id=1000001,
+            raw_label="车辆",
+            mapped_label="",
+            status="delete",
+        )
+    )
+    db.commit()
+
+    snapshot = IllegalDatasetPublishJobService()._effective_mapping_snapshot(
+        db,
+        1000001,
+        {"label_mapping_overrides": {}},
+    )
+
+    assert snapshot == {"车辆": "__DISCARD__"}
+
+
 def test_completed_publish_job_returns_existing_result(monkeypatch, tmp_path: Path) -> None:
     db = _make_db()
     _seed_illegal_dataset(db)
