@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added cancellation for illegal dataset publish jobs so stuck conversions can
+  be stopped after backend restarts.
 - Sped up illegal dataset publish conversion by processing LabelMe/JSON
   image pairs in parallel with configurable
   `ILLEGAL_DATASET_PUBLISH_MAX_WORKERS`.

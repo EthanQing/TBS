@@ -321,3 +321,40 @@ def test_get_active_publish_job_ignores_terminal_jobs(monkeypatch, tmp_path: Pat
 
     assert svc.get_active_job(1000001) is None
     db.close()
+
+
+def test_cancel_running_publish_job_marks_terminal_and_syncs_status(monkeypatch, tmp_path: Path) -> None:
+    factory = _make_db_factory()
+    db = factory()
+    _seed_illegal_dataset(db)
+    svc = IllegalDatasetPublishJobService()
+    monkeypatch.setattr(
+        "train_platform.services.v3.illegal_dataset_publish_job_service.SessionLocal",
+        factory,
+    )
+    monkeypatch.setattr(svc, "jobs_root", lambda dataset_id: tmp_path / "jobs" / str(dataset_id))
+
+    job = svc.create_job(db, 1000001, _payload())
+    row = db.query(IllegalDatasetPublishJob).filter_by(job_id=job.job_id).one()
+    row.status = "running"
+    row.phase = "converting"
+    row.progress = 43
+    row.processed = 5638
+    row.total = 17401
+    db.commit()
+
+    cancelled = svc.cancel_job(1000001, job.job_id)
+
+    assert cancelled.status == "cancelled"
+    assert cancelled.phase == "cancelled"
+    assert cancelled.progress == 100
+    assert cancelled.cancel_requested is True
+    assert svc.get_active_job(1000001) is None
+
+    status_payload = svc._read_json_retry(
+        svc.status_path(1000001, job.job_id),
+        missing_message="missing",
+    )
+    assert status_payload["status"] == "cancelled"
+    assert status_payload["cancel_requested"] is True
+    db.close()

@@ -223,6 +223,7 @@ class IllegalDatasetPublishJobOut(BaseModel):
     processed: int = 0
     total: int = 0
     seq: int = 0
+    cancel_requested: bool = False
     request: Optional[IllegalDatasetPublishJobRequestSummary] = None
     result: Optional[IllegalDatasetPublishOut] = None
     logs: list[str] = Field(default_factory=list)

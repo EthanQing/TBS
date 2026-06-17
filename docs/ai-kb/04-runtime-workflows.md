@@ -29,6 +29,7 @@
 - 发布逻辑位于 `illegal_dataset_publish_service.py`。
 - 发布任务逻辑位于 `illegal_dataset_publish_job_service.py`。
 - 前端应通过 `/api/v3/illegal-datasets/{id}/publish-jobs` 创建后台发布任务，并轮询 `/publish-jobs/{job_id}` 展示 `phase`、`progress`、`processed/total`、`logs` 和 `error_message`；重新进入详情页时可调用 `/publish-jobs/active` 恢复最新 queued/running 任务；同步 `/publish` 接口已移除。
+- 发布任务支持 `POST /api/v3/illegal-datasets/{id}/publish-jobs/{job_id}/cancel` 取消。取消会立即把数据库行和 `temp/illegal_dataset_publish_jobs/.../status.json` 标为 `cancelled`，用于容器重启后清理卡在 queued/running 的任务；活跃线程后续进度更新不能覆盖 terminal 状态。
 - 发布任务以数据库表 `illegal_dataset_publish_jobs` 为状态源，并把状态镜像写到 `temp/illegal_dataset_publish_jobs/<dataset_id>/<job_id>/status.json` 兼容旧轮询排查。幂等键由源违规数据集、源版本、最终生效标签映射、过滤、切片、拆分和 publish_config 生成，排除 `name`/`description`；同一请求重复提交返回已有 queued/running/completed 任务，failed/cancelled 可重置后重试。
 - 标签映射 `status=delete` 或 `__DISCARD__` 表示丢弃；发布任务幂等快照和发布转换都会保留删除语义，并按 `label_separator` 把父级删除扩展到 descendants，防止旧映射或缺省映射让子标签原样转出。删除映射变化属于幂等键输入，会生成新的发布任务。
 - 发布转换会先按图片/JSON 基名配对，并兼容 `images/`、`json/`、`annotations/` 等顶层目录别名；缺图片、缺 JSON、图片截断或图片不可解码的样本会记录为 skipped/warnings 后跳过，不阻塞还有有效样本的发布。

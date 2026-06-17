@@ -7,6 +7,7 @@ TBS Backend is a training platform backend built with **FastAPI**, **SQLAlchemy*
 ## Features
 
 - Dataset management, mounted imports, publishing, and augmentation
+- Cancellable illegal dataset publish jobs for long-running LabelMe/JSON conversion
 - Project and model version management
 - Training run orchestration
 - Pluggable training framework architecture

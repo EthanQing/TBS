@@ -22,6 +22,11 @@ from train_platform.utils.exceptions import NotFoundError
 
 TERMINAL_RETRYABLE_STATUSES = {"failed", "cancelled"}
 ACTIVE_OR_DONE_STATUSES = {"queued", "running", "completed"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+class PublishJobCancelled(RuntimeError):
+    pass
 
 
 class IllegalDatasetPublishJobService:
@@ -229,6 +234,7 @@ class IllegalDatasetPublishJobService:
             "processed": int(job.processed or 0),
             "total": int(job.total or 0),
             "seq": int(job.seq or 0),
+            "cancel_requested": bool(getattr(job, "cancel_requested", False)),
             "request": job.request_summary if isinstance(job.request_summary, dict) else None,
             "result": result,
             "logs": list(job.logs) if isinstance(job.logs, list) else [],
@@ -293,6 +299,7 @@ class IllegalDatasetPublishJobService:
         job.standard_dataset_id = None
         job.logs = ["上次转换未完成，已重新加入后台执行队列"]
         job.error_message = None
+        job.cancel_requested = False
         job.started_at = None
         job.finished_at = None
         job.updated_at = self._utcnow()
@@ -324,6 +331,7 @@ class IllegalDatasetPublishJobService:
             result=None,
             logs=["转换任务已创建，等待后台执行"],
             error_message=None,
+            cancel_requested=False,
         )
 
     def create_job(self, db: Session, illegal_dataset_id: int, payload: IllegalDatasetPublishRequest) -> IllegalDatasetPublishJobOut:
@@ -455,6 +463,60 @@ class IllegalDatasetPublishJobService:
         self._sync_status_file(job)
         return job
 
+    def _is_cancel_requested(self, illegal_dataset_id: int, job_id: str) -> bool:
+        db = SessionLocal()
+        try:
+            job = self._get_job_row(db, int(illegal_dataset_id), str(job_id))
+            return bool(getattr(job, "cancel_requested", False)) or str(job.status or "").lower() == "cancelled"
+        except NotFoundError:
+            try:
+                payload = self._read_json_retry(
+                    self.status_path(illegal_dataset_id, job_id),
+                    missing_message="Illegal dataset publish job not found",
+                )
+                return bool(payload.get("cancel_requested")) or str(payload.get("status") or "").lower() == "cancelled"
+            except Exception:
+                return False
+        finally:
+            db.close()
+
+    def cancel_job(self, illegal_dataset_id: int, job_id: str) -> IllegalDatasetPublishJobOut:
+        db = SessionLocal()
+        try:
+            job = self._get_job_row(db, int(illegal_dataset_id), str(job_id))
+            status = str(job.status or "").lower()
+            if status in {"completed", "failed", "cancelled"}:
+                job.cancel_requested = True if status == "cancelled" else bool(getattr(job, "cancel_requested", False))
+                db.commit()
+                db.refresh(job)
+                self._sync_status_file(job)
+                return self._job_out(job)
+
+            payload = self._job_to_payload(job)
+            payload["status"] = "cancelled"
+            payload["phase"] = "cancelled"
+            payload["progress"] = 100
+            payload["cancel_requested"] = True
+            payload["error_message"] = None
+            payload["seq"] = int(payload.get("seq") or 0) + 1
+            self._append_log(payload, "用户取消转换任务")
+
+            job.status = "cancelled"
+            job.phase = "cancelled"
+            job.progress = 100
+            job.cancel_requested = True
+            job.error_message = None
+            job.logs = payload.get("logs") if isinstance(payload.get("logs"), list) else []
+            job.seq = int(payload.get("seq") or 0)
+            job.finished_at = self._utcnow()
+            job.updated_at = self._utcnow()
+            db.commit()
+            db.refresh(job)
+            self._sync_status_file(job)
+            return self._job_out(job)
+        finally:
+            db.close()
+
     def _update_status(
         self,
         illegal_dataset_id: int,
@@ -466,6 +528,9 @@ class IllegalDatasetPublishJobService:
         db = SessionLocal()
         try:
             job = self._get_job_row(db, int(illegal_dataset_id), str(job_id))
+            if str(job.status or "").lower() in TERMINAL_STATUSES:
+                self._sync_status_file(job)
+                return self._job_to_payload(job)
             payload = self._job_to_payload(job)
             payload.update(dict(patch or {}))
             payload["seq"] = int(payload.get("seq") or 0) + 1
@@ -478,6 +543,7 @@ class IllegalDatasetPublishJobService:
             job.processed = int(payload.get("processed") or 0)
             job.total = int(payload.get("total") or 0)
             job.seq = int(payload.get("seq") or 0)
+            job.cancel_requested = bool(payload.get("cancel_requested", getattr(job, "cancel_requested", False)))
             job.logs = payload.get("logs") if isinstance(payload.get("logs"), list) else []
             job.error_message = payload.get("error_message")
             if isinstance(payload.get("result"), dict):
@@ -516,6 +582,8 @@ class IllegalDatasetPublishJobService:
             return
 
         def progress_callback(phase: str, info: dict[str, Any]) -> None:
+            if self._is_cancel_requested(int(illegal_dataset_id), str(job_id)):
+                raise PublishJobCancelled("转换任务已取消")
             payload = info if isinstance(info, dict) else {}
             total = max(0, int(payload.get("total") or 0))
             completed = max(
@@ -540,8 +608,12 @@ class IllegalDatasetPublishJobService:
                 patch,
                 message=str(payload.get("message") or "").strip() or None,
             )
+            if self._is_cancel_requested(int(illegal_dataset_id), str(job_id)):
+                raise PublishJobCancelled("转换任务已取消")
 
         try:
+            if self._is_cancel_requested(int(illegal_dataset_id), str(job_id)):
+                raise PublishJobCancelled("转换任务已取消")
             result = self._svc.publish_standard_dataset(
                 db,
                 int(illegal_dataset_id),
@@ -565,6 +637,23 @@ class IllegalDatasetPublishJobService:
                     "error_message": None,
                 },
                 message=f"转换完成，已生成标准数据集 #{int(result.get('standard_dataset_id') or 0)}",
+            )
+        except PublishJobCancelled as exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            self._update_status(
+                int(illegal_dataset_id),
+                str(job_id),
+                {
+                    "status": "cancelled",
+                    "phase": "cancelled",
+                    "progress": 100,
+                    "cancel_requested": True,
+                    "error_message": None,
+                },
+                message=str(exc) or "转换任务已取消",
             )
         except Exception as exc:
             try:

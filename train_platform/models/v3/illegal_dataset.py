@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BIGINT, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BIGINT, Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -214,6 +214,7 @@ class IllegalDatasetPublishJob(V3Base):
     processed: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     seq: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     request_payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     request_summary: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)

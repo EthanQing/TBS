@@ -277,6 +277,11 @@ def get_illegal_dataset_publish_job(illegal_dataset_id: int, job_id: str):
     return publish_job_svc.get_job(int(illegal_dataset_id), str(job_id))
 
 
+@router.post("/{illegal_dataset_id}/publish-jobs/{job_id}/cancel", response_model=IllegalDatasetPublishJobOut)
+def cancel_illegal_dataset_publish_job(illegal_dataset_id: int, job_id: str):
+    return publish_job_svc.cancel_job(int(illegal_dataset_id), str(job_id))
+
+
 @router.get("/{illegal_dataset_id}/view", response_model=DatasetViewOut)
 def get_illegal_dataset_view(
     illegal_dataset_id: int,

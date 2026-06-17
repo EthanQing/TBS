@@ -82,6 +82,10 @@ Starlette 挂载 `StaticFiles` 前要求目录存在。`create_app()` 和 lifesp
 
 前端和发布端都不能把未保存标签自动补成 `raw -> raw` 的保存映射，否则用户删除的类别会被默认保留覆盖。树形映射里父节点删除表示当前标签和所有 descendants 都过滤；发布任务幂等快照和发布转换都必须按 `label_separator` 保留 `status=delete` / `__DISCARD__` 的 descendants 兜底。
 
+## 发布转换任务重启后可能只剩卡住状态
+
+违规数据集发布任务的执行线程在 backend 进程内。容器重启会让线程消失，但数据库行和 `temp/illegal_dataset_publish_jobs/.../status.json` 可能仍停在 `queued` / `running`。不要手工改状态文件；应通过 `POST /api/v3/illegal-datasets/{id}/publish-jobs/{job_id}/cancel` 或前端“停止转换”按钮把数据库和状态镜像一起置为 `cancelled`，之后同请求可重新提交。
+
 LabelMe/JSON 的顶层 `version` 可能是 JSON 数字 `1`、`1.0` 或字符串 `"1"`。这三种都表示旧格式左下角坐标原点，发布转换必须用图片高度执行 `y = image_height - y`；不要只兼容 Python `int`，否则 `1.0` 会被误当成新版顶左坐标。
 
 ## 模型转换依赖本地队列文件
