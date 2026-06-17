@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from train_platform.core.config import settings
 from train_platform.workers.model_conversion_queue import ModelConversionQueueWorker
@@ -46,6 +47,16 @@ def _is_port_listening(host: str, port: int) -> bool:
         return False
 
 
+def _sidecar_has_validation_endpoint(host: str, port: int) -> bool:
+    probe_host = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
+    try:
+        with urlopen(f"http://{probe_host}:{int(port)}/openapi.json", timeout=2.0) as resp:
+            text = resp.read().decode("utf-8", errors="ignore")
+        return "/internal/model-evaluations/yolo-val" in text
+    except Exception:
+        return False
+
+
 def _start_inference_worker_if_needed() -> Optional[subprocess.Popen]:
     if not _inference_worker_enabled():
         print("[worker] inference sidecar disabled by YOLO_WORKER_START_INFERENCE=0", flush=True)
@@ -53,7 +64,14 @@ def _start_inference_worker_if_needed() -> Optional[subprocess.Popen]:
 
     host, port = _inference_worker_endpoint()
     if _is_port_listening(host, port):
-        print(f"[worker] inference sidecar already listening on {host}:{port}", flush=True)
+        if _sidecar_has_validation_endpoint(host, port):
+            print(f"[worker] inference sidecar already listening on {host}:{port}", flush=True)
+            return None
+        print(
+            f"[worker] port {host}:{port} is in use but does not expose the current inference sidecar API",
+            file=sys.stderr,
+            flush=True,
+        )
         return None
 
     log_dir = settings.temp_dir

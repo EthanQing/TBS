@@ -221,6 +221,37 @@ def test_extract_ultralytics_val_metrics() -> None:
     assert metrics["class_metrics"][0]["class_name"] == "person"
 
 
+class _FakeSparseBoxMetrics:
+    mp = 0.8
+    mr = 0.7
+    map50 = 0.75
+    map = 0.65
+    ap_class_index = [0, 2]
+    p = [0.9, 0.5]
+    r = [0.8, 0.4]
+    maps = [0.7, 0.3]
+    all_ap = [[0.8, 0.7], [0.4, 0.3]]
+
+
+class _FakeSparseValResults:
+    box = _FakeSparseBoxMetrics()
+    names = {0: "person", 2: "car"}
+    nt_per_class = [5, 0, 7]
+
+
+def test_extract_ultralytics_val_metrics_handles_sparse_class_ids() -> None:
+    metrics = _extract_ultralytics_val_metrics(_FakeSparseValResults(), elapsed_ms=10)
+
+    by_class = {item["class_id"]: item for item in metrics["class_metrics"]}
+
+    assert by_class[0]["precision"] == pytest.approx(0.9)
+    assert by_class[0]["gt_count"] == 5
+    assert by_class[2]["precision"] == pytest.approx(0.5)
+    assert by_class[2]["recall"] == pytest.approx(0.4)
+    assert by_class[2]["ap50_95"] == pytest.approx(0.3)
+    assert by_class[2]["gt_count"] == 7
+
+
 def test_yolo_worker_inference_sidecar_endpoint_uses_env_url(monkeypatch) -> None:
     monkeypatch.delenv("INFERENCE_WORKER_HOST", raising=False)
     monkeypatch.delenv("INFERENCE_WORKER_PORT", raising=False)

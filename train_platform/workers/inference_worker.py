@@ -386,7 +386,43 @@ def _extract_ultralytics_val_metrics(results: Any, elapsed_ms: float) -> Dict[st
 
     nt_per_class = [int(_as_float(x)) for x in _to_list(getattr(results, "nt_per_class", []))]
 
-    class_ids = sorted(set(ap_class_index) | set(range(len(nt_per_class))) | set(int(k) for k in names.keys() if str(k).isdigit()))
+    name_class_ids = set()
+    for key in names.keys():
+        try:
+            name_class_ids.add(int(key))
+        except Exception:
+            continue
+
+    metric_index_by_class = {class_id: idx for idx, class_id in enumerate(ap_class_index)}
+    compact_metric_arrays = bool(ap_class_index) and any(
+        class_id >= len(ap_class_index) for class_id in ap_class_index
+    )
+    has_full_target_counts = bool(nt_per_class) and (
+        not ap_class_index or len(nt_per_class) > max(ap_class_index)
+    )
+    target_class_ids = (
+        set(range(len(nt_per_class)))
+        if has_full_target_counts
+        else set(ap_class_index[: len(nt_per_class)])
+    )
+    class_ids = sorted(set(ap_class_index) | target_class_ids | name_class_ids)
+
+    def _metric_value(values: list[float], class_id: int) -> float:
+        metric_idx = metric_index_by_class.get(class_id)
+        if metric_idx is not None and metric_idx < len(values):
+            return values[metric_idx]
+        if not compact_metric_arrays and 0 <= class_id < len(values):
+            return values[class_id]
+        return 0.0
+
+    def _target_count(class_id: int) -> int:
+        metric_idx = metric_index_by_class.get(class_id)
+        if has_full_target_counts and 0 <= class_id < len(nt_per_class):
+            return nt_per_class[class_id]
+        if metric_idx is not None and metric_idx < len(nt_per_class):
+            return nt_per_class[metric_idx]
+        return 0
+
     class_metrics: list[dict[str, Any]] = []
     total_targets = 0
     total_predictions = 0
@@ -394,13 +430,12 @@ def _extract_ultralytics_val_metrics(results: Any, elapsed_ms: float) -> Dict[st
     est_fp_total = 0
     est_fn_total = 0
 
-    for idx, class_id in enumerate(class_ids):
-        metric_idx = ap_class_index.index(class_id) if class_id in ap_class_index else idx
-        p = p_values[metric_idx] if metric_idx < len(p_values) else 0.0
-        r = r_values[metric_idx] if metric_idx < len(r_values) else 0.0
-        ap50 = ap50_values[metric_idx] if metric_idx < len(ap50_values) else 0.0
-        ap5095 = maps[class_id] if 0 <= class_id < len(maps) else (maps[metric_idx] if metric_idx < len(maps) else 0.0)
-        gt_count = nt_per_class[class_id] if 0 <= class_id < len(nt_per_class) else 0
+    for class_id in class_ids:
+        p = _metric_value(p_values, class_id)
+        r = _metric_value(r_values, class_id)
+        ap50 = _metric_value(ap50_values, class_id)
+        ap5095 = _metric_value(maps, class_id)
+        gt_count = _target_count(class_id)
         est_tp = int(round(r * gt_count)) if gt_count > 0 else 0
         pred_count = int(round(est_tp / p)) if p > 0 else 0
         est_fp = max(0, pred_count - est_tp)
@@ -414,7 +449,7 @@ def _extract_ultralytics_val_metrics(results: Any, elapsed_ms: float) -> Dict[st
         class_metrics.append(
             {
                 "class_id": int(class_id),
-                "class_name": str(names.get(class_id)) if class_id in names else str(class_id),
+                "class_name": str(names.get(class_id, names.get(str(class_id), class_id))),
                 "gt_count": int(gt_count),
                 "pred_count": int(pred_count),
                 "tp": int(est_tp),
