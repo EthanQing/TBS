@@ -374,7 +374,12 @@ def link_json_source_tree(target_root: Path, source_root: Path) -> dict[str, Any
             skipped.append(f"{image_path.name}: cannot read image size")
             continue
         try:
-            bboxes, label_map = parse_annotations({**base_cfg, "label_map": label_map, "annotation_path": str(json_path)})
+            bboxes, label_map = parse_annotations({
+                **base_cfg,
+                "label_map": label_map,
+                "annotation_path": str(json_path),
+                "image_height": int(height),
+            })
         except Exception as exc:
             skipped.append(f"{json_path.name}: {exc}")
             continue

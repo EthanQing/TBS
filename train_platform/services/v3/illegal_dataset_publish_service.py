@@ -112,6 +112,52 @@ def _normalize_label_key(value: Any) -> str:
     return s.strip()
 
 
+def _uses_bottom_left_origin(version: Any) -> bool:
+    if isinstance(version, bool):
+        return False
+    if isinstance(version, int):
+        return version == 1
+    if isinstance(version, str):
+        return version.strip() == "1"
+    return False
+
+
+def _coerce_dimension(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+def _annotation_image_height(cfg: dict, data: Any, json_path: str) -> float:
+    candidates = [cfg.get("image_height")]
+    if isinstance(data, dict):
+        candidates.append(data.get("imageHeight"))
+    for candidate in candidates:
+        height = _coerce_dimension(candidate)
+        if height is not None:
+            return height
+    raise ValidationError(f"Missing image height for bottom-left origin annotation: {json_path}")
+
+
+def _normalize_annotation_points(points: list, *, bottom_left_origin: bool, image_height: Optional[float]) -> list:
+    if not bottom_left_origin:
+        return points
+    normalized = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            normalized.append(point)
+            continue
+        x, y = point[0], point[1]
+        normalized.append([x, float(image_height) - float(y), *list(point[2:])])
+    return normalized
+
+
 def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
     json_path = cfg["annotation_path"]
     label_map = cfg["label_map"]
@@ -192,6 +238,9 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
     else:
         raise ValidationError(f"Unrecognized json structure: {json_path}")
 
+    bottom_left_origin = isinstance(data, dict) and _uses_bottom_left_origin(data.get("version"))
+    image_height = _annotation_image_height(cfg, data, json_path) if bottom_left_origin else None
+
     for shape in shapes:
         if skip_hidden and shape.get("hidden", False):
             continue
@@ -203,6 +252,11 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
         pts = shape.get("points", [])
         if not pts or len(pts) < 2:
             continue
+        pts = _normalize_annotation_points(
+            pts,
+            bottom_left_origin=bottom_left_origin,
+            image_height=image_height,
+        )
 
         raw_label = str(shape.get("label", "unknown"))
         raw_label_stripped = raw_label.strip()
@@ -981,6 +1035,7 @@ class IllegalDatasetPublishService:
     def _run_single(self, cfg: dict) -> tuple[dict[str, int], Dict[str, int]]:
         with open_image_reader(cfg["image_path"], slice_size=int(cfg["slice_size"])) as reader:
             img_w, img_h = int(reader.width), int(reader.height)
+            cfg["image_height"] = img_h
             bboxes, label_map = parse_annotations(cfg)
             if not bboxes:
                 raise ValidationError(f"No valid annotations in {cfg['annotation_path']}")

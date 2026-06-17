@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed illegal dataset LabelMe/JSON conversion to adapt `version: 1`
+  bottom-left-origin points with `y = image_height - y` while leaving newer
+  LabelMe versions unchanged.
 - Added model evaluation jobs under `/api/v3/model-evaluations` for computing
   Precision, Recall, F1, mAP50, and mAP50-95 on labeled YOLO detection datasets.
 - Fixed model evaluation cancellation so cancelling an active job immediately

@@ -142,6 +142,66 @@ def test_convert_dataset_parent_delete_excludes_descendant_labels(tmp_path: Path
     assert label_lines[0].startswith("0 ")
 
 
+def _convert_single_annotation(tmp_path: Path, annotation: dict, dirname: str) -> list[float]:
+    source_root = tmp_path / dirname / "source"
+    output_root = tmp_path / dirname / "output"
+    source_root.mkdir(parents=True)
+    Image.new("RGB", (100, 100), (255, 255, 255)).save(source_root / "sample.jpg")
+    (source_root / "sample.json").write_text(json.dumps(annotation), encoding="utf-8")
+
+    IllegalDatasetPublishService().convert_dataset(
+        source_root,
+        output_root,
+        label_mapping={"car": "car"},
+        publish_config={"conversion": {"slice": {"enabled": False, "output_format": "jpg"}}},
+    )
+
+    label_line = list((output_root / "labels").glob("*.txt"))[0].read_text(encoding="utf-8").strip()
+    return [float(item) for item in label_line.split()]
+
+
+def test_convert_dataset_version_1_converts_bottom_left_points(tmp_path: Path) -> None:
+    annotation = {
+        "version": 1,
+        "shapes": [
+            {"label": "car", "shape_type": "rectangle", "points": [[10, 10], [30, 30]]},
+        ],
+    }
+
+    class_id, cx, cy, width, height = _convert_single_annotation(tmp_path, annotation, "v1")
+
+    assert class_id == 0
+    assert cx == 0.2
+    assert cy == 0.8
+    assert width == 0.2
+    assert height == 0.2
+
+    annotation["version"] = "1"
+    _class_id, _cx, string_version_cy, _width, _height = _convert_single_annotation(
+        tmp_path,
+        annotation,
+        "v1_string",
+    )
+    assert string_version_cy == 0.8
+
+
+def test_convert_dataset_newer_version_keeps_top_left_points(tmp_path: Path) -> None:
+    annotation = {
+        "version": "5.0.1",
+        "shapes": [
+            {"label": "car", "shape_type": "rectangle", "points": [[10, 10], [30, 30]]},
+        ],
+    }
+
+    class_id, cx, cy, width, height = _convert_single_annotation(tmp_path, annotation, "v5")
+
+    assert class_id == 0
+    assert cx == 0.2
+    assert cy == 0.2
+    assert width == 0.2
+    assert height == 0.2
+
+
 def test_publish_uses_original_source_for_mounted_json_versions(tmp_path: Path, monkeypatch) -> None:
     mounted_source = tmp_path / "imports" / "illegal-json"
     mounted_source.mkdir(parents=True)
