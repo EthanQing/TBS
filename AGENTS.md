@@ -33,6 +33,11 @@
 3. 如果流程变化，更新 `docs/ai-kb/04-runtime-workflows.md` 或 `docs/ai-kb/05-dev-workflows.md`。
 4. 如果发现新坑，更新 `docs/ai-kb/90-pitfalls.md`。
 5. 如果配置、命令、路径变化，更新 `docs/ai-kb/99-references.md`。
-6. 在最终回复中说明更新了哪些知识库文件。
+6. 如果本次修改影响 Docker 镜像内容，构建更新后的相关镜像：
+   - 后端 API、service、model、migration、配置、依赖或 `Dockerfile.backend` 变化：运行 `docker build -f Dockerfile.backend -t tbs-backend:plain .`。
+   - YOLO worker、训练插件、推理 worker、worker 依赖或 `Dockerfile.worker.yolo` 变化：运行 `docker build -f Dockerfile.worker.yolo -t tbs-worker-yolo:plain .`。
+   - Paddle worker、PaddleDetection 相关逻辑、worker 依赖或 `Dockerfile.worker.paddle` 变化：运行 `docker build -f Dockerfile.worker.paddle -t tbs-worker-paddle:plain .`。
+   - 仅文档、测试或不会进入镜像的运行时数据变化不需要构建镜像。
+7. 在最终回复中说明更新了哪些知识库文件，以及构建了哪些镜像；如果跳过构建，说明原因。
 
 除非用户明确要求，否则不要重写整个知识库。
