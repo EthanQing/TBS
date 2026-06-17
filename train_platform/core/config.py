@@ -51,6 +51,10 @@ def _ensure_mysql_charset(url: str) -> str:
         return f"{value}{joiner}charset=utf8mb4"
 
 
+def _default_dataset_import_max_workers() -> int:
+    return max(1, min(8, os.cpu_count() or 1))
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url_override: str | None = os.getenv("DATABASE_URL")
@@ -82,6 +86,10 @@ class Settings:
     thumbnail_first_page_prewarm: int = int(os.getenv("THUMBNAIL_FIRST_PAGE_PREWARM", "32"))
     thumbnail_size: int = int(os.getenv("THUMBNAIL_SIZE", "200"))
     view_index_max_workers: int = int(os.getenv("VIEW_INDEX_MAX_WORKERS", "8"))
+    dataset_import_max_workers: int = max(
+        1,
+        int(os.getenv("DATASET_IMPORT_MAX_WORKERS", str(_default_dataset_import_max_workers())) or str(_default_dataset_import_max_workers())),
+    )
     upload_chunk_size_mb: int = max(1, int(os.getenv("UPLOAD_CHUNK_SIZE_MB", "64") or "64"))
     upload_session_ttl_hours: int = max(1, int(os.getenv("UPLOAD_SESSION_TTL_HOURS", "24") or "24"))
     upload_part_max_retries: int = max(0, int(os.getenv("UPLOAD_PART_MAX_RETRIES", "5") or "5"))

@@ -67,6 +67,10 @@ class DatasetUploadTaskOut(BaseModel):
     status: str
     stage: str
     progress: int
+    processed_count: int = 0
+    total_count: int = 0
+    current_item: str | None = None
+    detail_message: str | None = None
     error_message: str | None = None
     created_by: str | None = None
     message: str | None = None

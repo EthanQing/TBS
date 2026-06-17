@@ -302,7 +302,13 @@ def test_build_illegal_mounted_manifest_is_lightweight_for_json(tmp_path: Path, 
 
     monkeypatch.setattr("train_platform.services.v3.mounted_dataset_service.image_size", fail_image_size)
 
-    manifest = build_illegal_mounted_manifest(source_root)
+    progress: list[tuple[int, str, dict]] = []
+
+    manifest = build_illegal_mounted_manifest(
+        source_root,
+        progress_callback=lambda value, stage, detail: progress.append((value, stage, detail)),
+        max_workers=1,
+    )
 
     assert manifest["format"] == "json"
     assert manifest["image_count"] == 1
@@ -313,6 +319,32 @@ def test_build_illegal_mounted_manifest_is_lightweight_for_json(tmp_path: Path, 
     assert "sample.json" in manifest["files"]
     assert not (source_root / "labels").exists()
     assert not (source_root / "data.yaml").exists()
+    assert any(stage == "parsing" and detail.get("processed_count") == 1 for _value, stage, detail in progress)
+
+
+def test_build_illegal_mounted_manifest_parallel_matches_serial(tmp_path: Path) -> None:
+    source_root = tmp_path / "imports" / "parallel-json"
+    source_root.mkdir(parents=True)
+    for idx, label in enumerate(("person", "helmet", "vest", "person"), start=1):
+        (source_root / f"sample-{idx}.jpg").write_bytes(b"not-a-real-image")
+        (source_root / f"sample-{idx}.json").write_text(
+            json.dumps({"shapes": [{"label": label}]}),
+            encoding="utf-8",
+        )
+
+    serial = build_illegal_mounted_manifest(source_root, max_workers=1)
+    parallel_progress: list[tuple[int, str, dict]] = []
+    parallel = build_illegal_mounted_manifest(
+        source_root,
+        max_workers=4,
+        progress_callback=lambda value, stage, detail: parallel_progress.append((value, stage, detail)),
+    )
+
+    assert parallel["image_paths"] == serial["image_paths"]
+    assert parallel["raw_labels"] == serial["raw_labels"]
+    assert parallel["object_count"] == serial["object_count"]
+    assert parallel["files"] == serial["files"]
+    assert any(stage == "parsing" and detail.get("total_count") == 4 for _value, stage, detail in parallel_progress)
 
 
 def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -> None:
@@ -352,7 +384,7 @@ def test_mounted_append_uses_next_dataset_version(tmp_path: Path, monkeypatch) -
         source_root.mkdir(parents=True)
         (source_root / "sample.jpg").write_bytes(b"fake-source-image")
 
-        def fake_build_illegal_mounted_manifest(source_root: Path, *, prefer_yolo: bool = True):
+        def fake_build_illegal_mounted_manifest(source_root: Path, *, prefer_yolo: bool = True, **_kwargs):
             manifest = {
                 "source_type": "mounted_dir_link",
                 "format": "yolo",
@@ -438,7 +470,7 @@ def test_mounted_json_import_records_manifest_labels_and_images(tmp_path: Path, 
             json.dumps({"shapes": [{"label": "person"}, {"label": "helmet"}]}),
             encoding="utf-8",
         )
-        progress: list[tuple[int, str]] = []
+        progress: list[tuple[int, str, dict]] = []
 
         svc = service_module.IllegalDatasetService()
         monkeypatch.setattr(svc, "_root_path", lambda dataset: storage_root / str(dataset.storage_path))
@@ -459,7 +491,7 @@ def test_mounted_json_import_records_manifest_labels_and_images(tmp_path: Path, 
             db,
             1000005,
             source_root,
-            progress_callback=lambda value, stage: progress.append((value, stage)),
+            progress_callback=lambda value, stage, detail=None: progress.append((value, stage, detail or {})),
         )
 
         version = db.query(IllegalDatasetVersion).filter(IllegalDatasetVersion.version_id == result.active_version_id).one()
@@ -471,7 +503,8 @@ def test_mounted_json_import_records_manifest_labels_and_images(tmp_path: Path, 
         assert db.query(IllegalDatasetImage).filter(IllegalDatasetImage.version_id == version.version_id).count() == 1
         assert not (storage_root / "illegal" / "1000005" / "labels").exists()
         assert not (storage_root / "illegal" / "1000005" / "data.yaml").exists()
-        assert "indexing" in [stage for _value, stage in progress]
+        assert "indexing" in [stage for _value, stage, _detail in progress]
+        assert any(detail.get("processed_count") == 1 and detail.get("total_count") == 1 for _value, _stage, detail in progress)
         assert svc.get_raw_labels(db, 1000005) == ["helmet", "person"]
     finally:
         db.close()

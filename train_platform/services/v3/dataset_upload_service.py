@@ -289,6 +289,8 @@ class DatasetUploadService:
             status="queued",
             stage="queued",
             progress=0,
+            processed_count=0,
+            total_count=0,
             created_by=created_by,
             message=message,
         )
@@ -351,13 +353,13 @@ class DatasetUploadService:
         with SessionLocal() as db:
             task = self.get_task(db, task_id)
             try:
-                self._update_task(db, task, status="extracting", stage="extracting", progress=10)
+                self._update_task(db, task, status="extracting", stage="extracting", progress=10, detail_message="Preparing dataset import")
                 source = Path(task.source_path)
                 logger.info("Dataset upload task started task_id=%s session_id=%s", task.task_id, task.session_id)
                 if task.dataset_kind == "standard":
                     service = StandardDatasetService()
                     if task.source_type == "dir_link":
-                        self._update_task(db, task, status="linking", stage="linking", progress=30)
+                        self._update_task(db, task, status="linking", stage="linking", progress=30, detail_message="Preparing mounted standard dataset import")
                         service.import_mounted_source_tree(
                             db,
                             int(task.dataset_id),
@@ -366,7 +368,7 @@ class DatasetUploadService:
                             filename=source.name,
                         )
                     elif task.source_type == "dir":
-                        self._update_task(db, task, status="validating", stage="validating", progress=30)
+                        self._update_task(db, task, status="validating", stage="validating", progress=30, detail_message="Validating standard dataset source")
                         service.import_source_tree(
                             db,
                             int(task.dataset_id),
@@ -377,7 +379,7 @@ class DatasetUploadService:
                     else:
                         extracted_root, staging = self._extract_archive_for_task(db, task, source)
                         try:
-                            self._update_task(db, task, status="validating", stage="validating", progress=75)
+                            self._update_task(db, task, status="validating", stage="validating", progress=75, detail_message="Validating extracted standard dataset")
                             service.import_source_tree(
                                 db,
                                 int(task.dataset_id),
@@ -390,7 +392,7 @@ class DatasetUploadService:
                 else:
                     service = IllegalDatasetService()
                     if task.source_type == "dir_link":
-                        self._update_task(db, task, status="linking", stage="linking", progress=30)
+                        self._update_task(db, task, status="linking", stage="linking", progress=30, detail_message="Preparing mounted illegal dataset import")
                         service.import_mounted_source_tree(
                             db,
                             int(task.dataset_id),
@@ -402,7 +404,7 @@ class DatasetUploadService:
                             progress_callback=import_progress,
                         )
                     elif task.source_type == "dir":
-                        self._update_task(db, task, status="validating", stage="validating", progress=30)
+                        self._update_task(db, task, status="validating", stage="validating", progress=30, detail_message="Validating illegal dataset source")
                         service.import_source_tree(
                             db,
                             int(task.dataset_id),
@@ -416,7 +418,7 @@ class DatasetUploadService:
                     else:
                         extracted_root, staging = self._extract_archive_for_task(db, task, source)
                         try:
-                            self._update_task(db, task, status="validating", stage="validating", progress=75)
+                            self._update_task(db, task, status="validating", stage="validating", progress=75, detail_message="Validating extracted illegal dataset")
                             service.import_source_tree(
                                 db,
                                 int(task.dataset_id),
@@ -430,13 +432,22 @@ class DatasetUploadService:
                         finally:
                             shutil.rmtree(staging, ignore_errors=True)
                 task = self.get_task(db, task_id)
-                self._update_task(db, task, status="done", stage="done", progress=100, finished=True)
+                self._update_task(db, task, status="done", stage="done", progress=100, detail_message="Dataset import completed", finished=True)
                 self._cleanup_task_source(task)
                 logger.info("Dataset upload task finished task_id=%s", task.task_id)
             except Exception as exc:
                 db.rollback()
                 task = self.get_task(db, task_id)
-                self._update_task(db, task, status="failed", stage="failed", progress=int(task.progress or 0), error_message=str(exc), finished=True)
+                self._update_task(
+                    db,
+                    task,
+                    status="failed",
+                    stage="failed",
+                    progress=int(task.progress or 0),
+                    error_message=str(exc),
+                    detail_message="Dataset import failed",
+                    finished=True,
+                )
                 logger.exception("Dataset upload task failed task_id=%s session_id=%s", task.task_id, task.session_id)
 
     def _update_task(
@@ -448,12 +459,24 @@ class DatasetUploadService:
         stage: str,
         progress: int,
         error_message: str | None = None,
+        processed_count: int | None = None,
+        total_count: int | None = None,
+        current_item: str | None = None,
+        detail_message: str | None = None,
         finished: bool = False,
     ) -> None:
         task.status = status
         task.stage = stage
         task.progress = max(0, min(100, int(progress)))
         task.error_message = error_message
+        if processed_count is not None:
+            task.processed_count = max(0, int(processed_count or 0))
+        if total_count is not None:
+            task.total_count = max(0, int(total_count or 0))
+        if current_item is not None:
+            task.current_item = str(current_item or "")[:1000] or None
+        if detail_message is not None:
+            task.detail_message = str(detail_message or "") or None
         if finished:
             task.finished_at = _utcnow()
         db.commit()
@@ -462,14 +485,14 @@ class DatasetUploadService:
         staging = settings.dataset_staging_dir / "upload-tasks" / str(task.task_id)
         extracted_dir = staging / "extracted"
         shutil.rmtree(staging, ignore_errors=True)
-        self._update_task(db, task, status="extracting", stage="extracting", progress=10)
+        self._update_task(db, task, status="extracting", stage="extracting", progress=10, detail_message="Extracting dataset archive")
         try:
             extracted_root = safe_extract_zip(
                 Path(source),
                 extracted_dir,
                 progress_callback=self._make_extract_progress_callback(db, task, start=10, end=70),
             )
-            self._update_task(db, task, status="extracting", stage="extracting", progress=70)
+            self._update_task(db, task, status="extracting", stage="extracting", progress=70, detail_message="Archive extraction completed")
             return extracted_root, staging
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
@@ -499,28 +522,60 @@ class DatasetUploadService:
             if progress <= int(last_progress["value"]):
                 return
             last_progress["value"] = progress
-            self._update_task(db, task, status="extracting", stage="extracting", progress=progress)
+            self._update_task(
+                db,
+                task,
+                status="extracting",
+                stage="extracting",
+                progress=progress,
+                processed_count=done,
+                total_count=total,
+                current_item=_rel_path,
+                detail_message=f"Extracted {done}/{total} files" if total else "Extracting files",
+            )
 
         return _callback
 
-    def _make_import_progress_callback(self, task_id: str) -> Callable[[int, str], None]:
-        last_progress = {"value": -1}
+    def _make_import_progress_callback(self, task_id: str) -> Callable[..., None]:
+        last_snapshot: dict[str, Any] = {"progress": -1, "stage": "", "processed_count": None, "total_count": None, "current_item": None, "detail_message": None}
 
-        def _callback(progress: int, stage: str) -> None:
+        def _callback(progress: int, stage: str, detail: dict[str, Any] | None = None, **kwargs: Any) -> None:
             progress = max(0, min(99, int(progress)))
-            if progress <= int(last_progress["value"]):
+            detail_payload: dict[str, Any] = {}
+            if isinstance(detail, dict):
+                detail_payload.update(detail)
+            detail_payload.update(kwargs)
+            normalized_stage = str(stage or "validating")
+            processed_count = detail_payload.get("processed_count")
+            total_count = detail_payload.get("total_count")
+            current_item = detail_payload.get("current_item")
+            detail_message = detail_payload.get("detail_message")
+            snapshot = {
+                "progress": progress,
+                "stage": normalized_stage,
+                "processed_count": processed_count,
+                "total_count": total_count,
+                "current_item": current_item,
+                "detail_message": detail_message,
+            }
+            if all(snapshot.get(key) == last_snapshot.get(key) for key in snapshot):
                 return
-            last_progress["value"] = progress
+            last_snapshot.update(snapshot)
             with SessionLocal() as progress_db:
                 task = progress_db.query(DatasetUploadTask).filter(DatasetUploadTask.task_id == str(task_id)).first()
                 if not task or str(task.status) in {"done", "failed", "cancelled"}:
                     return
+                progress_value = max(progress, int(task.progress or 0))
                 self._update_task(
                     progress_db,
                     task,
-                    status=str(stage or "validating"),
-                    stage=str(stage or "validating"),
-                    progress=progress,
+                    status=normalized_stage,
+                    stage=normalized_stage,
+                    progress=progress_value,
+                    processed_count=processed_count,
+                    total_count=total_count,
+                    current_item=current_item,
+                    detail_message=detail_message,
                 )
 
         return _callback

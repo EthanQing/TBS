@@ -19,7 +19,7 @@
 - 分片上传状态持久化在数据库和 `BASE_UPLOAD_SESSIONS_DIR`。
 - 离线导入根目录来自 `BASE_IMPORTS_DIR` 和 `DATASET_IMPORT_ROOTS`。
 - 上传/导入完成后通常返回 `task_id`，前端通过 `/api/v3/dataset-upload-tasks/{task_id}` 查询后台进度。
-- ZIP 上传任务会先进入 `extracting` 阶段，`safe_extract_zip` 按已解压文件数回调更新任务进度；解压完成后再进入 `validating`、索引和版本更新流程。违规数据集版本创建会在导入事务之外更新任务进度，依次暴露 `validating`、`materializing`、`indexing`、`finalizing`，但不再生成样本预览索引或缩略图，避免大数据集刷新后长时间停在 75%。违规数据集挂载导入使用轻量 manifest：LabelMe/JSON 目录只做图片/JSON 配对、读取 JSON 标签、记录挂载源文件和版本索引，不读取图片尺寸、不生成 YOLO labels/data.yaml；YOLO 转换延后到发布标准数据集阶段。
+- ZIP 上传任务会先进入 `extracting` 阶段，`safe_extract_zip` 按已解压文件数回调更新任务进度；解压完成后再进入 `validating`、索引和版本更新流程。违规数据集版本创建会在导入事务之外更新任务进度，依次暴露 `validating`、`materializing`、`indexing`、`finalizing`，并通过 `dataset_upload_tasks.processed_count`、`total_count`、`current_item`、`detail_message` 返回处理数量和当前项。违规数据集版本创建不再生成样本预览索引或缩略图，避免大数据集刷新后长时间停在 75%。违规数据集挂载导入使用轻量 manifest：LabelMe/JSON 目录只做图片/JSON 配对、并行读取 JSON 标签、记录挂载源文件和版本索引，不读取图片尺寸、不生成 YOLO labels/data.yaml；YOLO 转换延后到发布标准数据集阶段。并行度由 `DATASET_IMPORT_MAX_WORKERS` 控制，默认 `min(8, cpu_count)`。
 
 修改这条链路时同时检查标准数据集和违规数据集是否需要保持一致。
 

@@ -182,19 +182,51 @@ class IllegalDatasetService:
         db.flush()
         return row
 
-    def _index_version_images(self, db: Session, dataset: IllegalDataset, version: IllegalDatasetVersion) -> None:
+    def _index_version_images(
+        self,
+        db: Session,
+        dataset: IllegalDataset,
+        version: IllegalDatasetVersion,
+        *,
+        progress_callback: Callable[..., None] | None = None,
+        progress_start: int = 92,
+        progress_end: int = 96,
+    ) -> None:
         db.query(IllegalDatasetImage).filter(IllegalDatasetImage.version_id == int(version.version_id)).delete()
         manifest = load_version_manifest(version)
         image_paths = image_rel_paths_from_manifest(manifest)
-        for rel in image_paths:
-            db.add(
+        if not image_paths:
+            db.flush()
+            return
+        chunk_size = 1000
+        total = len(image_paths)
+        for start in range(0, total, chunk_size):
+            chunk = image_paths[start : start + chunk_size]
+            rows = [
                 IllegalDatasetImage(
                     illegal_dataset_id=int(dataset.illegal_dataset_id),
                     version_id=int(version.version_id),
                     path=rel,
                     split=detect_split_from_relpath(rel),
                 )
-            )
+                for rel in chunk
+            ]
+            db.add_all(rows)
+            db.flush()
+            done = min(total, start + len(chunk))
+            if progress_callback:
+                span = max(0, int(progress_end) - int(progress_start))
+                progress = int(progress_start) + int(round(span * done / max(1, total)))
+                progress_callback(
+                    progress,
+                    "indexing",
+                    {
+                        "processed_count": done,
+                        "total_count": total,
+                        "current_item": chunk[-1] if chunk else None,
+                        "detail_message": f"Indexed {done}/{total} images",
+                    },
+                )
         db.flush()
 
     def _refresh_version_raw_labels_cache(
@@ -574,7 +606,7 @@ class IllegalDatasetService:
         created_by: str | None = None,
         append: bool = False,
         filename: str | None = None,
-        progress_callback: Callable[[int, str], None] | None = None,
+        progress_callback: Callable[..., None] | None = None,
     ) -> IllegalDataset:
         row = self.get_dataset(db, illegal_dataset_id)
         with self._dataset_lock(int(row.illegal_dataset_id)):
@@ -612,20 +644,32 @@ class IllegalDatasetService:
         filename: str | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
     ) -> IllegalDataset:
-        def _progress(progress: int, stage: str) -> None:
+        def _progress(progress: int, stage: str, detail: dict[str, Any] | None = None) -> None:
             if progress_callback:
-                progress_callback(progress, stage)
+                try:
+                    progress_callback(progress, stage, detail or {})
+                except TypeError:
+                    progress_callback(progress, stage)
+
+        def _manifest_progress(progress: int, stage: str, detail: dict[str, Any] | None = None) -> None:
+            mapped = 60 + int(round(15 * max(0, min(100, int(progress))) / 100))
+            _progress(mapped, stage, detail)
 
         row = self.get_dataset(db, illegal_dataset_id)
         with self._dataset_lock(int(row.illegal_dataset_id)):
-            _progress(60, "linking")
+            _progress(60, "linking", {"detail_message": "Preparing mounted import"})
             row = self._lock_dataset_for_version_create(db, row)
             latest = self.version_repo.get_latest(db, int(row.illegal_dataset_id))
             version_no = self._next_version_no(db, row)
             parent_version_id = int(latest.version_id) if latest and append else None
             active_root = self._root_path(row)
-            mounted = build_illegal_mounted_manifest(Path(source_root), prefer_yolo=True)
-            _progress(75, "validating")
+            mounted = build_illegal_mounted_manifest(
+                Path(source_root),
+                prefer_yolo=True,
+                progress_callback=_manifest_progress,
+                max_workers=settings.dataset_import_max_workers,
+            )
+            _progress(75, "validating", {"detail_message": "Writing mounted manifest"})
             files = {
                 safe_manifest_rel(rel): normalize_manifest_file_entry(entry)
                 for rel, entry in (mounted.get("files") or {}).items()
@@ -694,16 +738,16 @@ class IllegalDatasetService:
             db.add(version_row)
             db.flush()
             row.active_version_id = int(version_row.version_id)
-            _progress(88, "materializing")
+            _progress(88, "materializing", {"detail_message": "Switching active mounted version"})
             try:
                 remove_tree(active_root)
             except Exception:
                 pass
             active_root.mkdir(parents=True, exist_ok=True)
-            _progress(92, "indexing")
-            self._index_version_images(db, row, version_row)
+            _progress(92, "indexing", {"processed_count": 0, "total_count": image_count, "detail_message": "Indexing mounted images"})
+            self._index_version_images(db, row, version_row, progress_callback=progress_callback)
             self._refresh_version_raw_labels_cache(row, version_row, manifest=manifest)
-            _progress(98, "finalizing")
+            _progress(98, "finalizing", {"processed_count": image_count, "total_count": image_count, "detail_message": "Refreshing raw label cache"})
             self._add_event(
                 db,
                 int(row.illegal_dataset_id),

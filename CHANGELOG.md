@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added detailed dataset import task progress fields and sped up illegal
+  mounted LabelMe/JSON imports with parallel JSON parsing plus batched image
+  indexing.
 - Mounted host `./TBS/imports` to backend container `/app/imports` in the
   compose files so the default offline import directory is visible in Docker.
 - Made illegal dataset mounted LabelMe/JSON imports lightweight by recording
