@@ -141,9 +141,9 @@ Portable layout:
   dependencies installed.
 - `runtime/mariadb/`: MariaDB/MySQL Windows ZIP runtime.
 - `app/TBS/`: this backend runtime, `alembic.ini`, requirements, and optional
-  PaddleDetection checkout. Customer packages use the protected runtime
-  assembled by `train_platform.core.build_protected_runtime` instead of copying
-  raw service/worker sources.
+  PaddleDetection checkout. Customer packages use the Cython-protected runtime
+  assembled by `train_platform.core.build_protected_runtime`; service and worker
+  implementations are shipped as native extensions instead of raw sources.
 - `app/TFS/dist/`: built frontend static files.
 - `data/`: MySQL data, datasets, imports, training runs, temp files, and
   pre-trained models.
@@ -161,12 +161,25 @@ the launcher stops the local runtime stack.
 
 Build the portable package from the outer workspace:
 
-```powershell
-tools/windows-portable/build-windows-portable.ps1 `
-  -OutputDir outputs/train-platform-windows-portable `
-  -LicenseFile C:\secrets\license.dat `
-  -PythonRuntimeDir C:\runtimes\python `
-  -MariaDbRuntimeDir C:\runtimes\mariadb
+```nu
+let build_args = [
+  '-NoProfile'
+  '-ExecutionPolicy'
+  'Bypass'
+  '-File'
+  'tools\windows-portable\build-windows-portable.ps1'
+  '-OutputDir'
+  'outputs\train-platform-windows-portable'
+  '-LicenseFile'
+  'C:\secrets\license.dat'
+  '-BuildPythonExe'
+  'C:\Python310\python.exe'
+  '-PythonRuntimeDir'
+  'C:\runtimes\python'
+  '-MariaDbRuntimeDir'
+  'C:\runtimes\mariadb'
+]
+^powershell.exe ...$build_args
 ```
 
 ## Worker Processes

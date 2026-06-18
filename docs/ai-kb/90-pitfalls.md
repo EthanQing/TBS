@@ -116,9 +116,11 @@ Ultralytics `model.export(format="onnx")` 可能返回实际输出路径，也�
 
 Windows + CUDA + PyTorch DataLoader pinned memory 组合可能在 Ultralytics 验证阶段报 `CUDA error: resource already mapped`，栈里通常出现 `torch/utils/data/_utils/pin_memory.py`。平台 YOLO 插件在 Windows 默认关闭 Ultralytics dataloader `pin_memory`；如确需恢复，可通过训练任务 `additional_params.pin_memory=true` 覆盖。遇到该错误时优先重试新任务，并确认 worker 日志中的 `Ultralytics dataloader pin_memory=false`。
 
-## Worker 镜像 pyc 编译版本必须匹配运行时
+## Worker 镜像 Cython 扩展必须匹配运行时 ABI
 
-`Dockerfile.worker.yolo` 的源码保护阶段可能在 PyArmor 失败时回退到 pyc-only protection。生成 `.pyc` 的 Python 版本必须与最终 `pytorch/pytorch` 运行时里的 Python 版本一致；否则容器启动或导入 worker 模块会报 `bad magic number`。当前 YOLO worker runtime 是 Python 3.11，因此 source-protector stage 也应使用 Python 3.11。
+Docker 客户镜像的源码保护统一使用 Cython。生成 `.so` 的 Python minor 版本、架构和 libc 环境必须与最终 worker runtime 一致；否则容器启动或导入 worker 模块会报扩展加载错误。worker 镜像的 source-protector 阶段应使用与最终 runtime 相同的基础镜像系列，不要用通用 `python:3.10-slim` 编译后复制进 Python 3.11 或不同发行版的 runtime。
+
+`worker.py`、`yolo_worker.py`、`paddle_worker.py`、`inference_worker.py`、`paddle_inference_worker.py` 和 `workers/training/train_entry.py` 是保留给 `python -m` 的薄壳。不要把它们编译成 Cython 扩展；核心实现应放在对应 `*_impl.py`。
 
 ## Worker 镜像 entrypoint 要去除 CRLF
 

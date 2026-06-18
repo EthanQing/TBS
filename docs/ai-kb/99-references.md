@@ -92,4 +92,5 @@ git check-ignore -v docs/ai-kb/00-index.md
 - 后端依赖：`requirements/backend.txt`
 - Worker 依赖：`requirements/worker*.txt`
 - 打包脚本：`setup.py`
+- 受保护运行时构建：`train_platform/core/build_protected_runtime.py` 调用 `setup.py build_ext`，用 Cython 编译 `services/` 和 `workers/` 核心实现。
 - Docker：`Dockerfile.backend`、`Dockerfile.worker.yolo`、`Dockerfile.worker.paddle`、`docker/entrypoint.sh`

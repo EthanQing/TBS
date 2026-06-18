@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-from train_platform.workers.worker import DbQueueWorker
-
-
-def main() -> None:
-    # Dedicated entrypoint for PaddleDetection training jobs.
-    DbQueueWorker(worker_id="worker-paddle", allowed_engines={"paddle-det"}).run_forever()
+from train_platform.workers.paddle_worker_impl import *  # noqa: F401,F403
+from train_platform.workers.paddle_worker_impl import main
 
 
 if __name__ == "__main__":

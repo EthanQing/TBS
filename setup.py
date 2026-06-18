@@ -91,6 +91,12 @@ def _build_extensions() -> list[Extension]:
         "train_platform/api/**/*.py",
         "train_platform/db/migrations/*.py",
         "train_platform/db/migrations/versions/*.py",
+        "train_platform/workers/worker.py",
+        "train_platform/workers/yolo_worker.py",
+        "train_platform/workers/paddle_worker.py",
+        "train_platform/workers/inference_worker.py",
+        "train_platform/workers/paddle_inference_worker.py",
+        "train_platform/workers/training/train_entry.py",
     ]
     exclude_globs = default_exclude_globs + _env_csv("CYTHON_EXCLUDE_GLOBS")
 
