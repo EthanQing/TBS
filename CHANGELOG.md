@@ -6,6 +6,9 @@
   deployments, including local MariaDB orchestration, Alembic migration,
   backend/worker startup, frontend static serving, and self-contained package
   scripts in the outer workspace.
+- Hardened the Windows portable customer package path so the launcher can inject
+  an embedded license through environment variables and the package can use the
+  same protected runtime strategy as the Docker images.
 - Improved dataset management list performance by adding a lightweight
   `include_statistics=false` mode for illegal dataset lists and supporting
   front-end tab caching with lazy per-dataset statistics loading.

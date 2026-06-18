@@ -7,7 +7,7 @@
 1. `uvicorn train_platform.app:app` 导入 app。
 2. `create_app()` 创建 FastAPI 实例，注册 `/api/v3` router 和静态目录。
 3. lifespan 启动时调用 `settings.ensure_dirs()` 创建运行目录。
-4. 调用 license 校验。
+4. 调用 license 校验；Docker 通常读取 `TRAIN_PLATFORM_LICENSE_PATH`，Windows portable 客户包由启动器注入 `TRAIN_PLATFORM_LICENSE_DATA_B64`。
 5. `init_db()` 检查 v3 表是否完整并写入默认架构、默认告警规则。
 6. 清理过期数据集上传 session。
 

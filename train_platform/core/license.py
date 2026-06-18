@@ -14,6 +14,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 PUBLIC_KEY_B64 = "qk/C58JiQDFp8UfxCp1TX+ABNZkD4yq+NsZ2LjNHuHE="
 DEFAULT_LICENSE_PATH = "/app/license/license.dat"
+LICENSE_DATA_ENV = "TRAIN_PLATFORM_LICENSE_DATA"
+LICENSE_DATA_B64_ENV = "TRAIN_PLATFORM_LICENSE_DATA_B64"
 
 
 class LicenseError(RuntimeError):
@@ -36,15 +38,10 @@ def assert_valid_license() -> LicenseInfo | None:
     if not license_required():
         return None
 
-    license_path = Path(os.getenv("TRAIN_PLATFORM_LICENSE_PATH", DEFAULT_LICENSE_PATH))
-    if not license_path.exists() or not license_path.is_file():
-        raise LicenseError(
-            f"License file not found: {license_path}. "
-            "Set TRAIN_PLATFORM_LICENSE_PATH or mount license.dat into /app/license."
-        )
-
     try:
-        raw = json.loads(license_path.read_text(encoding="utf-8"))
+        raw = json.loads(_load_license_text())
+    except LicenseError:
+        raise
     except Exception as e:
         raise LicenseError(f"Invalid license file format: {e}") from e
 
@@ -75,6 +72,27 @@ def assert_valid_license() -> LicenseInfo | None:
         raise LicenseError("Invalid license payload: deployment is required.")
 
     return LicenseInfo(customer=customer, deployment=deployment, expires_at=expires_at)
+
+
+def _load_license_text() -> str:
+    data_b64 = os.getenv(LICENSE_DATA_B64_ENV, "").strip()
+    if data_b64:
+        try:
+            return base64.b64decode(data_b64.encode("ascii"), validate=True).decode("utf-8")
+        except Exception as e:
+            raise LicenseError(f"Invalid base64 value for {LICENSE_DATA_B64_ENV}.") from e
+
+    data = os.getenv(LICENSE_DATA_ENV, "").strip()
+    if data:
+        return data
+
+    license_path = Path(os.getenv("TRAIN_PLATFORM_LICENSE_PATH", DEFAULT_LICENSE_PATH))
+    if not license_path.exists() or not license_path.is_file():
+        raise LicenseError(
+            f"License file not found: {license_path}. "
+            f"Set {LICENSE_DATA_B64_ENV}, TRAIN_PLATFORM_LICENSE_PATH, or mount license.dat into /app/license."
+        )
+    return license_path.read_text(encoding="utf-8")
 
 
 def _canonical_payload_bytes(payload: dict[str, Any]) -> bytes:

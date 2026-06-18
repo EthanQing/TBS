@@ -140,25 +140,31 @@ Portable layout:
 - `runtime/python/`: Python 3.10 x64 runtime with backend and worker
   dependencies installed.
 - `runtime/mariadb/`: MariaDB/MySQL Windows ZIP runtime.
-- `app/TBS/`: this backend, `alembic.ini`, requirements, optional license, and
-  optional PaddleDetection checkout.
+- `app/TBS/`: this backend runtime, `alembic.ini`, requirements, and optional
+  PaddleDetection checkout. Customer packages use the protected runtime
+  assembled by `train_platform.core.build_protected_runtime` instead of copying
+  raw service/worker sources.
 - `app/TFS/dist/`: built frontend static files.
 - `data/`: MySQL data, datasets, imports, training runs, temp files, and
   pre-trained models.
 - `logs/`: launcher and service logs.
 
-The launcher writes `app/TBS/.env`, initializes the bundled database on first
-run, applies Alembic migrations, starts FastAPI on `127.0.0.1:18001`, starts the
-YOLO worker, optionally starts the Paddle worker, and serves the frontend on
-`127.0.0.1:18581` with `/api`, `/static`, and WebSocket proxying to the backend.
-All child processes are attached to a Windows Job Object so stopping the
-launcher stops the local runtime stack.
+The launcher writes non-secret runtime settings to `app/TBS/.env`, initializes
+the bundled database on first run, applies Alembic migrations, starts FastAPI on
+`127.0.0.1:18001`, starts the YOLO worker, optionally starts the Paddle worker,
+and serves the frontend on `127.0.0.1:18581` with `/api`, `/static`, and
+WebSocket proxying to the backend. Customer packages embed `license.dat` inside
+`TrainPlatformLauncher.exe`; the launcher injects it through process
+environment variables and does not expose the license in the UI, `launcher.json`,
+or `.env`. All child processes are attached to a Windows Job Object so stopping
+the launcher stops the local runtime stack.
 
 Build the portable package from the outer workspace:
 
 ```powershell
 tools/windows-portable/build-windows-portable.ps1 `
   -OutputDir outputs/train-platform-windows-portable `
+  -LicenseFile C:\secrets\license.dat `
   -PythonRuntimeDir C:\runtimes\python `
   -MariaDbRuntimeDir C:\runtimes\mariadb
 ```
@@ -237,6 +243,17 @@ Optional overrides:
 - `WORKER_HEARTBEAT_INTERVAL`
 - `WORKER_STALE_AFTER_SECONDS`
 - `WORKER_BIND_HOST`
+
+### License
+
+- `TRAIN_PLATFORM_LICENSE_REQUIRED`
+- `TRAIN_PLATFORM_LICENSE_PATH`
+- `TRAIN_PLATFORM_LICENSE_DATA_B64`
+- `TRAIN_PLATFORM_LICENSE_DATA`
+
+`TRAIN_PLATFORM_LICENSE_PATH` keeps the Docker/file-based deployment flow.
+Windows portable customer packages prefer `TRAIN_PLATFORM_LICENSE_DATA_B64`,
+which is supplied by the launcher from its embedded license resource.
 
 ### Storage
 
