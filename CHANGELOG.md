@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added a Windows portable launcher workflow for no-Docker/no-WSL customer
+  deployments, including local MariaDB orchestration, Alembic migration,
+  backend/worker startup, frontend static serving, and self-contained package
+  scripts in the outer workspace.
 - Improved dataset management list performance by adding a lightweight
   `include_statistics=false` mode for illegal dataset lists and supporting
   front-end tab caching with lazy per-dataset statistics loading.

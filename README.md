@@ -128,6 +128,41 @@ Available endpoints after startup:
 - Swagger UI: `http://127.0.0.1:18000/docs`
 - OpenAPI schema: `http://127.0.0.1:18000/openapi.json`
 
+## Windows Portable Launcher
+
+The outer `train` workspace includes a Windows-only portable launcher for
+customer sites that cannot install Docker or WSL. The launcher is built from
+`launcher/windows/TrainPlatformLauncher.csproj` and distributed as
+`TrainPlatformLauncher.exe` in a self-contained package.
+
+Portable layout:
+
+- `runtime/python/`: Python 3.10 x64 runtime with backend and worker
+  dependencies installed.
+- `runtime/mariadb/`: MariaDB/MySQL Windows ZIP runtime.
+- `app/TBS/`: this backend, `alembic.ini`, requirements, optional license, and
+  optional PaddleDetection checkout.
+- `app/TFS/dist/`: built frontend static files.
+- `data/`: MySQL data, datasets, imports, training runs, temp files, and
+  pre-trained models.
+- `logs/`: launcher and service logs.
+
+The launcher writes `app/TBS/.env`, initializes the bundled database on first
+run, applies Alembic migrations, starts FastAPI on `127.0.0.1:18001`, starts the
+YOLO worker, optionally starts the Paddle worker, and serves the frontend on
+`127.0.0.1:18581` with `/api`, `/static`, and WebSocket proxying to the backend.
+All child processes are attached to a Windows Job Object so stopping the
+launcher stops the local runtime stack.
+
+Build the portable package from the outer workspace:
+
+```powershell
+tools/windows-portable/build-windows-portable.ps1 `
+  -OutputDir outputs/train-platform-windows-portable `
+  -PythonRuntimeDir C:\runtimes\python `
+  -MariaDbRuntimeDir C:\runtimes\mariadb
+```
+
 ## Worker Processes
 
 Generic training worker:
