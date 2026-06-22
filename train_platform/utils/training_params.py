@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -98,19 +99,59 @@ def selected_gpu_count(device_spec: Any) -> int:
     return len(extract_selected_gpu_ids(device_spec))
 
 
-def build_device_runtime(device_spec: Any) -> dict[str, str | None]:
+def parse_visible_host_gpu_ids(value: Any | None = None) -> list[int] | None:
+    """
+    Parse a Docker/NVIDIA visible-device list as host GPU ids.
+
+    Returns None when the runtime exposes all GPUs or uses non-numeric device
+    handles such as GPU UUIDs, because those cannot be mapped from the numeric
+    training task device field.
+    """
+    raw = os.getenv("NVIDIA_VISIBLE_DEVICES") if value is None else value
+    text = str(raw or "").strip()
+    if not text:
+        return None
+
+    lowered = text.lower()
+    if lowered == "all":
+        return None
+    if lowered in {"none", "void"}:
+        return []
+
+    parsed = _parse_gpu_id_tokens(text)
+    return _dedupe_gpu_ids(parsed) if parsed else None
+
+
+def worker_can_run_device(device_spec: Any, visible_host_gpu_ids: list[int] | None = None) -> bool:
+    requested = normalize_device_spec(device_spec)
+    if requested in {"auto", "cpu"}:
+        return True
+
+    selected_gpu_ids = extract_selected_gpu_ids(requested)
+    if not selected_gpu_ids or visible_host_gpu_ids is None:
+        return True
+
+    visible_set = set(int(idx) for idx in visible_host_gpu_ids)
+    return all(int(idx) in visible_set for idx in selected_gpu_ids)
+
+
+def build_device_runtime(device_spec: Any, visible_host_gpu_ids: list[int] | None = None) -> dict[str, str | None]:
     """
     Build per-process device runtime settings.
 
     For explicit GPU selection we isolate the training subprocess with
-    `CUDA_VISIBLE_DEVICES=<requested ids>` and remap the device argument to the
-    local visible index space expected by deep learning runtimes.
+    `CUDA_VISIBLE_DEVICES` and remap the device argument to the local visible
+    index space expected by deep learning runtimes.
 
     Examples:
       - "auto"   -> {"requested": "auto", "runtime_device": "auto", "cuda_visible_devices": None}
       - "cpu"    -> {"requested": "cpu",  "runtime_device": "cpu",  "cuda_visible_devices": ""}
       - "1"      -> {"requested": "1",    "runtime_device": "0",    "cuda_visible_devices": "1"}
       - "2,5"    -> {"requested": "2,5",  "runtime_device": "0,1",  "cuda_visible_devices": "2,5"}
+
+    In a Docker worker already restricted by `NVIDIA_VISIBLE_DEVICES`, pass the
+    host GPU ids visible to the container. For example, task device "1" inside a
+    container with `NVIDIA_VISIBLE_DEVICES=1` becomes local device "0".
     """
     requested = normalize_device_spec(device_spec)
     if requested == "cpu":
@@ -126,6 +167,21 @@ def build_device_runtime(device_spec: Any) -> dict[str, str | None]:
             "requested": requested,
             "runtime_device": requested,
             "cuda_visible_devices": None,
+        }
+
+    if visible_host_gpu_ids is not None:
+        missing = [idx for idx in selected_gpu_ids if idx not in visible_host_gpu_ids]
+        if missing:
+            visible_text = ",".join(str(idx) for idx in visible_host_gpu_ids) or "<none>"
+            raise ValueError(
+                f"Requested GPU device(s) {requested} are not visible to this worker "
+                f"(NVIDIA_VISIBLE_DEVICES={visible_text})"
+            )
+        local_gpu_ids = [visible_host_gpu_ids.index(idx) for idx in selected_gpu_ids]
+        return {
+            "requested": requested,
+            "runtime_device": ",".join(str(idx) for idx in range(len(local_gpu_ids))),
+            "cuda_visible_devices": ",".join(str(idx) for idx in local_gpu_ids),
         }
 
     return {

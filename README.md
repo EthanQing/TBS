@@ -203,6 +203,9 @@ falls back to `worker-yolo` when the variable is not set, and uses the provided
 value as-is in queue claims, events, and logs. For multi-GPU Docker deployments,
 also verify the GPU visibility inside each container because `WORKER_ID` only
 identifies the queue worker; it does not bind the process to a GPU by itself.
+Explicit training devices such as `device=0` and `device=1` use host GPU ids;
+Docker workers restricted by numeric `NVIDIA_VISIBLE_DEVICES` remap those ids
+to container-local CUDA ids before launching the training process.
 
 The YOLO worker also polls queued model-conversion jobs from
 `temp/model_conversions` and runs PT/PTH -> ONNX conversion locally in the

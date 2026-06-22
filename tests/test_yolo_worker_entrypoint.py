@@ -4,7 +4,7 @@ import pytest
 
 
 def test_yolo_worker_uses_worker_id_env(monkeypatch):
-    from train_platform.workers import yolo_worker
+    from train_platform.workers import yolo_worker_impl
 
     seen = {}
 
@@ -28,12 +28,13 @@ def test_yolo_worker_uses_worker_id_env(monkeypatch):
             pass
 
     monkeypatch.setenv("WORKER_ID", "custom-yolo-worker-a")
-    monkeypatch.setattr(yolo_worker, "DbQueueWorker", FakeTrainingWorker)
-    monkeypatch.setattr(yolo_worker, "ModelConversionQueueWorker", FakeConversionWorker)
-    monkeypatch.setattr(yolo_worker, "settings", SimpleNamespace(ensure_dirs=lambda: None))
+    monkeypatch.setattr(yolo_worker_impl, "DbQueueWorker", FakeTrainingWorker)
+    monkeypatch.setattr(yolo_worker_impl, "ModelConversionQueueWorker", FakeConversionWorker)
+    monkeypatch.setattr(yolo_worker_impl, "settings", SimpleNamespace(ensure_dirs=lambda: None))
+    monkeypatch.setattr(yolo_worker_impl, "_start_inference_worker_if_needed", lambda: None)
 
     with pytest.raises(KeyboardInterrupt):
-        yolo_worker.main()
+        yolo_worker_impl.main()
 
     assert seen["worker_id"] == "custom-yolo-worker-a"
     assert seen["conversion_worker_id"] == "custom-yolo-worker-a"

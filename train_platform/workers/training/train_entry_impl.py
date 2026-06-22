@@ -21,7 +21,7 @@ from train_platform.training.registry import get_trainer
 from train_platform.utils.path_utils import resolve_dataset_path
 from train_platform.utils.mlflow_utils import init_mlflow_logger
 from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
-from train_platform.utils.training_params import build_device_runtime
+from train_platform.utils.training_params import build_device_runtime, parse_visible_host_gpu_ids
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
 
@@ -215,7 +215,11 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 0
             return exit_code
 
-        device_runtime = build_device_runtime(getattr(run.parameters, "device", "auto") or "auto")
+        visible_host_gpu_ids = parse_visible_host_gpu_ids()
+        device_runtime = build_device_runtime(
+            getattr(run.parameters, "device", "auto") or "auto",
+            visible_host_gpu_ids=visible_host_gpu_ids,
+        )
         requested_device = str(device_runtime.get("requested") or "auto")
         runtime_device = str(device_runtime.get("runtime_device") or requested_device)
         visible_devices = device_runtime.get("cuda_visible_devices")
@@ -228,7 +232,8 @@ def main(argv: list[str] | None = None) -> int:
             f"run_id={run_id} "
             f"requested={requested_device} "
             f"runtime={runtime_device} "
-            f"cuda_visible_devices={os.getenv('CUDA_VISIBLE_DEVICES', '<inherit>')}",
+            f"cuda_visible_devices={os.getenv('CUDA_VISIBLE_DEVICES', '<inherit>')} "
+            f"nvidia_visible_devices={os.getenv('NVIDIA_VISIBLE_DEVICES', '<inherit>')}",
             flush=True,
         )
 

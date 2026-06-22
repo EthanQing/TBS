@@ -20,6 +20,7 @@ from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun, TrainingRunEvent
 from train_platform.services.v3.alarm_service import AlarmService
 from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
+from train_platform.utils.training_params import parse_visible_host_gpu_ids, worker_can_run_device
 
 
 def _utcnow() -> datetime:
@@ -141,6 +142,7 @@ class DbQueueWorker:
             if allowed_engines is not None
             else _parse_worker_engines(os.getenv("WORKER_ENGINES"))
         )
+        self.visible_host_gpu_ids = parse_visible_host_gpu_ids()
 
         self._running: Optional[RunningJob] = None
         self._last_heartbeat_at: Optional[datetime] = None
@@ -275,7 +277,12 @@ class DbQueueWorker:
             except Exception:
                 pass
 
-            run = q.first()
+            run = None
+            for candidate in q.limit(50).all():
+                device_spec = getattr(getattr(candidate, "parameters", None), "device", "auto")
+                if worker_can_run_device(device_spec, self.visible_host_gpu_ids):
+                    run = candidate
+                    break
             if not run:
                 return
 

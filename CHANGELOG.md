@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed multi-GPU Docker YOLO worker routing so workers restricted by
+  `NVIDIA_VISIBLE_DEVICES` only claim matching explicit GPU tasks and remap host
+  GPU ids to container-local CUDA ids before launching training.
 - Switched protected Docker runtimes back to `.pyc` protection for core service
   code and selected training worker modules, keeping FastAPI sidecars as Python
   source so route signature inspection works.
