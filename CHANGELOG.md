@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Expanded `pyproject.toml` and `uv.lock` to support `uv sync` on Linux/Ubuntu
+  while keeping Windows support, with platform-specific PaddlePaddle GPU pins to
+  avoid Linux cuDNN conflicts with PyTorch CUDA 11.8.
 - Fixed multi-GPU Docker YOLO worker routing so workers restricted by
   `NVIDIA_VISIBLE_DEVICES` only claim matching explicit GPU tasks and remap host
   GPU ids to container-local CUDA ids before launching training.

@@ -23,9 +23,11 @@ dependencies = [
   "torchvision==0.19.1",
   "ultralytics==8.4.14",
 
-  # PaddlePaddle GPU for Windows CUDA 11.8
-  # Paddle 官方 Windows CUDA 11.8 文档当前推荐 3.2.2。
-  "paddlepaddle-gpu==3.2.2",
+  # PaddlePaddle GPU for CUDA 11.8.
+  # Windows 当前推荐 3.2.2；Linux 先沿用 worker requirements 中验证过的 2.6.2，
+  # 避免与 torch 2.4.1+cu118 的 Linux cuDNN 依赖冲突。
+  "paddlepaddle-gpu==3.2.2; sys_platform == 'win32'",
+  "paddlepaddle-gpu==2.6.2; sys_platform == 'linux'",
 
   # PaddleDetection 2.6.0 需要 numpy<1.24
   "numpy==1.23.5",
@@ -72,10 +74,10 @@ dependencies = [
 ]
 
 [tool.uv]
-# 你只关心 Windows，就只解析 Windows。
-# 这样不会再触发 Linux 下 torch/paddle 的 cudnn 冲突。
+# 同时解析 Windows 和 Linux，保证 Windows 开发环境与 Ubuntu 部署环境都能 uv sync。
 environments = [
   "sys_platform == 'win32'",
+  "sys_platform == 'linux'",
 ]
 
 # 关键：统一使用 PaddleDetection 源码 checkout，不安装 paddledet wheel。
@@ -99,13 +101,13 @@ explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu118", marker = "sys_platform == 'win32'" },
+  { index = "pytorch-cu118", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]
 
 torchvision = [
-  { index = "pytorch-cu118", marker = "sys_platform == 'win32'" },
+  { index = "pytorch-cu118", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]
 
 paddlepaddle-gpu = [
-  { index = "paddle-cu118", marker = "sys_platform == 'win32'" },
+  { index = "paddle-cu118", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]

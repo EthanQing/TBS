@@ -19,6 +19,7 @@
 安装：
 
 ```bash
+uv sync
 pip install -r requirements/backend.txt
 pip install -e .
 ```
@@ -91,7 +92,7 @@ git check-ignore -v docs/ai-kb/00-index.md
 
 ## 依赖入口
 
-- 项目元数据：`pyproject.toml`
+- 项目元数据：`pyproject.toml`，`uv sync` 支持 Windows 和 Linux/Ubuntu；Windows 使用 `paddlepaddle-gpu==3.2.2`，Linux 使用 `paddlepaddle-gpu==2.6.2`
 - 锁文件：`uv.lock`
 - 后端依赖：`requirements/backend.txt`
 - Worker 依赖：`requirements/worker*.txt`

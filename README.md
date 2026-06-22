@@ -76,6 +76,17 @@ cp .env.example .env
 
 ### 2. Install dependencies
 
+Using `uv` from project metadata and `uv.lock`:
+
+```bash
+uv sync
+```
+
+The lockfile supports both Windows and Linux. On Linux/Ubuntu, `uv sync` uses
+the CUDA 11.8 PyTorch source and pins `paddlepaddle-gpu==2.6.2` to avoid the
+Linux cuDNN dependency conflict between newer PaddlePaddle GPU wheels and
+`torch==2.4.1+cu118`.
+
 Using `pip` with the backend requirements file:
 
 ```bash
