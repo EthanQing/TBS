@@ -45,7 +45,7 @@
 - Paddle worker、PaddleDetection 相关逻辑、worker 依赖或 `Dockerfile.worker.paddle` 变化：`docker build -f Dockerfile.worker.paddle -t tbs-worker-paddle:plain .`
 - 仅文档、测试或不会进入镜像的运行时数据变化不需要构建镜像，但最终回复要说明跳过原因。
 
-Docker 客户镜像统一使用 Cython 保护 `train_platform/services/` 和 `train_platform/workers/` 核心实现。`build_protected_runtime` 会调用 `setup.py build_ext` 组装 `build/runtime`，source-protector 阶段必须安装 `requirements/build.txt` 和 C 编译工具。`worker.py`、`yolo_worker.py`、`paddle_worker.py`、`inference_worker.py`、`paddle_inference_worker.py`、`workers/training/train_entry.py` 是 `python -m` 入口壳，不要把业务逻辑重新写回这些壳文件；实际实现放在对应 `*_impl.py` 并由 Cython 编译。
+Docker 客户镜像统一使用 `.pyc` 保护核心代码。`build_protected_runtime` 会复制运行时源码树，然后把 `train_platform/services/` 和少量训练 worker 核心文件编译为同目录 `.pyc` 并删除对应 `.py`。API、migration、FastAPI sidecar、推理任务和模型转换 worker 保持 `.py`，避免框架反射或 `python -m` 入口失败。默认受保护 worker 文件是 `worker_impl.py`、`yolo_worker_impl.py`、`paddle_worker_impl.py`、`workers/training/train_entry_impl.py`、`workers/training/vdl_bridge.py`。
 
 ## 训练插件
 

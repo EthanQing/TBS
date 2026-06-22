@@ -141,9 +141,10 @@ Portable layout:
   dependencies installed.
 - `runtime/mariadb/`: MariaDB/MySQL Windows ZIP runtime.
 - `app/TBS/`: this backend runtime, `alembic.ini`, requirements, and optional
-  PaddleDetection checkout. Customer packages use the Cython-protected runtime
-  assembled by `train_platform.core.build_protected_runtime`; service and worker
-  implementations are shipped as native extensions instead of raw sources.
+  PaddleDetection checkout. Customer packages use the pyc-protected runtime
+  assembled by `train_platform.core.build_protected_runtime`; service modules
+  and selected training worker core files are shipped as bytecode instead of raw
+  sources.
 - `app/TFS/dist/`: built frontend static files.
 - `data/`: MySQL data, datasets, imports, training runs, temp files, and
   pre-trained models.

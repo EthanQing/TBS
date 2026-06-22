@@ -94,5 +94,5 @@ git check-ignore -v docs/ai-kb/00-index.md
 - 后端依赖：`requirements/backend.txt`
 - Worker 依赖：`requirements/worker*.txt`
 - 打包脚本：`setup.py`
-- 受保护运行时构建：`train_platform/core/build_protected_runtime.py` 调用 `setup.py build_ext`，用 Cython 编译 `services/` 和 `workers/` 核心实现。
+- 受保护运行时构建：`train_platform/core/build_protected_runtime.py` 复制运行时源码树，并把 `services/` 与少量训练 worker 核心文件编译为同目录 `.pyc` 后删除对应 `.py`。默认 worker 保护白名单是 `worker_impl.py`、`yolo_worker_impl.py`、`paddle_worker_impl.py`、`training/train_entry_impl.py`、`training/vdl_bridge.py`。API、migration、FastAPI sidecar、推理任务和模型转换 worker 保持 Python 源码。
 - Docker：`Dockerfile.backend`、`Dockerfile.worker.yolo`、`Dockerfile.worker.paddle`、`docker/entrypoint.sh`

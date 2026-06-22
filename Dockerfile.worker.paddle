@@ -1,21 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-# Build Cython-protected runtime sources using the same runtime family as the
-# final worker image, so compiled extensions match the Python ABI.
+# Build pyc-protected runtime sources using the same runtime family as the
+# final worker image, so bytecode matches the Python version.
 FROM paddlepaddle/paddle:2.6.2-gpu-cuda11.7-cudnn8.4-trt8.4 AS source-protector
 
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /build
 
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends build-essential; \
-    rm -rf /var/lib/apt/lists/*
-
-COPY requirements/build.txt ./requirements/build.txt
-RUN pip install --no-cache-dir -r requirements/build.txt
-COPY setup.py ./setup.py
 COPY train_platform/ ./train_platform/
 
 RUN python -m train_platform.core.build_protected_runtime --output /protected-runtime
@@ -52,8 +44,7 @@ RUN pip install --no-cache-dir \
     motmetrics \
     pyclipper \
     shapely \
-    terminaltables \
-    Cython
+    terminaltables
 
 # Clone PaddleDetection repo. The platform imports ppdet and official configs
 # from this checkout instead of the incomplete paddledet wheel.

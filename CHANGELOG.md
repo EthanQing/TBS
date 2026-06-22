@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Switched protected Docker runtimes back to `.pyc` protection for core service
+  code and selected training worker modules, keeping FastAPI sidecars as Python
+  source so route signature inspection works.
 - Fixed backend database connection pool exhaustion by making pool sizing
   configurable and releasing DB sessions during long dataset import, publish,
   model evaluation, and deployment runtime work.

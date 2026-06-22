@@ -1,22 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-# Build Cython-protected runtime sources. API/schema/migration code remains
-# readable for framework reflection; services/workers implementations compile
-# to native extensions.
+# Build pyc-protected runtime sources. API/schema/migration code remains
+# readable for framework reflection; services and training worker core are pyc-only.
 FROM python:3.10-slim-bookworm AS source-protector
 
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /build
 
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends build-essential; \
-    rm -rf /var/lib/apt/lists/*
-
-COPY requirements/build.txt ./requirements/build.txt
-RUN pip install --no-cache-dir -r requirements/build.txt
-COPY setup.py ./setup.py
 COPY train_platform/ ./train_platform/
 
 RUN python -m train_platform.core.build_protected_runtime --output /protected-runtime
