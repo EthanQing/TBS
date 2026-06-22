@@ -12,7 +12,7 @@ from typing import Any, Callable
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.db.session import SessionLocal
+from train_platform.db.session import SessionLocal, session_scope
 from train_platform.models.v3.dataset_upload import DatasetUploadSession, DatasetUploadTask
 from train_platform.services.v3.dataset_common import safe_extract_zip
 from train_platform.services.v3.dataset_import_service import DatasetImportService
@@ -348,107 +348,160 @@ class DatasetUploadService:
             raise NotFoundError("Dataset upload task not found")
         return task
 
+    def _snapshot_task(self, task: DatasetUploadTask) -> dict[str, Any]:
+        return {
+            "task_id": str(task.task_id),
+            "session_id": str(task.session_id or ""),
+            "dataset_kind": str(task.dataset_kind or ""),
+            "dataset_id": int(task.dataset_id),
+            "mode": str(task.mode or "upload"),
+            "source_path": str(task.source_path or ""),
+            "source_type": str(task.source_type or ""),
+            "created_by": task.created_by,
+            "message": task.message,
+        }
+
+    def _get_task_snapshot(self, task_id: str) -> dict[str, Any]:
+        with session_scope() as db:
+            return self._snapshot_task(self.get_task(db, task_id))
+
+    def _update_task_by_id(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        stage: str,
+        progress: int,
+        error_message: str | None = None,
+        processed_count: int | None = None,
+        total_count: int | None = None,
+        current_item: str | None = None,
+        detail_message: str | None = None,
+        finished: bool = False,
+    ) -> None:
+        with session_scope() as db:
+            task = self.get_task(db, task_id)
+            self._update_task(
+                db,
+                task,
+                status=status,
+                stage=stage,
+                progress=progress,
+                error_message=error_message,
+                processed_count=processed_count,
+                total_count=total_count,
+                current_item=current_item,
+                detail_message=detail_message,
+                finished=finished,
+            )
+
     def run_task(self, task_id: str) -> None:
         import_progress = self._make_import_progress_callback(task_id)
-        with SessionLocal() as db:
-            task = self.get_task(db, task_id)
-            try:
-                self._update_task(db, task, status="extracting", stage="extracting", progress=10, detail_message="Preparing dataset import")
-                source = Path(task.source_path)
-                logger.info("Dataset upload task started task_id=%s session_id=%s", task.task_id, task.session_id)
-                if task.dataset_kind == "standard":
-                    service = StandardDatasetService()
-                    if task.source_type == "dir_link":
-                        self._update_task(db, task, status="linking", stage="linking", progress=30, detail_message="Preparing mounted standard dataset import")
+        snapshot = self._get_task_snapshot(task_id)
+        try:
+            self._update_task_by_id(task_id, status="extracting", stage="extracting", progress=10, detail_message="Preparing dataset import")
+            source = Path(snapshot["source_path"])
+            logger.info("Dataset upload task started task_id=%s session_id=%s", snapshot["task_id"], snapshot["session_id"])
+            if snapshot["dataset_kind"] == "standard":
+                service = StandardDatasetService()
+                if snapshot["source_type"] == "dir_link":
+                    self._update_task_by_id(task_id, status="linking", stage="linking", progress=30, detail_message="Preparing mounted standard dataset import")
+                    with session_scope() as db:
                         service.import_mounted_source_tree(
                             db,
-                            int(task.dataset_id),
+                            int(snapshot["dataset_id"]),
                             source,
-                            created_by=task.created_by,
+                            created_by=snapshot["created_by"],
                             filename=source.name,
                         )
-                    elif task.source_type == "dir":
-                        self._update_task(db, task, status="validating", stage="validating", progress=30, detail_message="Validating standard dataset source")
+                elif snapshot["source_type"] == "dir":
+                    self._update_task_by_id(task_id, status="validating", stage="validating", progress=30, detail_message="Validating standard dataset source")
+                    with session_scope() as db:
                         service.import_source_tree(
                             db,
-                            int(task.dataset_id),
+                            int(snapshot["dataset_id"]),
                             source,
-                            created_by=task.created_by,
+                            created_by=snapshot["created_by"],
                             filename=source.name,
                         )
-                    else:
-                        extracted_root, staging = self._extract_archive_for_task(db, task, source)
-                        try:
-                            self._update_task(db, task, status="validating", stage="validating", progress=75, detail_message="Validating extracted standard dataset")
+                else:
+                    extracted_root, staging = self._extract_archive_for_task(task_id, source)
+                    try:
+                        self._update_task_by_id(task_id, status="validating", stage="validating", progress=75, detail_message="Validating extracted standard dataset")
+                        with session_scope() as db:
                             service.import_source_tree(
                                 db,
-                                int(task.dataset_id),
+                                int(snapshot["dataset_id"]),
                                 extracted_root,
-                                created_by=task.created_by,
+                                created_by=snapshot["created_by"],
                                 filename=source.name,
                             )
-                        finally:
-                            shutil.rmtree(staging, ignore_errors=True)
-                else:
-                    service = IllegalDatasetService()
-                    if task.source_type == "dir_link":
-                        self._update_task(db, task, status="linking", stage="linking", progress=30, detail_message="Preparing mounted illegal dataset import")
+                    finally:
+                        shutil.rmtree(staging, ignore_errors=True)
+            else:
+                service = IllegalDatasetService()
+                if snapshot["source_type"] == "dir_link":
+                    self._update_task_by_id(task_id, status="linking", stage="linking", progress=30, detail_message="Preparing mounted illegal dataset import")
+                    with session_scope() as db:
                         service.import_mounted_source_tree(
                             db,
-                            int(task.dataset_id),
+                            int(snapshot["dataset_id"]),
                             source,
-                            message=task.message,
-                            created_by=task.created_by,
-                            append=(task.mode == "append"),
+                            message=snapshot["message"],
+                            created_by=snapshot["created_by"],
+                            append=(snapshot["mode"] == "append"),
                             filename=source.name,
                             progress_callback=import_progress,
                         )
-                    elif task.source_type == "dir":
-                        self._update_task(db, task, status="validating", stage="validating", progress=30, detail_message="Validating illegal dataset source")
+                elif snapshot["source_type"] == "dir":
+                    self._update_task_by_id(task_id, status="validating", stage="validating", progress=30, detail_message="Validating illegal dataset source")
+                    with session_scope() as db:
                         service.import_source_tree(
                             db,
-                            int(task.dataset_id),
+                            int(snapshot["dataset_id"]),
                             source,
-                            message=task.message,
-                            created_by=task.created_by,
-                            append=(task.mode == "append"),
+                            message=snapshot["message"],
+                            created_by=snapshot["created_by"],
+                            append=(snapshot["mode"] == "append"),
                             filename=source.name,
                             progress_callback=import_progress,
                         )
-                    else:
-                        extracted_root, staging = self._extract_archive_for_task(db, task, source)
-                        try:
-                            self._update_task(db, task, status="validating", stage="validating", progress=75, detail_message="Validating extracted illegal dataset")
+                else:
+                    extracted_root, staging = self._extract_archive_for_task(task_id, source)
+                    try:
+                        self._update_task_by_id(task_id, status="validating", stage="validating", progress=75, detail_message="Validating extracted illegal dataset")
+                        with session_scope() as db:
                             service.import_source_tree(
                                 db,
-                                int(task.dataset_id),
+                                int(snapshot["dataset_id"]),
                                 extracted_root,
-                                message=task.message,
-                                created_by=task.created_by,
-                                append=(task.mode == "append"),
+                                message=snapshot["message"],
+                                created_by=snapshot["created_by"],
+                                append=(snapshot["mode"] == "append"),
                                 filename=source.name,
                                 progress_callback=import_progress,
                             )
-                        finally:
-                            shutil.rmtree(staging, ignore_errors=True)
-                task = self.get_task(db, task_id)
-                self._update_task(db, task, status="done", stage="done", progress=100, detail_message="Dataset import completed", finished=True)
-                self._cleanup_task_source(task)
-                logger.info("Dataset upload task finished task_id=%s", task.task_id)
-            except Exception as exc:
-                db.rollback()
-                task = self.get_task(db, task_id)
-                self._update_task(
-                    db,
-                    task,
-                    status="failed",
-                    stage="failed",
-                    progress=int(task.progress or 0),
-                    error_message=str(exc),
-                    detail_message="Dataset import failed",
-                    finished=True,
-                )
-                logger.exception("Dataset upload task failed task_id=%s session_id=%s", task.task_id, task.session_id)
+                    finally:
+                        shutil.rmtree(staging, ignore_errors=True)
+            self._update_task_by_id(task_id, status="done", stage="done", progress=100, detail_message="Dataset import completed", finished=True)
+            self._cleanup_task_source_by_snapshot(snapshot)
+            logger.info("Dataset upload task finished task_id=%s", snapshot["task_id"])
+        except Exception as exc:
+            try:
+                with session_scope() as db:
+                    task = self.get_task(db, task_id)
+                    self._update_task(
+                        db,
+                        task,
+                        status="failed",
+                        stage="failed",
+                        progress=int(task.progress or 0),
+                        error_message=str(exc),
+                        detail_message="Dataset import failed",
+                        finished=True,
+                    )
+            finally:
+                logger.exception("Dataset upload task failed task_id=%s session_id=%s", snapshot.get("task_id"), snapshot.get("session_id"))
 
     def _update_task(
         self,
@@ -481,18 +534,18 @@ class DatasetUploadService:
             task.finished_at = _utcnow()
         db.commit()
 
-    def _extract_archive_for_task(self, db: Session, task: DatasetUploadTask, source: Path) -> tuple[Path, Path]:
-        staging = settings.dataset_staging_dir / "upload-tasks" / str(task.task_id)
+    def _extract_archive_for_task(self, task_id: str, source: Path) -> tuple[Path, Path]:
+        staging = settings.dataset_staging_dir / "upload-tasks" / str(task_id)
         extracted_dir = staging / "extracted"
         shutil.rmtree(staging, ignore_errors=True)
-        self._update_task(db, task, status="extracting", stage="extracting", progress=10, detail_message="Extracting dataset archive")
+        self._update_task_by_id(task_id, status="extracting", stage="extracting", progress=10, detail_message="Extracting dataset archive")
         try:
             extracted_root = safe_extract_zip(
                 Path(source),
                 extracted_dir,
-                progress_callback=self._make_extract_progress_callback(db, task, start=10, end=70),
+                progress_callback=self._make_extract_progress_callback(task_id, start=10, end=70),
             )
-            self._update_task(db, task, status="extracting", stage="extracting", progress=70, detail_message="Archive extraction completed")
+            self._update_task_by_id(task_id, status="extracting", stage="extracting", progress=70, detail_message="Archive extraction completed")
             return extracted_root, staging
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
@@ -500,8 +553,7 @@ class DatasetUploadService:
 
     def _make_extract_progress_callback(
         self,
-        db: Session,
-        task: DatasetUploadTask,
+        task_id: str,
         *,
         start: int,
         end: int,
@@ -522,9 +574,8 @@ class DatasetUploadService:
             if progress <= int(last_progress["value"]):
                 return
             last_progress["value"] = progress
-            self._update_task(
-                db,
-                task,
+            self._update_task_by_id(
+                task_id,
                 status="extracting",
                 stage="extracting",
                 progress=progress,
@@ -583,6 +634,11 @@ class DatasetUploadService:
     def _cleanup_task_source(self, task: DatasetUploadTask) -> None:
         if task.session_id:
             shutil.rmtree(self._session_root(task.session_id), ignore_errors=True)
+
+    def _cleanup_task_source_by_snapshot(self, task: dict[str, Any]) -> None:
+        session_id = str(task.get("session_id") or "")
+        if session_id:
+            shutil.rmtree(self._session_root(session_id), ignore_errors=True)
 
     def cleanup_expired_sessions(self, db: Session) -> int:
         now = _utcnow()

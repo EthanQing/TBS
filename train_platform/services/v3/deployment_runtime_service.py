@@ -7,6 +7,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from PIL import Image
@@ -14,7 +15,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.db.session import SessionLocal
+from train_platform.db.session import session_scope
 from train_platform.models.v3.deployment import Deployment, DeploymentLog
 from train_platform.models.v3.deployment_run import DeploymentRun
 from train_platform.models.v3.enums import (
@@ -231,20 +232,45 @@ class DeploymentRuntimeService:
             t.start()
 
     def _run_pipeline(self, run_id: str) -> None:
-        with SessionLocal() as db:
+        snapshot = self._start_run_snapshot(run_id)
+        if not snapshot:
+            return
+        try:
+            model_context = self._step_validate_artifacts(str(run_id))
+            if self._check_cancelled_by_id(str(run_id)):
+                return
+
+            snapshot["model_context"] = model_context
+            adapter = get_deployment_adapter(snapshot["platform"])
+            ctx = self._make_adapter_context(snapshot)
+            adapter_prepare_output = adapter.prepare(ctx)
+            self._step_materialize_runtime(str(run_id), adapter_output=adapter_prepare_output)
+            if self._check_cancelled_by_id(str(run_id)):
+                return
+
+            self._step_smoke_test(str(run_id), model_context)
+            if self._check_cancelled_by_id(str(run_id)):
+                return
+
+            ctx = self._make_adapter_context(snapshot)
+            self._step_activate(str(run_id), adapter_output=adapter.activate(ctx))
+        except Exception as e:
+            self._fail_run(str(run_id), e)
+
+    def _start_run_snapshot(self, run_id: str) -> dict[str, Any] | None:
+        with session_scope() as db:
             run = db.query(DeploymentRun).filter(DeploymentRun.run_id == str(run_id)).first()
             if not run:
-                return
+                return None
             if run.status not in {DeploymentRunStatus.QUEUED, DeploymentRunStatus.RUNNING}:
-                return
+                return None
 
             deployment = db.query(Deployment).filter(Deployment.deployment_id == int(run.deployment_id)).first()
             if not deployment:
                 run.status = DeploymentRunStatus.FAILED
                 run.error_message = "Deployment not found"
                 run.finished_at = _utcnow()
-                db.commit()
-                return
+                return None
 
             run.status = DeploymentRunStatus.RUNNING
             run.phase = DeploymentRunPhase.PREPARING
@@ -252,50 +278,23 @@ class DeploymentRuntimeService:
             run.current_step = None
             run.progress = 1
             deployment.status = DeploymentStatus.DEPLOYING
-            db.commit()
+            return {
+                "run_id": str(run.run_id),
+                "deployment_id": int(run.deployment_id),
+                "project_id": int(run.project_id),
+                "model_version_id": int(run.model_version_id),
+                "platform": str(deployment.platform.value if hasattr(deployment.platform, "value") else deployment.platform),
+                "defaults": self._get_defaults(run),
+            }
 
-            try:
-                model_context = self._step_validate_artifacts(db, run, deployment)
-                if self._check_cancelled(db, run):
-                    return
-
-                adapter = get_deployment_adapter(deployment.platform)
-                ctx = DeploymentAdapterContext(
-                    deployment=deployment,
-                    run_id=str(run.run_id),
-                    model_context=model_context,
-                    defaults=self._get_defaults(run),
-                )
-                self._step_materialize_runtime(db, run, deployment, ctx, adapter_output=adapter.prepare(ctx))
-                if self._check_cancelled(db, run):
-                    return
-
-                self._step_smoke_test(db, run, deployment, model_context)
-                if self._check_cancelled(db, run):
-                    return
-
-                self._step_activate(db, run, deployment, ctx, adapter_output=adapter.activate(ctx))
-            except Exception as e:
-                run = db.query(DeploymentRun).filter(DeploymentRun.run_id == str(run_id)).first()
-                if not run:
-                    return
-                deployment = db.query(Deployment).filter(Deployment.deployment_id == int(run.deployment_id)).first()
-                run.status = DeploymentRunStatus.FAILED
-                run.error_message = f"{type(e).__name__}: {e}"
-                run.finished_at = _utcnow()
-                self._set_step_status(run, key=str(run.current_step or ""), status="failed", detail=str(e))
-                if deployment and deployment.status == DeploymentStatus.DEPLOYING:
-                    deployment.status = DeploymentStatus.FAILED
-                self._append_log(
-                    db,
-                    run=run,
-                    level=LogLevel.ERROR,
-                    message=f"Deployment run failed: {type(e).__name__}: {e}",
-                    step_key=run.current_step,
-                    action="failed",
-                    detail={"error": str(e)},
-                )
-                db.commit()
+    def _make_adapter_context(self, snapshot: dict[str, Any]) -> DeploymentAdapterContext:
+        deployment_ref = SimpleNamespace(deployment_id=int(snapshot["deployment_id"]))
+        return DeploymentAdapterContext(
+            deployment=deployment_ref,
+            run_id=str(snapshot["run_id"]),
+            model_context=dict(snapshot.get("model_context") or {}),
+            defaults=dict(snapshot.get("defaults") or {}),
+        )
 
     def _ensure_no_active_project_run(self, db: Session, *, project_id: int) -> None:
         row = (
@@ -318,120 +317,128 @@ class DeploymentRuntimeService:
             "iou": float(defaults.get("iou", 0.45)),
         }
 
-    def _step_validate_artifacts(self, db: Session, run: DeploymentRun, deployment: Deployment) -> Dict[str, Any]:
-        run.phase = DeploymentRunPhase.VALIDATE_ARTIFACTS
-        run.current_step = "validate_artifacts"
-        run.progress = 10
-        self._set_step_status(run, key="validate_artifacts", status="running")
-        self._append_log(
-            db,
-            run=run,
-            level=LogLevel.INFO,
-            message="Validating model artifacts",
-            step_key="validate_artifacts",
-            action="start",
-            detail=None,
-        )
-        db.commit()
+    def _step_validate_artifacts(self, run_id: str) -> Dict[str, Any]:
+        with session_scope() as db:
+            run = self.get_run(db, run_id)
+            run.phase = DeploymentRunPhase.VALIDATE_ARTIFACTS
+            run.current_step = "validate_artifacts"
+            run.progress = 10
+            self._set_step_status(run, key="validate_artifacts", status="running")
+            self._append_log(
+                db,
+                run=run,
+                level=LogLevel.INFO,
+                message="Validating model artifacts",
+                step_key="validate_artifacts",
+                action="start",
+                detail=None,
+            )
+            model_version_id = int(run.model_version_id)
 
-        model_context = self._infer.resolve_model_context(db, model_version_id=int(run.model_version_id))
-        self._set_step_status(run, key="validate_artifacts", status="completed")
-        run.progress = 25
-        self._append_log(
-            db,
-            run=run,
-            level=LogLevel.INFO,
-            message="Artifacts validated",
-            step_key="validate_artifacts",
-            action="completed",
-            detail={"engine": model_context.get("engine"), "weights_path": model_context.get("weights_path")},
-        )
-        db.commit()
+        with session_scope() as db:
+            model_context = self._infer.resolve_model_context(db, model_version_id=model_version_id)
+
+        with session_scope() as db:
+            run = self.get_run(db, run_id)
+            self._set_step_status(run, key="validate_artifacts", status="completed")
+            run.progress = 25
+            self._append_log(
+                db,
+                run=run,
+                level=LogLevel.INFO,
+                message="Artifacts validated",
+                step_key="validate_artifacts",
+                action="completed",
+                detail={"engine": model_context.get("engine"), "weights_path": model_context.get("weights_path")},
+            )
         return model_context
 
     def _step_materialize_runtime(
         self,
-        db: Session,
-        run: DeploymentRun,
-        deployment: Deployment,
-        ctx: DeploymentAdapterContext,
+        run_id: str,
         *,
         adapter_output: dict[str, Any],
     ) -> None:
-        run.phase = DeploymentRunPhase.MATERIALIZE_RUNTIME
-        run.current_step = "materialize_runtime"
-        run.progress = 35
-        self._set_step_status(run, key="materialize_runtime", status="running")
-        self._append_log(
-            db,
-            run=run,
-            level=LogLevel.INFO,
-            message="Materializing runtime",
-            step_key="materialize_runtime",
-            action="start",
-            detail=None,
-        )
+        with session_scope() as db:
+            run = self.get_run(db, run_id)
+            deployment = db.query(Deployment).filter(Deployment.deployment_id == int(run.deployment_id)).first()
+            if not deployment:
+                raise NotFoundError("Deployment not found")
+            run.phase = DeploymentRunPhase.MATERIALIZE_RUNTIME
+            run.current_step = "materialize_runtime"
+            run.progress = 35
+            self._set_step_status(run, key="materialize_runtime", status="running")
+            self._append_log(
+                db,
+                run=run,
+                level=LogLevel.INFO,
+                message="Materializing runtime",
+                step_key="materialize_runtime",
+                action="start",
+                detail=None,
+            )
 
-        endpoint = str(adapter_output.get("endpoint_url") or "").strip()
-        health = str(adapter_output.get("health_check_url") or "").strip()
-        if endpoint:
-            deployment.endpoint_url = endpoint
-        if health:
-            deployment.health_check_url = health
+            endpoint = str(adapter_output.get("endpoint_url") or "").strip()
+            health = str(adapter_output.get("health_check_url") or "").strip()
+            if endpoint:
+                deployment.endpoint_url = endpoint
+            if health:
+                deployment.health_check_url = health
 
-        cfg = dict(deployment.config or {})
-        cfg.setdefault("serving_defaults", {})
-        cfg["serving_defaults"]["conf"] = float(ctx.defaults.get("conf", 0.25))
-        cfg["serving_defaults"]["iou"] = float(ctx.defaults.get("iou", 0.45))
-        cfg["last_deployment_run_id"] = str(run.run_id)
-        cfg["last_materialized_at"] = _utcnow().isoformat()
-        deployment.config = cfg
+            defaults = self._get_defaults(run)
+            cfg = dict(deployment.config or {})
+            cfg.setdefault("serving_defaults", {})
+            cfg["serving_defaults"]["conf"] = float(defaults.get("conf", 0.25))
+            cfg["serving_defaults"]["iou"] = float(defaults.get("iou", 0.45))
+            cfg["last_deployment_run_id"] = str(run.run_id)
+            cfg["last_materialized_at"] = _utcnow().isoformat()
+            deployment.config = cfg
 
-        snapshot = run.snapshot if isinstance(run.snapshot, dict) else {}
-        pending_hash = str(snapshot.get("pending_api_key_hash") or "").strip()
-        if pending_hash:
-            deployment.api_key_hash = pending_hash
-            deployment.api_key_hint = str(snapshot.get("api_key_hint") or "") or None
+            snapshot = run.snapshot if isinstance(run.snapshot, dict) else {}
+            pending_hash = str(snapshot.get("pending_api_key_hash") or "").strip()
+            if pending_hash:
+                deployment.api_key_hash = pending_hash
+                deployment.api_key_hint = str(snapshot.get("api_key_hint") or "") or None
 
-        self._set_step_status(run, key="materialize_runtime", status="completed")
-        run.progress = 55
-        self._append_log(
-            db,
-            run=run,
-            level=LogLevel.INFO,
-            message="Runtime materialized",
-            step_key="materialize_runtime",
-            action="completed",
-            detail={"endpoint_url": deployment.endpoint_url, "health_check_url": deployment.health_check_url},
-        )
-        db.commit()
+            self._set_step_status(run, key="materialize_runtime", status="completed")
+            run.progress = 55
+            self._append_log(
+                db,
+                run=run,
+                level=LogLevel.INFO,
+                message="Runtime materialized",
+                step_key="materialize_runtime",
+                action="completed",
+                detail={"endpoint_url": deployment.endpoint_url, "health_check_url": deployment.health_check_url},
+            )
 
-    def _step_smoke_test(self, db: Session, run: DeploymentRun, deployment: Deployment, model_context: dict[str, Any]) -> None:
-        run.phase = DeploymentRunPhase.SMOKE_TEST
-        run.current_step = "smoke_test"
-        run.progress = 65
-        self._set_step_status(run, key="smoke_test", status="running")
-        self._append_log(
-            db,
-            run=run,
-            level=LogLevel.INFO,
-            message="Running smoke test inference",
-            step_key="smoke_test",
-            action="start",
-            detail=None,
-        )
-        db.commit()
+    def _step_smoke_test(self, run_id: str, model_context: dict[str, Any]) -> None:
+        with session_scope() as db:
+            run = self.get_run(db, run_id)
+            run.phase = DeploymentRunPhase.SMOKE_TEST
+            run.current_step = "smoke_test"
+            run.progress = 65
+            self._set_step_status(run, key="smoke_test", status="running")
+            self._append_log(
+                db,
+                run=run,
+                level=LogLevel.INFO,
+                message="Running smoke test inference",
+                step_key="smoke_test",
+                action="start",
+                detail=None,
+            )
+            defaults = self._get_defaults(run)
 
         smoke_dir = (settings.temp_dir / "deployment_smoke").resolve()
         smoke_dir.mkdir(parents=True, exist_ok=True)
-        smoke_image = smoke_dir / f"{run.run_id}.jpg"
+        smoke_image = smoke_dir / f"{run_id}.jpg"
         Image.new("RGB", (64, 64), color=(0, 0, 0)).save(smoke_image)
 
-        defaults = self._get_defaults(run)
-        out = self._infer.run_inference_output(
-            db,
-            model_version_id=int(run.model_version_id),
+        out = self._infer.run_inference_output_from_context(
+            model_context,
             input_path=str(smoke_image),
+            stored_token=str(smoke_image),
             conf=float(defaults["conf"]),
             iou=float(defaults["iou"]),
         )
@@ -442,25 +449,38 @@ class DeploymentRuntimeService:
         output = out.get("output") if isinstance(out.get("output"), dict) else {}
         preds = output.get("predictions") if isinstance(output, dict) else None
         pred_count = len(preds) if isinstance(preds, list) else 0
-        self._set_step_status(run, key="smoke_test", status="completed")
-        run.progress = 80
-        self._append_log(
-            db,
-            run=run,
-            level=LogLevel.INFO,
-            message="Smoke test passed",
-            step_key="smoke_test",
-            action="completed",
-            detail={"detections": pred_count, "inference_time_ms": out.get("inference_time_ms")},
-        )
-        db.commit()
+        with session_scope() as db:
+            run = self.get_run(db, run_id)
+            self._set_step_status(run, key="smoke_test", status="completed")
+            run.progress = 80
+            self._append_log(
+                db,
+                run=run,
+                level=LogLevel.INFO,
+                message="Smoke test passed",
+                step_key="smoke_test",
+                action="completed",
+                detail={"detections": pred_count, "inference_time_ms": out.get("inference_time_ms")},
+            )
 
     def _step_activate(
+        self,
+        run_id: str,
+        *,
+        adapter_output: dict[str, Any],
+    ) -> None:
+        with session_scope() as db:
+            run = self.get_run(db, run_id)
+            deployment = db.query(Deployment).filter(Deployment.deployment_id == int(run.deployment_id)).first()
+            if not deployment:
+                raise NotFoundError("Deployment not found")
+            self._step_activate_with_rows(db, run, deployment, adapter_output=adapter_output)
+
+    def _step_activate_with_rows(
         self,
         db: Session,
         run: DeploymentRun,
         deployment: Deployment,
-        ctx: DeploymentAdapterContext,
         *,
         adapter_output: dict[str, Any],
     ) -> None:
@@ -605,3 +625,30 @@ class DeploymentRuntimeService:
             dep.status = DeploymentStatus.PENDING
         db.commit()
         return True
+
+    def _check_cancelled_by_id(self, run_id: str) -> bool:
+        with session_scope() as db:
+            run = self.get_run(db, run_id)
+            return self._check_cancelled(db, run)
+
+    def _fail_run(self, run_id: str, exc: Exception) -> None:
+        with session_scope() as db:
+            run = db.query(DeploymentRun).filter(DeploymentRun.run_id == str(run_id)).first()
+            if not run:
+                return
+            deployment = db.query(Deployment).filter(Deployment.deployment_id == int(run.deployment_id)).first()
+            run.status = DeploymentRunStatus.FAILED
+            run.error_message = f"{type(exc).__name__}: {exc}"
+            run.finished_at = _utcnow()
+            self._set_step_status(run, key=str(run.current_step or ""), status="failed", detail=str(exc))
+            if deployment and deployment.status == DeploymentStatus.DEPLOYING:
+                deployment.status = DeploymentStatus.FAILED
+            self._append_log(
+                db,
+                run=run,
+                level=LogLevel.ERROR,
+                message=f"Deployment run failed: {type(exc).__name__}: {exc}",
+                step_key=run.current_step,
+                action="failed",
+                detail={"error": str(exc)},
+            )

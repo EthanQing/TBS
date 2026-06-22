@@ -243,11 +243,20 @@ starting an evaluation from the deployment center.
 - `MYSQL_HOST`
 - `MYSQL_PORT`
 - `MYSQL_DATABASE`
+- `DB_POOL_SIZE`
+- `DB_MAX_OVERFLOW`
+- `DB_POOL_TIMEOUT`
+- `DB_POOL_RECYCLE`
 
 Optional overrides:
 
 - `DATABASE_URL`
 - `ALEMBIC_DATABASE_URL`
+
+`DB_POOL_SIZE=20`, `DB_MAX_OVERFLOW=30`, `DB_POOL_TIMEOUT=60`, and
+`DB_POOL_RECYCLE=300` are the default backend pool settings for a single
+backend container. Tune them together with MySQL `max_connections` when running
+multiple backend replicas.
 
 ### Runtime and workers
 

@@ -59,6 +59,23 @@ def _default_illegal_dataset_publish_max_workers() -> int:
     return max(1, min(4, os.cpu_count() or 1))
 
 
+def _int_env(name: str, default: int, *, min_value: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or str(default))
+    except Exception:
+        value = int(default)
+    if min_value is not None:
+        value = max(int(min_value), int(value))
+    return int(value)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url_override: str | None = os.getenv("DATABASE_URL")
@@ -68,6 +85,11 @@ class Settings:
     mysql_host: str = os.getenv("MYSQL_HOST", "localhost")
     mysql_port: str = os.getenv("MYSQL_PORT", "3306")
     mysql_database: str = os.getenv("MYSQL_DATABASE", "train_backend_v2")
+    db_pool_size: int = _int_env("DB_POOL_SIZE", 20, min_value=1)
+    db_max_overflow: int = _int_env("DB_MAX_OVERFLOW", 30, min_value=0)
+    db_pool_timeout: int = _int_env("DB_POOL_TIMEOUT", 60, min_value=1)
+    db_pool_recycle: int = _int_env("DB_POOL_RECYCLE", 300, min_value=1)
+    db_pool_pre_ping: bool = _bool_env("DB_POOL_PRE_PING", True)
 
     home_dir: Path = Path(os.getenv("TRAIN_PLATFORM_HOME") or _default_home_dir()).resolve()
 
@@ -86,10 +108,10 @@ class Settings:
     inference_allowed_schemes: Tuple[str, ...] = _csv_env("INFERENCE_ALLOWED_SCHEMES", "http,https")
     inference_allowed_hosts: Tuple[str, ...] = _csv_env("INFERENCE_ALLOWED_HOSTS", "")
     worker_bind_host: str = os.getenv("WORKER_BIND_HOST", "").strip()
-    thumbnail_max_workers: int = int(os.getenv("THUMBNAIL_MAX_WORKERS", "4"))
-    thumbnail_first_page_prewarm: int = int(os.getenv("THUMBNAIL_FIRST_PAGE_PREWARM", "32"))
-    thumbnail_size: int = int(os.getenv("THUMBNAIL_SIZE", "200"))
-    view_index_max_workers: int = int(os.getenv("VIEW_INDEX_MAX_WORKERS", "8"))
+    thumbnail_max_workers: int = _int_env("THUMBNAIL_MAX_WORKERS", 4, min_value=1)
+    thumbnail_first_page_prewarm: int = _int_env("THUMBNAIL_FIRST_PAGE_PREWARM", 32, min_value=0)
+    thumbnail_size: int = _int_env("THUMBNAIL_SIZE", 200, min_value=1)
+    view_index_max_workers: int = _int_env("VIEW_INDEX_MAX_WORKERS", 8, min_value=1)
     dataset_import_max_workers: int = max(
         1,
         int(os.getenv("DATASET_IMPORT_MAX_WORKERS", str(_default_dataset_import_max_workers())) or str(_default_dataset_import_max_workers())),

@@ -109,7 +109,27 @@ class InferenceService:
 
         local_path, stored_token, derived_meta = self._materialize_input(input_path=input_path, image_url=image_url)
         ctx = self.resolve_model_context(db, model_version_id=int(model_version_id))
+        return self.run_inference_output_from_context(
+            ctx,
+            input_path=str(local_path),
+            stored_token=stored_token,
+            derived_meta=derived_meta,
+            conf=float(conf),
+            iou=float(iou),
+        )
 
+    def run_inference_output_from_context(
+        self,
+        ctx: Dict[str, Any],
+        *,
+        input_path: str,
+        stored_token: Optional[str] = None,
+        derived_meta: Optional[Dict[str, Any]] = None,
+        conf: float = 0.5,
+        iou: float = 0.45,
+    ) -> Dict[str, Any]:
+        local_path = Path(str(input_path))
+        token = str(stored_token or input_path)
         t0 = time.perf_counter()
         output = None
         err_msg = None
@@ -127,8 +147,8 @@ class InferenceService:
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         return {
-            "model_version_id": int(model_version_id),
-            "input_path": stored_token,
+            "model_version_id": int(ctx.get("model_version_id") or 0),
+            "input_path": token,
             "input_meta": {**(derived_meta or {}), "conf": float(conf), "iou": float(iou)},
             "output": output,
             "error_message": err_msg,

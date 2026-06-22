@@ -12,7 +12,7 @@ from train_platform.api.v3 import router as api_router
 from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
 from train_platform.db.init_db import init_db
-from train_platform.db.session import SessionLocal
+from train_platform.db.session import log_pool_configuration, session_scope
 from train_platform.services.v3.dataset_upload_service import DatasetUploadService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
@@ -25,13 +25,14 @@ logger = logging.getLogger("train_platform")
 async def lifespan(app: FastAPI):
     settings.ensure_dirs()
     assert_valid_license()
+    log_pool_configuration()
     try:
         init_db()
     except Exception as e:
         logger.error("Database init failed (did you run 'alembic -c alembic.ini upgrade head'?)")
         raise
     try:
-        with SessionLocal() as db:
+        with session_scope() as db:
             cleaned = DatasetUploadService().cleanup_expired_sessions(db)
             if cleaned:
                 logger.info("Cleaned %s expired dataset upload sessions on startup.", cleaned)

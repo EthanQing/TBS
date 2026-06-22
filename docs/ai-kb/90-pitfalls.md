@@ -12,6 +12,12 @@
 
 `train_platform/db/init_db.py` 明确不调用 `Base.metadata.create_all()`。缺表时应运行 Alembic migration，而不是在启动逻辑里偷偷建表。
 
+## 后台长任务不能长期持有数据库连接
+
+SQLAlchemy 默认连接池只有 `pool_size=5`、`max_overflow=10`，训练详情轮询、WebSocket、数据集导入、违规数据集发布、模型评估和部署任务叠加时，长任务如果在文件解压、格式转换、推理或健康检查期间一直持有 `Session`，会导致普通接口报 `QueuePool limit ... connection timed out`。
+
+后端连接池通过 `DB_POOL_SIZE`、`DB_MAX_OVERFLOW`、`DB_POOL_TIMEOUT`、`DB_POOL_RECYCLE` 和 `DB_POOL_PRE_PING` 配置，启动日志会记录当前池配置。排查池耗尽时优先看 `train_platform.db` 日志中的 `engine.pool.status()`；修复原则是后台任务只在读取快照、写进度、写最终结果时使用短 session，耗时文件处理、转换、推理、部署等待期间不得持有 ORM session 或跨 session 传递 ORM 对象。
+
 ## Windows 路径分隔
 
 `DATASET_IMPORT_ROOTS` 支持逗号和分号，不按冒号拆分，因为 Windows 盘符含冒号。新增 path list 配置时参考 `core/config.py` 的 `_path_list_env()`。

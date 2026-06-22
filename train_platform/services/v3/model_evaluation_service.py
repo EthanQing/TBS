@@ -12,7 +12,7 @@ import yaml
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.db.session import SessionLocal
+from train_platform.db.session import session_scope
 from train_platform.models.v3.enums import DatasetSplit, DatasetType, ModelStage, TrainingRunStatus
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetImage
@@ -295,12 +295,12 @@ class ModelEvaluationService:
     def _select_labeled_image_rows(
         self,
         root: Path,
-        rows: list[StandardDatasetImage],
-    ) -> tuple[list[StandardDatasetImage], int]:
-        labeled: list[StandardDatasetImage] = []
+        rows: list[str],
+    ) -> tuple[list[str], int]:
+        labeled: list[str] = []
         skipped = 0
-        for row in rows:
-            rel_path = str(getattr(row, "path", "") or "")
+        for rel_path in rows:
+            rel_path = str(rel_path or "")
             if not rel_path:
                 skipped += 1
                 continue
@@ -312,31 +312,31 @@ class ModelEvaluationService:
             if not _is_valid_yolo_label(label_path):
                 skipped += 1
                 continue
-            labeled.append(row)
+            labeled.append(rel_path)
         return labeled, skipped
 
     def _write_ultralytics_eval_data_yaml(
         self,
         job_id: str,
         root: Path,
-        rows: list[StandardDatasetImage],
+        rows: list[str],
         class_names: list[str],
     ) -> Path:
         job_root = self.job_dir(job_id)
         images_txt = job_root / "eval_images.txt"
         data_yaml = job_root / "eval_data.yaml"
         with images_txt.open("w", encoding="utf-8") as f:
-            for row in rows:
-                rel_path = str(getattr(row, "path", "") or "")
+            for rel_path in rows:
+                rel_path = str(rel_path or "")
                 if not rel_path:
                     continue
                 f.write((root / rel_path).resolve(strict=False).as_posix() + "\n")
 
-        names: list[str] = list(class_names or [])
+            names: list[str] = list(class_names or [])
         if not names:
             max_class_id = -1
-            for row in rows:
-                label_path = guess_label_path(root, str(getattr(row, "path", "") or ""))
+            for rel_path in rows:
+                label_path = guess_label_path(root, str(rel_path or ""))
                 try:
                     for line in label_path.read_text(encoding="utf-8", errors="ignore").splitlines():
                         parts = [p for p in line.strip().split() if p]
@@ -464,9 +464,8 @@ class ModelEvaluationService:
         return ModelEvaluationOut.model_validate(payload)
 
     def _run_job_thread(self, job_id: str) -> None:
-        db = SessionLocal()
         try:
-            self._run_job(db, job_id)
+            self._run_job(job_id)
         except Exception as e:
             try:
                 self._update_status_if_not_terminal(
@@ -481,15 +480,28 @@ class ModelEvaluationService:
                 )
             except Exception:
                 pass
-        finally:
-            db.close()
 
-    def _run_job(self, db: Session, job_id: str) -> None:
+    def _prepare_job_snapshot(self, job_id: str) -> dict[str, Any]:
         status = self._read_status(job_id)
-        dataset = self._resolve_dataset(db, int(status["standard_dataset_id"]))
-        root = resolve_storage_token(dataset.storage_path)
-        rows = self._select_image_rows(db, dataset, scope=str(status.get("scope") or "all"))
-        ctx = self._infer.resolve_model_context(db, model_version_id=int(status["model_version_id"]))
+        with session_scope() as db:
+            dataset = self._resolve_dataset(db, int(status["standard_dataset_id"]))
+            root = resolve_storage_token(dataset.storage_path)
+            rows = self._select_image_rows(db, dataset, scope=str(status.get("scope") or "all"))
+            row_paths = [str(row.path or "") for row in rows]
+            ctx = self._infer.resolve_model_context(db, model_version_id=int(status["model_version_id"]))
+        return {
+            "status": status,
+            "root": root,
+            "row_paths": row_paths,
+            "model_context": ctx,
+        }
+
+    def _run_job(self, job_id: str) -> None:
+        snapshot = self._prepare_job_snapshot(job_id)
+        status = snapshot["status"]
+        root = snapshot["root"]
+        rows = snapshot["row_paths"]
+        ctx = snapshot["model_context"]
         class_names = read_class_names(root)
         labeled_rows, skipped_by_label_scan = self._select_labeled_image_rows(root, rows)
 
@@ -558,12 +570,12 @@ class ModelEvaluationService:
             bump_seq=True,
         )
 
-        for idx, row in enumerate(labeled_rows, start=1):
+        for idx, rel_path in enumerate(labeled_rows, start=1):
             if self._is_cancel_requested(job_id):
                 self._update_status_if_not_terminal(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
                 return
 
-            rel_path = str(row.path or "")
+            rel_path = str(rel_path or "")
             image_path = root / rel_path
             label_path = guess_label_path(root, rel_path)
             progress = int((idx / total) * 100) if total else 100

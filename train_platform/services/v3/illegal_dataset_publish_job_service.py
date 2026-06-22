@@ -13,9 +13,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.db.session import SessionLocal
+from train_platform.db.session import SessionLocal, session_scope
 from train_platform.models.v3.illegal_dataset import IllegalDatasetPublishJob
 from train_platform.schemas.v3.illegal_datasets import IllegalDatasetPublishJobOut, IllegalDatasetPublishRequest
+from train_platform.services.v3.illegal_dataset_cas import remove_tree
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 from train_platform.utils.exceptions import NotFoundError
 
@@ -562,16 +563,25 @@ class IllegalDatasetPublishJobService:
             db.close()
 
     def _run_job(self, illegal_dataset_id: int, job_id: str) -> None:
-        db = SessionLocal()
+        materialized: dict[str, Any] | None = None
         try:
-            job = self._claim_job(db, int(illegal_dataset_id), str(job_id))
-            if job is None:
-                return
-            request_payload = job.request_payload if isinstance(job.request_payload, dict) else None
+            with session_scope() as db:
+                job = self._claim_job(db, int(illegal_dataset_id), str(job_id))
+                if job is None:
+                    return
+                request_payload = job.request_payload if isinstance(job.request_payload, dict) else None
+                idempotency_key = str(job.idempotency_key or "")
             if request_payload is None:
                 request_payload = self._read_request_file(int(illegal_dataset_id), str(job_id))
+            with session_scope() as db:
+                publish_snapshot = self._svc.prepare_publish_snapshot(
+                    db,
+                    int(illegal_dataset_id),
+                    obj=request_payload,
+                    publish_job_id=str(job_id),
+                    idempotency_key=idempotency_key,
+                )
         except Exception as exc:
-            db.close()
             msg = f"{type(exc).__name__}: {exc}"
             self._update_status(
                 int(illegal_dataset_id),
@@ -614,14 +624,31 @@ class IllegalDatasetPublishJobService:
         try:
             if self._is_cancel_requested(int(illegal_dataset_id), str(job_id)):
                 raise PublishJobCancelled("转换任务已取消")
-            result = self._svc.publish_standard_dataset(
-                db,
-                int(illegal_dataset_id),
+            materialized = self._svc.materialize_publish_snapshot(
+                publish_snapshot,
                 obj=request_payload,
                 progress_callback=progress_callback,
-                publish_job_id=str(job_id),
-                idempotency_key=str(job.idempotency_key),
             )
+            if self._is_cancel_requested(int(illegal_dataset_id), str(job_id)):
+                raise PublishJobCancelled("转换任务已取消")
+            publish_result = materialized.get("publish_result") if isinstance(materialized.get("publish_result"), dict) else {}
+            progress_callback(
+                "publishing",
+                {
+                    "message": "转换完成，正在生成标准数据集",
+                    "processed": int(publish_result.get("pairs_processed", 0)),
+                    "completed": int(publish_result.get("pairs_total", 0)),
+                    "total": int(publish_result.get("pairs_total", 0)),
+                    "skipped": int(publish_result.get("pairs_skipped", 0)),
+                },
+            )
+            with session_scope() as db:
+                result = self._svc.finalize_publish_snapshot(
+                    db,
+                    publish_snapshot,
+                    materialized,
+                    obj=request_payload,
+                )
             total = int((((result.get("publish_config") or {}).get("conversion_result", {})).get("pairs_total", 0)) or 0)
             processed = int((((result.get("publish_config") or {}).get("conversion_result", {})).get("pairs_processed", 0)) or 0)
             self._update_status(
@@ -639,10 +666,7 @@ class IllegalDatasetPublishJobService:
                 message=f"转换完成，已生成标准数据集 #{int(result.get('standard_dataset_id') or 0)}",
             )
         except PublishJobCancelled as exc:
-            try:
-                db.rollback()
-            except Exception:
-                pass
+            self._cleanup_materialized_publish(materialized)
             self._update_status(
                 int(illegal_dataset_id),
                 str(job_id),
@@ -656,10 +680,7 @@ class IllegalDatasetPublishJobService:
                 message=str(exc) or "转换任务已取消",
             )
         except Exception as exc:
-            try:
-                db.rollback()
-            except Exception:
-                pass
+            self._cleanup_materialized_publish(materialized)
             msg = f"{type(exc).__name__}: {exc}"
             self._update_status(
                 int(illegal_dataset_id),
@@ -667,5 +688,14 @@ class IllegalDatasetPublishJobService:
                 {"status": "failed", "phase": "failed", "progress": 100, "error_message": msg},
                 message=msg,
             )
-        finally:
-            db.close()
+
+    def _cleanup_materialized_publish(self, materialized: dict[str, Any] | None) -> None:
+        if not isinstance(materialized, dict):
+            return
+        temp_dir = str(materialized.get("temp_dir") or "").strip()
+        if not temp_dir:
+            return
+        try:
+            remove_tree(Path(temp_dir))
+        except Exception:
+            pass

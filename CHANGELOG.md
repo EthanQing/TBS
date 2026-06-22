@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed backend database connection pool exhaustion by making pool sizing
+  configurable and releasing DB sessions during long dataset import, publish,
+  model evaluation, and deployment runtime work.
 - Added a Windows portable launcher workflow for no-Docker/no-WSL customer
   deployments, including local MariaDB orchestration, Alembic migration,
   backend/worker startup, frontend static serving, and self-contained package

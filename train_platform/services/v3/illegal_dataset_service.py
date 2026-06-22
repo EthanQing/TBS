@@ -5,6 +5,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from sqlalchemy import func
@@ -1160,6 +1161,190 @@ class IllegalDatasetService:
                 "name": standard.name,
                 "source_illegal_dataset_id": int(row.illegal_dataset_id),
                 "source_illegal_version_id": int(version.version_id),
+                "publish_config": publish_config,
+            }
+        finally:
+            try:
+                remove_tree(temp_dir)
+            except Exception:
+                pass
+
+    def prepare_publish_snapshot(
+        self,
+        db: Session,
+        illegal_dataset_id: int,
+        *,
+        obj: dict,
+        publish_job_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        row = self.get_dataset(db, illegal_dataset_id)
+        version = self._selected_version(db, row, version_id=obj.get("version_id"))
+        mapping_rows = self.get_label_mappings(db, int(row.illegal_dataset_id))
+        mapping_snapshot = {
+            raw_label: mapped_label
+            for item in mapping_rows
+            for raw_label, mapped_label in [
+                (str(item.raw_label or "").strip(), self._effective_label_mapping_value(item))
+            ]
+            if raw_label and mapped_label
+        }
+        overrides = obj.get("label_mapping_overrides") or {}
+        if isinstance(overrides, dict):
+            for raw_label, raw_value in overrides.items():
+                raw_label_s = str(raw_label or "").strip()
+                mapped_label = self._normalize_label_mapping_override_value(raw_value)
+                if raw_label_s and mapped_label:
+                    mapping_snapshot[raw_label_s] = mapped_label
+        label_filters = [str(x) for x in (obj.get("label_filters") or []) if str(x).strip()]
+        publish_config = {
+            "source_illegal_dataset_id": int(row.illegal_dataset_id),
+            "source_illegal_dataset_name": str(row.name),
+            "source_illegal_version_id": int(version.version_id),
+            "source_version": int(version.version),
+            "publish_job_id": str(publish_job_id) if publish_job_id else None,
+            "idempotency_key": str(idempotency_key) if idempotency_key else None,
+            "label_mappings": mapping_snapshot,
+            "label_filters": label_filters,
+            "split": obj.get("split") or {},
+            **(obj.get("publish_config") or {}),
+        }
+        if publish_config.get("publish_job_id") is None:
+            publish_config.pop("publish_job_id", None)
+        if publish_config.get("idempotency_key") is None:
+            publish_config.pop("idempotency_key", None)
+        return {
+            "illegal_dataset_id": int(row.illegal_dataset_id),
+            "dataset_type": row.dataset_type,
+            "version_id": int(version.version_id),
+            "version": int(version.version),
+            "version_manifest_path": str(version.manifest_path or ""),
+            "version_meta": dict(version.meta or {}) if isinstance(version.meta, dict) else {},
+            "mapping_snapshot": mapping_snapshot,
+            "label_filters": label_filters,
+            "publish_config": publish_config,
+        }
+
+    def _publish_version_ref(self, snapshot: dict[str, Any]) -> SimpleNamespace:
+        return SimpleNamespace(
+            version_id=int(snapshot["version_id"]),
+            version=int(snapshot["version"]),
+            manifest_path=str(snapshot.get("version_manifest_path") or ""),
+            meta=dict(snapshot.get("version_meta") or {}),
+        )
+
+    def materialize_publish_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        obj: dict,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        temp_dir = Path(tempfile.mkdtemp(dir=illegal_dataset_temp_root()))
+        source_root = temp_dir / "illegal_source"
+        processed_root = temp_dir / "standard_publish"
+        version = self._publish_version_ref(snapshot)
+        mapping_snapshot = dict(snapshot.get("mapping_snapshot") or {})
+        label_filters = list(snapshot.get("label_filters") or [])
+        publish_config = dict(snapshot.get("publish_config") or {})
+        try:
+            if callable(progress_callback):
+                progress_callback(
+                    "materializing",
+                    {
+                        "message": f"正在准备原始数据集版本 v{int(version.version)}",
+                    },
+                )
+            mounted_publish_root = self._mounted_publish_source_root(version)
+            if mounted_publish_root is not None:
+                source_root = mounted_publish_root
+            else:
+                manifest = load_version_manifest(version)
+                materialize_manifest_to_dir(manifest, source_root, replace=True)
+            if callable(progress_callback):
+                progress_callback(
+                    "converting",
+                    {
+                        "message": "原始数据已准备完成，开始执行格式转换",
+                    },
+                )
+            publish_result = IllegalDatasetPublishService().convert_dataset(
+                source_root,
+                processed_root,
+                label_mapping=mapping_snapshot,
+                label_filters=label_filters,
+                publish_config=obj.get("publish_config") or {},
+                split_config=obj.get("split") or {},
+                progress_callback=progress_callback,
+            )
+            publish_config["conversion_result"] = {
+                "pairs_total": int(publish_result.get("pairs_total", 0)),
+                "pairs_processed": int(publish_result.get("pairs_processed", 0)),
+                "pairs_skipped": int(publish_result.get("pairs_skipped", 0)),
+                "skipped_details": publish_result.get("skipped_details") or [],
+                "warnings": publish_result.get("warnings") or [],
+                "class_names": publish_result.get("class_names") or [],
+                "stats": publish_result.get("stats") or {},
+                "split_summary": publish_result.get("split_summary"),
+                "normalized_slice_config": publish_result.get("normalized_slice_config") or {},
+            }
+            return {
+                "temp_dir": str(temp_dir),
+                "processed_root": str(processed_root),
+                "publish_result": publish_result,
+                "publish_config": publish_config,
+            }
+        except Exception:
+            try:
+                remove_tree(temp_dir)
+            except Exception:
+                pass
+            raise
+
+    def finalize_publish_snapshot(
+        self,
+        db: Session,
+        snapshot: dict[str, Any],
+        materialized: dict[str, Any],
+        *,
+        obj: dict,
+    ) -> dict[str, Any]:
+        from train_platform.services.v3.standard_dataset_service import StandardDatasetService
+
+        temp_dir = Path(str(materialized.get("temp_dir") or ""))
+        processed_root = Path(str(materialized.get("processed_root") or ""))
+        publish_result = materialized.get("publish_result") if isinstance(materialized.get("publish_result"), dict) else {}
+        publish_config = materialized.get("publish_config") if isinstance(materialized.get("publish_config"), dict) else {}
+        try:
+            standard = StandardDatasetService().materialize_from_source_tree(
+                db,
+                name=str(obj.get("name") or "").strip(),
+                dataset_type=snapshot["dataset_type"],
+                source_root=processed_root,
+                description=obj.get("description"),
+                source_type="illegal_publish",
+                publish_config=publish_config,
+                commit=False,
+            )
+            self._add_event(
+                db,
+                int(snapshot["illegal_dataset_id"]),
+                "published",
+                version_id=int(snapshot["version_id"]),
+                message=f"Published standard dataset {standard.name}",
+                data={
+                    "standard_dataset_id": int(standard.standard_dataset_id),
+                    "pairs_processed": int(publish_result.get("pairs_processed", 0)),
+                    "pairs_skipped": int(publish_result.get("pairs_skipped", 0)),
+                },
+            )
+            db.commit()
+            db.refresh(standard)
+            return {
+                "standard_dataset_id": int(standard.standard_dataset_id),
+                "name": standard.name,
+                "source_illegal_dataset_id": int(snapshot["illegal_dataset_id"]),
+                "source_illegal_version_id": int(snapshot["version_id"]),
                 "publish_config": publish_config,
             }
         finally:
