@@ -59,6 +59,11 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def require_valid_license(request, call_next):
+        assert_valid_license()
+        return await call_next(request)
+
     app.include_router(api_router, prefix="/api/v3")
 
     app.mount("/static/datasets", StaticFiles(directory=str(settings.datasets_dir)), name="datasets")

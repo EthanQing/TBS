@@ -14,6 +14,7 @@ from typing import Optional, TextIO
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.core.license import assert_valid_license
 from train_platform.db.session import SessionLocal
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
@@ -159,6 +160,7 @@ class DbQueueWorker:
             time.sleep(self.poll_interval)
 
     def tick(self) -> None:
+        assert_valid_license()
         if self._running is not None:
             self._tick_running()
             return
@@ -397,6 +399,7 @@ class DbQueueWorker:
 
 
 def main() -> None:
+    assert_valid_license()
     DbQueueWorker().run_forever()
 
 

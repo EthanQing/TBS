@@ -16,6 +16,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.core.license import assert_valid_license
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.standard_dataset import StandardDataset
 from train_platform.models.v3.deployment import Deployment
@@ -296,6 +297,7 @@ class TrainingRunService:
         return runs
 
     def create_run(self, db: Session, *, obj: dict) -> TrainingRun:
+        assert_valid_license()
         project_id = int(obj["project_id"])
         architecture_id = int(obj["architecture_id"])
         params = obj["parameters"]

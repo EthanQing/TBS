@@ -126,9 +126,13 @@ Windows + CUDA + PyTorch DataLoader pinned memory 组合可能在 Ultralytics �
 
 ## 不要把需要反射的入口编成受保护核心
 
-Docker 客户镜像的源码保护使用同目录 `.pyc`，不是 Cython `.so`。`train_platform/services/` 和少量训练 worker 核心文件会删除 `.py`，保留 `.pyc`；API、migration、FastAPI sidecar、推理任务和模型转换 worker 必须保留 `.py`。
+Docker 和 Windows 客户运行时使用 Cython `.so` / `.pyd` 保护 `train_platform/services/` 和指定 worker 实现，并使用 Rust/PyO3 native 模块实现 `train_platform.core.license`。正式产物不得包含 `core/license.py`，也不得允许 `TRAIN_PLATFORM_LICENSE_REQUIRED=0` 关闭授权。
+
+Paddle 官方 GPU runtime 基础镜像自带 `/usr/local/gcc-8.2`。正式 worker 镜像必须在 Paddle/PPDet 构建自检后删除该工具链和 `cc` / `c++` alternatives；仅把编译工作放到多阶段 builder 并不能自动清除基础镜像原有的编译器。
 
 `worker.py`、`yolo_worker.py`、`paddle_worker.py`、`inference_worker.py`、`paddle_inference_worker.py` 和 `workers/training/train_entry.py` 是保留给 `python -m` 的薄壳。`inference_worker_impl.py`、`paddle_inference_worker_impl.py` 里有 FastAPI 路由，也必须保持 `.py`；否则 FastAPI 可能因为无法 `inspect.signature()` 而报 `ValueError: no signature found for builtin ...`。
+
+Windows Cython 构建不要设置并行 `CYTHON_NTHREADS`；`setup.py` 在 Windows spawn 模式下可能被子进程重复导入并失败。正式 Windows 脚本固定单进程，Linux Docker 构建可按需并行。
 
 ## Worker 镜像 entrypoint 要去除 CRLF
 

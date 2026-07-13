@@ -1,16 +1,32 @@
 # syntax=docker/dockerfile:1.7
 
-# Build pyc-protected runtime sources. API/schema/migration code remains
-# readable for framework reflection; services and training worker core are pyc-only.
+# Build native-protected runtime sources. API/schema/migration code remains
+# readable for framework reflection; services and worker core are Cython extensions.
 FROM python:3.10-slim-bookworm AS source-protector
 
 ENV PYTHONUNBUFFERED=1
+ENV PATH=/root/.cargo/bin:${PATH}
 
 WORKDIR /build
 
-COPY train_platform/ ./train_platform/
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | sh -s -- -y --profile minimal --default-toolchain 1.85.1
 
-RUN python -m train_platform.core.build_protected_runtime --output /protected-runtime
+COPY requirements/build.txt ./requirements/build.txt
+RUN pip install --no-cache-dir -r requirements/build.txt
+
+COPY setup.py ./setup.py
+COPY train_platform/ ./train_platform/
+COPY native/license_verifier/ ./native/license_verifier/
+
+RUN CYTHON_INCLUDE_GLOBS="train_platform/services/*.py,train_platform/services/**/*.py,train_platform/workers/worker_impl.py,train_platform/workers/yolo_worker_impl.py,train_platform/workers/paddle_worker_impl.py,train_platform/workers/model_conversion_queue.py,train_platform/workers/model_conversion_task.py,train_platform/workers/inference_job_task.py,train_platform/workers/training/train_entry_impl.py,train_platform/workers/training/vdl_bridge.py" \
+    python setup.py build_ext \
+    && mkdir -p /protected-runtime \
+    && cp -a build/runtime/. /protected-runtime/ \
+    && python native/license_verifier/build.py --output /protected-runtime --enforce
 
 # Backend-only image (no GPU/torch stack).
 FROM python:3.10-slim-bookworm

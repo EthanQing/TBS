@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from train_platform.core.config import settings
+from train_platform.core.license import assert_valid_license
 from train_platform.workers.model_conversion_queue import ModelConversionQueueWorker
 from train_platform.workers.worker import DbQueueWorker
 
@@ -103,6 +104,7 @@ def _start_inference_worker_if_needed() -> Optional[subprocess.Popen]:
 
 
 def main() -> None:
+    assert_valid_license()
     # Dedicated entrypoint for Ultralytics YOLO training jobs and YOLO-side utility jobs.
     training_worker = DbQueueWorker(
         worker_id=os.getenv("WORKER_ID") or "worker-yolo",

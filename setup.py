@@ -27,6 +27,7 @@ EXT_BUILD_LIB_DIR = BUILD_DIR / "lib"
 EXT_BUILD_TEMP_DIR = BUILD_DIR / "temp"
 RUNTIME_DIR = BUILD_DIR / "runtime"
 RUNTIME_ROOT_PATHS = [Path("alembic.ini")]
+RUNTIME_REMOVE_PATHS = [Path("train_platform/core/build_protected_runtime.py")]
 
 
 def _read_version() -> str:
@@ -77,7 +78,11 @@ def _build_extensions() -> list[Extension]:
     # - If CYTHON_INCLUDE_GLOBS is set (comma-separated), only matching files are compiled.
     # - Excludes are applied after includes.
     include_globs = _env_csv("CYTHON_INCLUDE_GLOBS")
-    exclude_modules = set(_env_csv("CYTHON_EXCLUDE_MODULES"))
+    exclude_modules = {
+        "train_platform.core.build_protected_runtime",
+        "train_platform.core.license",
+        *_env_csv("CYTHON_EXCLUDE_MODULES"),
+    }
 
     # Safe defaults: Alembic loads migration scripts by reading .py files from disk.
     # If you compile/remove these, `alembic upgrade head` can break.
@@ -180,6 +185,11 @@ def _assemble_runtime_tree(compiled_module_names: set[str]) -> None:
         runtime_py = RUNTIME_DIR / rel_py
         if runtime_py.exists():
             runtime_py.unlink()
+
+    for rel_path in RUNTIME_REMOVE_PATHS:
+        runtime_path = RUNTIME_DIR / rel_path
+        if runtime_path.exists():
+            runtime_path.unlink()
 
 
 def _remove_tree_if_exists(path: Path) -> None:

@@ -8,6 +8,7 @@ from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import FileResponse
 
 from train_platform.core.config import settings
+from train_platform.core.license import assert_valid_license
 from train_platform.schemas.v3.model_conversions import ModelConversionOut
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.model_conversion_jobs import _append_log, _job_dir, _read_status, _utcnow, _write_status
@@ -31,6 +32,7 @@ async def create_model_conversion(
     - returns a job_id immediately
     - client polls GET /model-conversions/{job_id}
     """
+    assert_valid_license()
     sf = str(source_format or "").strip().lower()
     tf = str(target_format or "").strip().lower()
     if sf not in ("pt", "pth"):

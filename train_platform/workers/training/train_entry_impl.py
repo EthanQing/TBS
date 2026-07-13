@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Dict
 
 from train_platform.core.config import settings
+from train_platform.core.license import assert_valid_license
 from train_platform.db.session import SessionLocal
 from sqlalchemy.orm import Session
 from train_platform.models.v3.enums import TrainingRunStatus
@@ -181,6 +182,7 @@ def _upsert_epoch_metrics(run_id: str, epoch: int, metrics: Dict[str, float]) ->
 
 
 def main(argv: list[str] | None = None) -> int:
+    assert_valid_license()
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)

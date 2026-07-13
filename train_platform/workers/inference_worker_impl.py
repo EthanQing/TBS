@@ -12,8 +12,15 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from train_platform.core.config import settings
+from train_platform.core.license import assert_valid_license
 
 app = FastAPI(title="Inference Worker", version="1.0")
+
+
+@app.middleware("http")
+async def require_valid_license(request, call_next):
+    assert_valid_license()
+    return await call_next(request)
 
 
 class InferenceRequest(BaseModel):
@@ -742,6 +749,7 @@ def export_training_onnx(
 
 
 def main() -> None:
+    assert_valid_license()
     import uvicorn
 
     host = (

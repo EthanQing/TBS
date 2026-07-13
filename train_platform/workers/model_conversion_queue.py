@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from train_platform.core.config import settings
+from train_platform.core.license import assert_valid_license
 from train_platform.utils.model_conversion_jobs import _append_log, _read_status, _write_status
 
 
@@ -82,6 +83,7 @@ class ModelConversionQueueWorker:
         self.stale_lock_seconds = int(stale_lock_seconds or os.getenv("MODEL_CONVERSION_STALE_LOCK_SECONDS", "1800"))
 
     def tick(self) -> bool:
+        assert_valid_license()
         for status_path in _status_files():
             queued = _queued_job_from_status(status_path)
             if queued is None:

@@ -8,9 +8,10 @@
 - Fixed multi-GPU Docker YOLO worker routing so workers restricted by
   `NVIDIA_VISIBLE_DEVICES` only claim matching explicit GPU tasks and remap host
   GPU ids to container-local CUDA ids before launching training.
-- Switched protected Docker runtimes back to `.pyc` protection for core service
-  code and selected training worker modules, keeping FastAPI sidecars as Python
-  source so route signature inspection works.
+- Replaced plaintext release license validation with a mandatory Rust/PyO3
+  `.pyd`/`.so` verifier, added repeated checks across API and worker execution,
+  and switched protected service/worker implementations to Cython extensions
+  while keeping reflection-sensitive FastAPI entry modules as Python source.
 - Fixed backend database connection pool exhaustion by making pool sizing
   configurable and releasing DB sessions during long dataset import, publish,
   model evaluation, and deployment runtime work.

@@ -1,5 +1,4 @@
-# Historical build-only dependencies for the old Cython protection path.
-# Docker images now use pyc protection and do not install this file.
+# Build-only dependencies for the protected Windows and Docker runtimes.
 setuptools>=65
 wheel
 cython>=3.0

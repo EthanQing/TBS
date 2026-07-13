@@ -152,10 +152,10 @@ Portable layout:
   dependencies installed.
 - `runtime/mariadb/`: MariaDB/MySQL Windows ZIP runtime.
 - `app/TBS/`: this backend runtime, `alembic.ini`, requirements, and optional
-  PaddleDetection checkout. Customer packages use the pyc-protected runtime
-  assembled by `train_platform.core.build_protected_runtime`; service modules
-  and selected training worker core files are shipped as bytecode instead of raw
-  sources.
+  PaddleDetection checkout. Customer packages compile service modules and
+  selected worker implementations as Cython extensions. License verification is
+  supplied by a Rust/PyO3 `license.pyd`; plaintext `core/license.py` is not
+  included in customer packages.
 - `app/TFS/dist/`: built frontend static files.
 - `data/`: MySQL data, datasets, imports, training runs, temp files, and
   pre-trained models.
@@ -291,6 +291,9 @@ multiple backend replicas.
 `TRAIN_PLATFORM_LICENSE_PATH` keeps the Docker/file-based deployment flow.
 Windows portable customer packages prefer `TRAIN_PLATFORM_LICENSE_DATA_B64`,
 which is supplied by the launcher from its embedded license resource.
+Customer Windows and Docker builds compile the Rust verifier with mandatory
+enforcement, so `TRAIN_PLATFORM_LICENSE_REQUIRED=0` only disables checks for
+local source/development runs and cannot disable a protected release runtime.
 
 ### Storage
 

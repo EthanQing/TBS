@@ -4,7 +4,8 @@
 
 - 应用入口：`train_platform/app.py`
 - 配置：`train_platform/core/config.py`
-- License 校验：`train_platform/core/license.py`
+- 开发态 License 校验：`train_platform/core/license.py`
+- 正式 native License：`native/license_verifier/`，构建助手为 `native/license_verifier/build.py`
 - DB session：`train_platform/db/session.py`
 - DB 初始化：`train_platform/db/init_db.py`
 - migration 配置：`alembic.ini`
@@ -64,7 +65,7 @@ git check-ignore -v docs/ai-kb/00-index.md
 - 缩略图/索引：`THUMBNAIL_MAX_WORKERS`、`THUMBNAIL_FIRST_PAGE_PREWARM`、`THUMBNAIL_SIZE`、`VIEW_INDEX_MAX_WORKERS`
 - ID 起始段：`ILLEGAL_DATASET_ID_START`、`STANDARD_DATASET_ID_START`
 - MLflow：`MLFLOW_ENABLE`、`MLFLOW_TRACKING_URI`、`MLFLOW_EXPERIMENT_NAME`
-- License：`TRAIN_PLATFORM_LICENSE_REQUIRED`、`TRAIN_PLATFORM_LICENSE_PATH`、`TRAIN_PLATFORM_LICENSE_DATA_B64`、`TRAIN_PLATFORM_LICENSE_DATA`
+- License：`TRAIN_PLATFORM_LICENSE_REQUIRED`、`TRAIN_PLATFORM_LICENSE_PATH`、`TRAIN_PLATFORM_LICENSE_DATA_B64`、`TRAIN_PLATFORM_LICENSE_DATA`；正式 native 构建固定强制授权，`TRAIN_PLATFORM_LICENSE_REQUIRED` 仅对开发态源码实现提供开关
 
 `PADDLE_DET_DIR` 必须指向完整 PaddleDetection `release/2.6` 源码 checkout；未设置时默认使用后端目录下的 `PaddleDetection/`。
 
@@ -97,5 +98,5 @@ git check-ignore -v docs/ai-kb/00-index.md
 - 后端依赖：`requirements/backend.txt`
 - Worker 依赖：`requirements/worker*.txt`
 - 打包脚本：`setup.py`
-- 受保护运行时构建：`train_platform/core/build_protected_runtime.py` 复制运行时源码树，并把 `services/` 与少量训练 worker 核心文件编译为同目录 `.pyc` 后删除对应 `.py`。默认 worker 保护白名单是 `worker_impl.py`、`yolo_worker_impl.py`、`paddle_worker_impl.py`、`training/train_entry_impl.py`、`training/vdl_bridge.py`。API、migration、FastAPI sidecar、推理任务和模型转换 worker 保持 Python 源码。
+- 受保护运行时构建：`setup.py build_ext` 生成 Cython services/worker 扩展，`native/license_verifier/build.py --output <runtime> --enforce` 叠加 Rust/PyO3 `license.pyd` / `license*.so` 并删除明文 `core/license.py`。API、migration、FastAPI sidecar 和 `python -m` 薄入口保持 Python 源码。
 - Docker：`Dockerfile.backend`、`Dockerfile.worker.yolo`、`Dockerfile.worker.paddle`、`docker/entrypoint.sh`

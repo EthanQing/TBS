@@ -13,6 +13,7 @@ import requests
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.core.license import assert_valid_license
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import ModelStage, TrainingRunStatus
 from train_platform.models.v3.model_registry import ModelVersion
@@ -414,6 +415,7 @@ class InferenceJobService:
             raise RuntimeError(worker_error or f"Inference worker returned status={worker_status or 'unknown'}")
 
     def create_job(self, db: Session, payload: InferenceJobCreate) -> InferenceJobOut:
+        assert_valid_license()
         with _CREATE_JOB_PROCESS_LOCK:
             self._acquire_create_job_lock(self.CREATE_JOB_LOCK_TIMEOUT_SEC)
             try:

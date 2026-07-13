@@ -42,6 +42,7 @@ imports/
 # --- Python 构建与分发 (如果有打包需求) ---
 build/
 dist/
+**/target/
 *.egg-info/
 .pytest_cache/
 .coverage

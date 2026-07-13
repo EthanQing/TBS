@@ -45,7 +45,9 @@
 - Paddle worker、PaddleDetection 相关逻辑、worker 依赖或 `Dockerfile.worker.paddle` 变化：`docker build -f Dockerfile.worker.paddle -t tbs-worker-paddle:plain .`
 - 仅文档、测试或不会进入镜像的运行时数据变化不需要构建镜像，但最终回复要说明跳过原因。
 
-Docker 客户镜像统一使用 `.pyc` 保护核心代码。`build_protected_runtime` 会复制运行时源码树，然后把 `train_platform/services/` 和少量训练 worker 核心文件编译为同目录 `.pyc` 并删除对应 `.py`。API、migration、FastAPI sidecar、推理任务和模型转换 worker 保持 `.py`，避免框架反射或 `python -m` 入口失败。默认受保护 worker 文件是 `worker_impl.py`、`yolo_worker_impl.py`、`paddle_worker_impl.py`、`workers/training/train_entry_impl.py`、`workers/training/vdl_bridge.py`。
+Docker 客户镜像使用 `setup.py` 把 `train_platform/services/` 和指定 worker 实现编译为 Cython `.so`，同时用 `native/license_verifier/` 构建 Rust/PyO3 `train_platform.core.license` 模块。正式构建必须传入 `--enforce`，并删除运行目录中的 `core/license.py`；不得在 native 模块缺失时回退明文校验。API、migration、`python -m` 薄入口以及包含 FastAPI 路由的推理 sidecar 保持 `.py`，避免框架反射失败。
+
+Windows 下 Cython 必须使用 `CYTHON_NTHREADS=0`，否则 `setup.py` 导入阶段可能触发 multiprocessing spawn 重入。Rust 工具链由 `native/license_verifier/rust-toolchain.toml` 固定；Docker 应在各自基础镜像的构建阶段编译 `.so`，不能跨不同 glibc/CUDA 基础镜像复用未知 ABI 的产物。
 
 ## 训练插件
 

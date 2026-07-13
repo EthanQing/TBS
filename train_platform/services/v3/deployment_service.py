@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from train_platform.core.license import assert_valid_license
 from train_platform.models.v3.deployment import Deployment, DeploymentLog
 from train_platform.models.v3.enums import DeploymentStatus, LogLevel, ModelStage
 from train_platform.models.v3.model_registry import ModelVersion
@@ -45,6 +46,7 @@ class DeploymentService:
         return d
 
     def create_deployment(self, db: Session, *, obj: dict) -> Deployment:
+        assert_valid_license()
         model_version_id = int(obj["model_version_id"])
         mv = db.query(ModelVersion).filter(ModelVersion.model_version_id == model_version_id).first()
         if not mv:
