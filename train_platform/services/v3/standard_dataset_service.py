@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 from urllib.parse import quote
 
 import yaml
@@ -13,6 +13,10 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.domains.datasets import yolo
+from train_platform.domains.datasets.storage.paths import resolve_storage_token
+from train_platform.domains.datasets.storage.mounted import load_mounted_manifest, resolve_dataset_file
+from train_platform.platform.filesystem import clear_directory, copy_tree, extract_archive, remove_tree
 from train_platform.models.v3.enums import DatasetSplit, DatasetType
 from train_platform.models.v3.project import Project
 from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetEvent, StandardDatasetImage
@@ -24,30 +28,18 @@ from train_platform.services.v3.dataset_common import (
     build_statistics,
     build_view_payload_from_index,
     build_yolo_view_index,
-    clear_directory,
     commit_refresh,
-    copy_tree,
     count_tree,
-    detect_split_from_relpath,
     iter_image_files,
     load_cached_view_index,
-    resolve_storage_token,
-    safe_extract_zip,
     static_dataset_url,
     dataset_thumbnail_url,
     load_cached_statistics,
-    to_storage_token,
-    unpack_uploaded_archive,
     utcnow,
     write_cached_statistics,
     write_cached_view_index,
 )
-from train_platform.services.v3.file_service import FileService
-from train_platform.services.v3.mounted_dataset_service import (
-    load_mounted_manifest,
-    link_source_tree,
-    resolve_dataset_file,
-)
+from train_platform.services.v3.mounted_dataset_service import link_source_tree
 from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
@@ -66,7 +58,7 @@ class StandardDatasetService:
             return root
         if any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
             return root
-        return FileService()._find_yolo_export_root(root)
+        return yolo.find_yolo_export_root(root)
 
     def _ensure_name_available(self, db: Session, name: str, *, exclude_id: int | None = None) -> None:
         row = self.repo.get_by_name(db, str(name).strip())
@@ -110,7 +102,7 @@ class StandardDatasetService:
                 StandardDatasetImage(
                     standard_dataset_id=int(dataset.standard_dataset_id),
                     path=rel,
-                    split=detect_split_from_relpath(rel),
+                    split=yolo.detect_split_from_relpath(rel),
                 )
             )
         db.flush()
@@ -129,7 +121,7 @@ class StandardDatasetService:
                 StandardDatasetImage(
                     standard_dataset_id=int(dataset.standard_dataset_id),
                     path=rel,
-                    split=detect_split_from_relpath(rel),
+                    split=yolo.detect_split_from_relpath(rel),
                 )
             )
         db.flush()
@@ -285,7 +277,7 @@ class StandardDatasetService:
                 break
         if data_yaml is None:
             data_yaml = dataset_root / "data.yaml"
-            FileService()._create_yolo_data_yaml(dataset_root, data_yaml)
+            yolo.create_yolo_data_yaml(dataset_root, data_yaml)
 
         try:
             cfg = yaml.safe_load(data_yaml.read_text(encoding="utf-8", errors="ignore")) or {}
@@ -518,7 +510,7 @@ class StandardDatasetService:
         db.delete(row)
         db.commit()
         if delete_files:
-            shutil.rmtree(root, ignore_errors=True)
+            remove_tree(root, ignore_errors=True)
 
     def import_archive_file(
         self,
@@ -533,7 +525,7 @@ class StandardDatasetService:
         staging = settings.dataset_staging_dir / "standard" / f"{int(standard_dataset_id)}-{uuid.uuid4().hex}"
         extracted_dir = staging / "extracted"
         try:
-            extracted_root = safe_extract_zip(Path(archive_path), extracted_dir, progress_callback=progress_callback)
+            extracted_root = extract_archive(Path(archive_path), extracted_dir, progress_callback=progress_callback)
             return self.import_source_tree(
                 db,
                 standard_dataset_id,
@@ -542,7 +534,7 @@ class StandardDatasetService:
                 filename=filename or Path(archive_path).name,
             )
         finally:
-            shutil.rmtree(staging, ignore_errors=True)
+            remove_tree(staging, ignore_errors=True)
 
     def import_source_tree(
         self,
@@ -568,7 +560,7 @@ class StandardDatasetService:
         try:
             copy_tree(yolo_root, materialized)
             if not any((materialized / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
-                FileService()._create_yolo_data_yaml(materialized, materialized / "data.yaml")
+                yolo.create_yolo_data_yaml(materialized, materialized / "data.yaml")
             self._index_images_in_root(db, row, materialized)
             clear_directory(root)
             for item in materialized.iterdir():
@@ -587,7 +579,7 @@ class StandardDatasetService:
             db.refresh(row)
             return row
         finally:
-            shutil.rmtree(materialized, ignore_errors=True)
+            remove_tree(materialized, ignore_errors=True)
 
     def import_mounted_source_tree(
         self,
@@ -642,7 +634,7 @@ class StandardDatasetService:
             db.refresh(row)
             return row
         finally:
-            shutil.rmtree(materialized, ignore_errors=True)
+            remove_tree(materialized, ignore_errors=True)
 
     def split_dataset(
         self,
@@ -773,7 +765,7 @@ class StandardDatasetService:
         try:
             copy_tree(source_root, root)
             if not any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
-                FileService()._create_yolo_data_yaml(root, root / "data.yaml")
+                yolo.create_yolo_data_yaml(root, root / "data.yaml")
             self._index_images(db, row)
             self._refresh_dataset_statistics_cache(db, row)
             self._refresh_dataset_view_index_cache(db, row)
@@ -793,7 +785,7 @@ class StandardDatasetService:
             return row
         except Exception:
             if not commit:
-                shutil.rmtree(root, ignore_errors=True)
+                remove_tree(root, ignore_errors=True)
             raise
 
     def list_events(self, db: Session, standard_dataset_id: int, *, skip: int = 0, limit: int = 100) -> list[StandardDatasetEvent]:

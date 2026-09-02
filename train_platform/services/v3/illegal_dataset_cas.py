@@ -3,8 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
-import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +12,9 @@ from urllib.parse import quote
 import yaml
 
 from train_platform.core.config import settings
-from train_platform.services.v3.dataset_common import ensure_safe_relative_path, resolve_storage_token
+from train_platform.domains.datasets.storage.mounted import validate_mounted_source_root
+from train_platform.domains.datasets.storage.paths import resolve_storage_token
+from train_platform.platform.filesystem import atomic_write_json, ensure_under, remove_tree, safe_relative_path
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
 
@@ -60,38 +60,10 @@ def illegal_dataset_file_url(illegal_dataset_id: int, version_id: int, rel_path:
 
 
 def safe_manifest_rel(value: str | Path | None) -> str:
-    rel = ensure_safe_relative_path(value).as_posix()
+    rel = safe_relative_path(value).as_posix()
     if not rel or rel == ".":
         raise ValidationError("Invalid relative path")
     return rel
-
-
-def _ensure_under_base(path: Path, base: Path, label: str) -> Path:
-    resolved = path.resolve(strict=False)
-    base_resolved = base.resolve(strict=False)
-    try:
-        resolved.relative_to(base_resolved)
-    except Exception as exc:
-        raise ValidationError(f"Unsafe {label}") from exc
-    return resolved
-
-
-def _chmod_writable(path: str | os.PathLike[str]) -> None:
-    try:
-        os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-    except Exception:
-        pass
-
-
-def remove_tree(path: Path) -> None:
-    if not path.exists():
-        return
-
-    def _onerror(func, raw_path, _exc_info):
-        _chmod_writable(raw_path)
-        func(raw_path)
-
-    shutil.rmtree(path, onerror=_onerror)
 
 
 def hash_file(path: Path) -> str:
@@ -150,22 +122,6 @@ def store_file_in_cas(path: Path) -> dict[str, Any]:
     except Exception:
         pass
     return {"hash": digest, "size": size, "mtime": mtime}
-
-
-def mounted_file_entry(path: Path) -> dict[str, Any]:
-    src = Path(path).resolve(strict=False)
-    if not src.exists() or not src.is_file():
-        raise NotFoundError(f"Mounted source file not found: {src}")
-    try:
-        st = src.stat()
-    except Exception as exc:
-        raise ValidationError(f"Cannot stat mounted source file: {src}") from exc
-    return {
-        "storage": "mounted",
-        "source_path": str(src),
-        "size": int(st.st_size),
-        "mtime": float(st.st_mtime),
-    }
 
 
 def iter_regular_files(root: Path) -> Iterable[Path]:
@@ -251,16 +207,7 @@ def build_manifest(
 
 def write_manifest(manifest: Mapping[str, Any], path: Path) -> Path:
     dst = Path(path).resolve(strict=False)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f"{dst.name}.", suffix=".tmp")
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
-        tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, dst)
-    finally:
-        tmp.unlink(missing_ok=True)
-    return dst
+    return atomic_write_json(dst, dict(manifest), sort_keys=True)
 
 
 def load_manifest_path(path: Path) -> dict[str, Any]:
@@ -323,7 +270,7 @@ def manifest_file_path(manifest: Mapping[str, Any], rel_path: str | Path, *, req
     entry = manifest_entry(manifest, rel_path, required=True)
     assert entry is not None
     if _entry_storage(entry) == "mounted":
-        source_path = Path(str(entry.get("source_path") or "")).expanduser().resolve(strict=False)
+        source_path = validate_mounted_source_root(Path(str(entry.get("source_path") or "")))
         if required and (not source_path.exists() or not source_path.is_file()):
             raise NotFoundError("Mounted source file is no longer available")
         return source_path
@@ -411,7 +358,7 @@ def manifest_image_size(manifest: Mapping[str, Any], image_rel_path: str | Path)
 
 
 def guess_label_rel_path(image_rel_path: str | Path) -> str:
-    rel = ensure_safe_relative_path(image_rel_path)
+    rel = safe_relative_path(image_rel_path)
     parts = list(rel.parts)
     if "images" in parts:
         idx = parts.index("images")
@@ -677,7 +624,7 @@ def materialize_manifest_to_dir(manifest: Mapping[str, Any], dst: Path, *, repla
     for rel, entry in sorted(manifest_files(manifest).items()):
         rel_s = safe_manifest_rel(rel)
         src = manifest_file_path(manifest, rel_s, required=True)
-        target = _ensure_under_base(dst / rel_s, dst, "manifest materialization path")
+        target = ensure_under(dst / rel_s, dst, "manifest materialization path")
         hardlink_file(src, target)
 
 

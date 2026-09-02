@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Dict
 
 from train_platform.core.config import settings
+from train_platform.domains.datasets.storage.paths import resolve_legacy_dataset_path
 from train_platform.core.license import assert_valid_license
 from train_platform.db.session import SessionLocal
 from sqlalchemy.orm import Session
@@ -19,7 +20,6 @@ from train_platform.repositories.v3.training_run_repo import TrainingRunReposito
 from train_platform.services.v3.alarm_service import AlarmService
 from train_platform.training.plugins.base import TrainContext
 from train_platform.training.registry import get_trainer
-from train_platform.utils.path_utils import resolve_dataset_path
 from train_platform.utils.mlflow_utils import init_mlflow_logger
 from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
 from train_platform.utils.training_params import build_device_runtime, parse_visible_host_gpu_ids
@@ -205,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             return exit_code
 
         dataset_path_token = run.standard_dataset.storage_path
-        dataset_path = resolve_dataset_path(dataset_path_token)
+        dataset_path = resolve_legacy_dataset_path(dataset_path_token)
         if not dataset_path.exists():
             print(f"[train_entry] dataset path does not exist: {dataset_path}", file=sys.stderr, flush=True)
             exit_code = 2

@@ -10,6 +10,7 @@ from typing import Callable
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from train_platform.core.config import settings
+from train_platform.platform.filesystem.paths import safe_relative_path
 from train_platform.utils.image_exts import IMAGE_EXTS
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 
@@ -86,7 +87,7 @@ class ThumbnailService:
         if rel_paths:
             seen_paths: set[Path] = set()
             for raw_rel in rel_paths:
-                rel = self._safe_rel_path(raw_rel)
+                rel = safe_relative_path(str(raw_rel or "").strip().lstrip("/"))
                 src = (dataset_root / rel).resolve(strict=False)
                 if dataset_root not in src.parents and src != dataset_root:
                     continue
@@ -205,7 +206,7 @@ class ThumbnailService:
         # Keep thumbnails reasonably small to protect server CPU/memory.
         size_i = max(16, min(size_i, 1024))
 
-        rel = self._safe_rel_path(file_rel_path)
+        rel = safe_relative_path(str(file_rel_path or "").strip().lstrip("/"))
 
         dataset_root = Path(dataset_root).resolve(strict=False)
         src = (dataset_root / rel).resolve(strict=False)
@@ -271,7 +272,7 @@ class ThumbnailService:
             raise ValidationError("size must be a positive integer")
         size_i = max(16, min(size_i, 1024))
 
-        rel = self._safe_rel_path(file_rel_path)
+        rel = safe_relative_path(str(file_rel_path or "").strip().lstrip("/"))
         src = Path(source_path).resolve(strict=False)
         if not src.exists() or not src.is_file():
             raise NotFoundError("Image not found")
@@ -365,12 +366,3 @@ class ThumbnailService:
             bg.alpha_composite(im.convert("RGBA"))
             return bg.convert("RGB")
         return im.convert("RGB")
-
-    def _safe_rel_path(self, file_rel_path: str) -> Path:
-        raw = str(file_rel_path or "").strip().replace("\\", "/").lstrip("/")
-        if not raw:
-            raise ValidationError("file_path is required")
-        rel = Path(raw)
-        if rel.is_absolute() or ".." in rel.parts:
-            raise ValidationError("Unsafe file path")
-        return rel

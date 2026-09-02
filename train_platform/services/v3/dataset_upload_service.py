@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal, session_scope
 from train_platform.models.v3.dataset_upload import DatasetUploadSession, DatasetUploadTask
-from train_platform.services.v3.dataset_common import safe_extract_zip
+from train_platform.platform.filesystem import extract_archive, remove_tree
 from train_platform.services.v3.dataset_import_service import DatasetImportService
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
@@ -203,7 +203,7 @@ class DatasetUploadService:
         row = self.get_session(db, dataset_kind, dataset_id, session_id)
         with self._session_lock(row.session_id):
             row.status = "cancelled"
-            shutil.rmtree(self._session_root(row.session_id), ignore_errors=True)
+            remove_tree(self._session_root(row.session_id), ignore_errors=True)
             db.commit()
             db.refresh(row)
             return row
@@ -437,7 +437,7 @@ class DatasetUploadService:
                                 filename=source.name,
                             )
                     finally:
-                        shutil.rmtree(staging, ignore_errors=True)
+                        remove_tree(staging, ignore_errors=True)
             else:
                 service = IllegalDatasetService()
                 if snapshot["source_type"] == "dir_link":
@@ -482,7 +482,7 @@ class DatasetUploadService:
                                 progress_callback=import_progress,
                             )
                     finally:
-                        shutil.rmtree(staging, ignore_errors=True)
+                        remove_tree(staging, ignore_errors=True)
             self._update_task_by_id(task_id, status="done", stage="done", progress=100, detail_message="Dataset import completed", finished=True)
             self._cleanup_task_source_by_snapshot(snapshot)
             logger.info("Dataset upload task finished task_id=%s", snapshot["task_id"])
@@ -537,10 +537,10 @@ class DatasetUploadService:
     def _extract_archive_for_task(self, task_id: str, source: Path) -> tuple[Path, Path]:
         staging = settings.dataset_staging_dir / "upload-tasks" / str(task_id)
         extracted_dir = staging / "extracted"
-        shutil.rmtree(staging, ignore_errors=True)
+        remove_tree(staging, ignore_errors=True)
         self._update_task_by_id(task_id, status="extracting", stage="extracting", progress=10, detail_message="Extracting dataset archive")
         try:
-            extracted_root = safe_extract_zip(
+            extracted_root = extract_archive(
                 Path(source),
                 extracted_dir,
                 progress_callback=self._make_extract_progress_callback(task_id, start=10, end=70),
@@ -548,7 +548,7 @@ class DatasetUploadService:
             self._update_task_by_id(task_id, status="extracting", stage="extracting", progress=70, detail_message="Archive extraction completed")
             return extracted_root, staging
         except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
+            remove_tree(staging, ignore_errors=True)
             raise
 
     def _make_extract_progress_callback(
@@ -633,12 +633,12 @@ class DatasetUploadService:
 
     def _cleanup_task_source(self, task: DatasetUploadTask) -> None:
         if task.session_id:
-            shutil.rmtree(self._session_root(task.session_id), ignore_errors=True)
+            remove_tree(self._session_root(task.session_id), ignore_errors=True)
 
     def _cleanup_task_source_by_snapshot(self, task: dict[str, Any]) -> None:
         session_id = str(task.get("session_id") or "")
         if session_id:
-            shutil.rmtree(self._session_root(session_id), ignore_errors=True)
+            remove_tree(self._session_root(session_id), ignore_errors=True)
 
     def cleanup_expired_sessions(self, db: Session) -> int:
         now = _utcnow()
@@ -649,7 +649,7 @@ class DatasetUploadService:
         )
         count = 0
         for row in rows:
-            shutil.rmtree(self._session_root(row.session_id), ignore_errors=True)
+            remove_tree(self._session_root(row.session_id), ignore_errors=True)
             row.status = "expired" if row.status != "cancelled" else row.status
             count += 1
         db.commit()

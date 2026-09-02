@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import os
-import json
 import string
 import uuid
 from pathlib import Path
 from typing import Any
 
 from train_platform.core.config import settings
+from train_platform.domains.datasets.storage.roots import (
+    allowed_import_roots,
+    load_user_import_roots,
+    save_user_import_roots,
+)
 from train_platform.schemas.v3.dataset_imports import (
     DatasetImportEntriesOut,
     DatasetImportEntryOut,
@@ -25,54 +29,6 @@ from train_platform.utils.image_exts import IMAGE_EXTS
 class DatasetImportService:
     _DATA_YAML_NAMES = {"data.yaml", "dataset.yaml", "data.yml", "dataset.yml"}
     _SKIP_DIRS = {".git", "__macosx", ".thumbnails", ".versions"}
-    _ROOT_STORE_NAME = "dataset_import_roots.json"
-
-    def _root_store_path(self) -> Path:
-        return settings.home_dir / self._ROOT_STORE_NAME
-
-    def _load_user_roots(self) -> list[dict[str, str]]:
-        path = self._root_store_path()
-        if not path.exists() or not path.is_file():
-            return []
-        try:
-            data = json.loads(path.read_text(encoding="utf-8")) or []
-        except Exception:
-            return []
-        if not isinstance(data, list):
-            return []
-        out: list[dict[str, str]] = []
-        for item in data:
-            if isinstance(item, str):
-                raw_path = item
-                root_id = f"user_{uuid.uuid4().hex[:10]}"
-                label = ""
-            elif isinstance(item, dict):
-                raw_path = str(item.get("path") or "").strip()
-                root_id = str(item.get("root_id") or "").strip() or f"user_{uuid.uuid4().hex[:10]}"
-                label = str(item.get("label") or "").strip()
-            else:
-                continue
-            if not raw_path:
-                continue
-            if not root_id.startswith("user_"):
-                root_id = f"user_{root_id}"
-            out.append({"root_id": root_id, "path": raw_path, "label": label})
-        return out
-
-    def _save_user_roots(self, roots: list[dict[str, str]]) -> None:
-        path = self._root_store_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = [
-            {
-                "root_id": str(item.get("root_id") or "").strip(),
-                "path": str(item.get("path") or "").strip(),
-                "label": str(item.get("label") or "").strip(),
-            }
-            for item in roots
-            if str(item.get("root_id") or "").strip() and str(item.get("path") or "").strip()
-        ]
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
     def _root_out(self, *, root_id: str, path: Path, label: str = "", editable: bool = False) -> DatasetImportRootOut:
         exists = path.exists() and path.is_dir()
         readable = False
@@ -101,7 +57,7 @@ class DatasetImportService:
             out.append(self._root_out(root_id=root_id, path=root, editable=False))
         static_paths = {str(Path(item.path).resolve(strict=False)).lower() for item in out}
         seen_ids = {item.root_id for item in out}
-        for item in self._load_user_roots():
+        for item in load_user_import_roots():
             raw_id = str(item.get("root_id") or "").strip()
             root_id = raw_id if raw_id and raw_id not in seen_ids else f"user_{uuid.uuid4().hex[:10]}"
             try:
@@ -116,7 +72,7 @@ class DatasetImportService:
         return out
 
     def allowed_roots(self) -> tuple[Path, ...]:
-        return tuple(Path(item.path).resolve(strict=False) for item in self.roots())
+        return allowed_import_roots()
 
     def add_root(self, payload: DatasetImportRootCreate) -> DatasetImportRootOut:
         raw_path = str(payload.path or "").strip()
@@ -139,21 +95,21 @@ class DatasetImportService:
             if Path(existing.path).resolve(strict=False) == root:
                 return existing
 
-        roots = self._load_user_roots()
+        roots = load_user_import_roots()
         root_id = f"user_{uuid.uuid4().hex[:10]}"
         roots.append({"root_id": root_id, "path": str(root), "label": str(payload.label or "").strip()})
-        self._save_user_roots(roots)
+        save_user_import_roots(roots)
         return self._root_out(root_id=root_id, path=root, label=str(payload.label or ""), editable=True)
 
     def delete_root(self, root_id: str) -> DatasetImportRootDeleteOut:
         wanted = str(root_id or "").strip()
         if not wanted.startswith("user_"):
             raise ValidationError("Only user-added import roots can be removed")
-        roots = self._load_user_roots()
+        roots = load_user_import_roots()
         kept = [item for item in roots if str(item.get("root_id") or "").strip() != wanted]
         if len(kept) == len(roots):
             raise NotFoundError("Dataset import root not found")
-        self._save_user_roots(kept)
+        save_user_import_roots(kept)
         return DatasetImportRootDeleteOut(root_id=wanted, deleted=True)
 
     def _filesystem_start_entries(self) -> DatasetImportFsEntriesOut:

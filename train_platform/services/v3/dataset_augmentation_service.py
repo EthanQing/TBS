@@ -22,7 +22,9 @@ from train_platform.schemas.v3.dataset_augmentations import (
     DatasetAugmentationPublishIn,
     DatasetAugmentationPublishOut,
 )
-from train_platform.services.v3.dataset_common import copy_tree, count_tree, iter_image_files, read_class_names, resolve_storage_token
+from train_platform.domains.datasets.storage.paths import resolve_storage_token
+from train_platform.platform.filesystem import copy_tree
+from train_platform.services.v3.dataset_common import count_tree, iter_image_files
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 from train_platform.utils.exceptions import ConflictError, NotFoundError
 

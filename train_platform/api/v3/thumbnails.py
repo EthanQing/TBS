@@ -6,11 +6,11 @@ from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
 from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
-from train_platform.services.v3.mounted_dataset_service import resolve_mounted_file
+from train_platform.domains.datasets.storage.mounted import resolve_mounted_file
+from train_platform.domains.datasets.storage.paths import resolve_storage_token
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.exceptions import NotFoundError
-from train_platform.utils.path_utils import resolve_dataset_path
 
 
 router = APIRouter(prefix="/thumbnails", tags=["thumbnails"])
@@ -37,7 +37,7 @@ def get_thumbnail(
     elif kind == "standard":
         ds = StandardDatasetService().get_dataset(db, int(dataset_id))
         root_token = ds.storage_path
-        dataset_root = resolve_dataset_path(root_token).resolve(strict=False)
+        dataset_root = resolve_storage_token(root_token)
         source_path = resolve_mounted_file(dataset_root, file_path)
     else:
         raise NotFoundError("Unknown dataset kind")
@@ -53,7 +53,7 @@ def get_thumbnail(
             cache_prefix=cache_prefix,
         )
     else:
-        dataset_root = resolve_dataset_path(root_token).resolve(strict=False)
+        dataset_root = resolve_storage_token(root_token)
         thumb_path = svc.ensure_thumbnail(
             dataset_id=cache_dataset_id,
             dataset_namespace=kind,

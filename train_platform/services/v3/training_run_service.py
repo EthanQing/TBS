@@ -15,6 +15,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.domains.datasets.storage.paths import resolve_legacy_dataset_path
 from train_platform.core.license import assert_valid_license
 from train_platform.domains.model_assets.runtime import resolve_architecture_config_path
 from train_platform.models.v3.architecture import ModelArchitecture
@@ -39,7 +40,7 @@ from train_platform.repositories.v3.training_run_repo import TrainingRunReposito
 from train_platform.training.registry import get_plugin
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.training_artifacts import compute_epoch_metric_snapshots, index_completion_artifacts
-from train_platform.utils.path_utils import resolve_dataset_path, resolve_training_path
+from train_platform.utils.path_utils import resolve_training_path
 from train_platform.utils.training_augmentations import normalize_training_augmentation
 from train_platform.utils.training_loss_weights import normalize_training_loss_weights
 from train_platform.utils.training_params import validate_training_params_for_engine
@@ -376,7 +377,7 @@ class TrainingRunService:
         # Check dataset train/val split before training (no auto-split).
         has_split = False
         try:
-            dataset_root = resolve_dataset_path(dataset.storage_path)
+            dataset_root = resolve_legacy_dataset_path(dataset.storage_path)
             if not dataset_root.exists() or not dataset_root.is_dir():
                 raise ConflictError("Standard dataset path does not exist; upload dataset files first")
 

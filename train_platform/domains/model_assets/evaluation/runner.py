@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from train_platform.platform.runtime import ModelWorkerClient
-from train_platform.services.v3.dataset_common import guess_label_path, read_yolo_boxes
+from train_platform.domains.datasets.yolo import guess_label_path, read_yolo_boxes
 from train_platform.utils.exceptions import ValidationError
 
 from .metrics import compute_detection_metrics

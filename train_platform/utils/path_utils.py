@@ -40,34 +40,6 @@ def _resolve_under_base(
     return resolved
 
 
-def resolve_dataset_path(raw_path: Optional[str]) -> Path:
-    base_dir = settings.datasets_dir.resolve()
-    if not raw_path:
-        return base_dir
-
-    p = str(raw_path).strip().replace("\\", "/")
-    marker = "/static/datasets/"
-    if marker in p:
-        p = p.split(marker, 1)[1]
-
-    # Treat as portable relative path under BASE_DATASETS_DIR by default.
-    p = p.strip("/\\")
-    if not p:
-        return base_dir
-
-    rel = Path(p)
-
-    # If absolute and exists, return as-is (backwards compatibility).
-    if rel.is_absolute() and rel.exists():
-        return rel.resolve()
-
-    # Prevent path traversal for relative paths.
-    if ".." in rel.parts:
-        return base_dir
-
-    return (base_dir / rel).resolve(strict=False)
-
-
 def resolve_training_path(raw_path: Optional[str]) -> Path:
     return _resolve_under_base(
         raw_path=raw_path,

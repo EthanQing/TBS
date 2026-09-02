@@ -13,6 +13,10 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.domains.datasets.yolo import detect_split_from_relpath
+from train_platform.domains.datasets.storage.mounted import validate_mounted_source_root
+from train_platform.domains.datasets.storage.paths import resolve_storage_token, to_storage_token
+from train_platform.platform.filesystem import extract_archive, remove_tree, safe_relative_path
 from train_platform.models.v3.illegal_dataset import (
     IllegalDataset,
     IllegalDatasetEvent,
@@ -23,14 +27,7 @@ from train_platform.models.v3.illegal_dataset import (
 from train_platform.models.v3.enums import DatasetVersionStatus
 from train_platform.repositories.v3.illegal_dataset_repo import IllegalDatasetRepository
 from train_platform.repositories.v3.illegal_dataset_version_repo import IllegalDatasetVersionRepository
-from train_platform.services.v3.dataset_common import (
-    detect_split_from_relpath,
-    load_cached_json_file,
-    resolve_storage_token,
-    safe_extract_zip,
-    to_storage_token,
-    write_cached_json_file,
-)
+from train_platform.services.v3.dataset_common import load_cached_json_file, write_cached_json_file
 from train_platform.services.v3.illegal_dataset_cas import (
     build_manifest,
     extract_json_labels_from_manifest,
@@ -43,7 +40,6 @@ from train_platform.services.v3.illegal_dataset_cas import (
     materialize_manifest_to_dir,
     normalize_manifest_file_entry,
     read_class_names_from_manifest,
-    remove_tree,
     replace_dir_from_manifest,
     safe_manifest_rel,
     scan_tree_to_cas_files,
@@ -282,20 +278,8 @@ class IllegalDatasetService:
         if not source_root.exists() or not source_root.is_dir():
             raise NotFoundError("Mounted illegal dataset source directory is no longer available")
 
-        from train_platform.services.v3.dataset_import_service import DatasetImportService
-
-        allowed_roots = DatasetImportService().allowed_roots()
-        if not any(self._is_relative_to(source_root, allowed.resolve(strict=False)) for allowed in allowed_roots):
-            raise ValidationError("Mounted illegal dataset source directory is not under an allowed import root")
+        validate_mounted_source_root(source_root)
         return source_root
-
-    @staticmethod
-    def _is_relative_to(path: Path, base: Path) -> bool:
-        try:
-            Path(path).resolve(strict=False).relative_to(Path(base).resolve(strict=False))
-            return True
-        except Exception:
-            return False
 
     def _version_files_for_inheritance(
         self,
@@ -601,7 +585,7 @@ class IllegalDatasetService:
         staging = illegal_dataset_temp_root() / f"import-{int(illegal_dataset_id)}-{uuid.uuid4().hex}"
         extracted_dir = staging / "extracted"
         try:
-            extracted_root = safe_extract_zip(Path(archive_path), extracted_dir, progress_callback=progress_callback)
+            extracted_root = extract_archive(Path(archive_path), extracted_dir, progress_callback=progress_callback)
             return self.import_source_tree(
                 db,
                 illegal_dataset_id,
@@ -895,9 +879,7 @@ class IllegalDatasetService:
             row = self._lock_dataset_for_version_create(db, row)
             temp_dir = Path(tempfile.mkdtemp(dir=illegal_dataset_temp_root()))
             try:
-                from train_platform.services.v3.dataset_common import ensure_safe_relative_path
-
-                rel_dir = ensure_safe_relative_path(relative_dir)
+                rel_dir = safe_relative_path(relative_dir)
                 target_dir = temp_dir / rel_dir
                 target_dir.mkdir(parents=True, exist_ok=True)
                 saved_files: list[str] = []

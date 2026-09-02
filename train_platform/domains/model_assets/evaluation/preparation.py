@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 
 from train_platform.models.v3.enums import DatasetSplit, DatasetType
 from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetImage
-from train_platform.services.v3.dataset_common import guess_label_path, read_class_names, resolve_storage_token
+from train_platform.domains.datasets.yolo import guess_label_path, read_class_names
+from train_platform.domains.datasets.storage.paths import resolve_storage_token
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 
 from ..runtime import ModelRuntimeSpec
