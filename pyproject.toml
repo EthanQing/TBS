@@ -73,10 +73,6 @@ dependencies = [
   "cython>=3.2.4",
 ]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-
 [tool.uv]
 # 同时解析 Windows 和 Linux，保证 Windows 开发环境与 Ubuntu 部署环境都能 uv sync。
 environments = [
