@@ -10,7 +10,7 @@ Static evidence came from Python AST parsing, import/call-site analysis, line an
 
 The repository has a recognizable layered shape, but the effective architecture is service-centric rather than layered: `services/v3` contains 28 files and about 15,299 lines, owns DB transactions, filesystem mutation, task dispatch, status persistence, and cross-service orchestration. Several services have become application subsystems rather than services. The most urgent risks are:
 
-1. Dataset responsibilities are fragmented across `illegal_dataset_service`, `illegal_dataset_publish_service`, `illegal_dataset_publish_job_service`, `illegal_dataset_cas`, `mounted_dataset_service`, `dataset_common`, `dataset_upload_service`, `standard_dataset_service`, and `file_service`, while these modules call each other cyclically at the responsibility level.
+1. Dataset responsibilities are fragmented across `illegal_dataset_service`, `illegal_dataset_publish_service`, `illegal_dataset_publish_job_service`, `illegal_dataset_cas`, `mounted_dataset_service`, `dataset_common`, `dataset_upload_service`, `standard_dataset_service`, and `file_service`. Their responsibilities are mutually entangled and ownership is non-local: storage, versioning, publication, import, and materialization do not each have a single explicit owner. This is a responsibility/ownership finding; the static call graph below does not establish a concrete strongly connected call component.
 2. Background jobs do not share one state model. Training and deployment use DB enums; upload and publish jobs use DB string states; inference/evaluation/augmentation/conversion jobs use JSON files and process-local locks/threads. Recovery, cancellation, idempotency, and observability therefore differ by task type.
 3. Training plugins and worker implementations mix configuration translation, subprocess lifecycle, metrics parsing, status repair, filesystem layout, and framework-specific execution. The largest function is Paddle `run()` at 585 lines.
 4. Exception handling is dominated by broad `except Exception`: 38 sites in `paddle_det.py`, 30 in `inference_worker_impl.py`, and 23 in `training_run_service.py`. Many are legitimate process-boundary guards, but the density obscures failure contracts and makes partial failure hard to reason about.
@@ -151,7 +151,7 @@ Highest fan-out orchestration points are `IllegalDatasetService`, `StandardDatas
 | Framework runtime | `training/plugins/*`, inference worker implementations, external `PaddleDetection` | Framework adapter boundary exists, but plugin `run()` methods still absorb orchestration and metrics responsibilities. |
 | Native license | `core/license.py`, compiled Rust extension, protected-runtime build script | Clear security boundary, but packaging/build compatibility wrappers add operational complexity. |
 
-The critical consistency gap is “DB commit followed by filesystem/worker action” without an outbox or durable task lease. Failures can leave DB state, JSON state, and actual process state disagreeing.
+The critical consistency gap is “DB commit followed by filesystem/worker action” without durable workflow ownership. The required model is a durable job with an explicit state machine, lease ownership, idempotent execution, retry policy, and reconciliation or compensation for partial external effects. If dispatch is later performed through a message broker, a transactional outbox can make the DB-state/message-publication boundary reliable; an outbox alone cannot make large filesystem conversions, renames, subprocesses, Docker calls, or HTTP worker effects atomic. Failures can currently leave DB state, JSON state, and actual process state disagreeing.
 
 ## Background task state machines
 
@@ -192,7 +192,7 @@ Both implement nearly identical status-file, lock, cursor, update, and results-s
 
 ### Augmentation and model conversion
 
-Augmentation uses filesystem status plus a background job. Conversion uses worker queues/tasks and filesystem job metadata. Neither participates in a repository-wide task registry despite migration `0012_unified_task_system` suggesting a historical attempt at unification.
+Augmentation uses filesystem status plus a background job. Conversion uses worker queues/tasks and filesystem job metadata. Neither participates in a repository-wide task registry. The historical revision name `0012_unified_task_system` suggests that a unified-task concept once existed, but this checkout contains only a no-op placeholder and explicitly says the original migration source is absent. Its tables, runtime semantics, deployment history, and reason for removal therefore cannot be established from this repository.
 
 ## Duplicate code hotspots
 
@@ -390,10 +390,12 @@ No other production module has enough static evidence for deletion. In particula
 ## Recommended sequence
 
 1. Fix the test boundary first: configure discovery to `tests`, repair the inference worker export/import, and establish real coverage output. This makes later restructuring measurable.
-2. Define one durable background-task contract (typed states, lease owner, heartbeat, cancellation, retry/idempotency, progress/events, terminal result) and migrate inference/evaluation/publish/upload/conversion incrementally.
-3. Consolidate dataset storage and manifest primitives, then split the three oversized dataset services around commands, reads, conversion, and storage ownership.
-4. Replace training heartbeat repair with one durable supervisor/lease model; then split worker supervision from framework plugin execution.
-5. Split deployment runtime around its already-visible steps and move transition validation into an explicit state model.
-6. Remove confirmed dead/working-tree residue and put expiry metadata on retained compatibility paths.
+2. Document only the minimum cross-task invariants: explicit states and allowed transitions, durable identity, lease/heartbeat ownership, idempotency key, retry policy, cancellation semantics, and reconciliation responsibility. Do not introduce a generic task table, base class, or `UnifiedTaskService` at this stage.
+3. Validate those invariants in one closely related task family with demonstrated duplication—preferably inference plus model evaluation—while keeping domain-specific payloads, transitions, execution policy, and result models separate. Extract shared infrastructure only after the concrete implementation proves the seam.
+4. Consolidate dataset storage and manifest primitives, then split the three oversized dataset services around commands, reads, conversion, and storage ownership.
+5. Apply the proven durable-job primitives selectively to publish/upload/conversion. Use a transactional outbox only if broker dispatch is introduced; use idempotency plus reconciliation/compensation for filesystem and process side effects.
+6. Replace training heartbeat repair with one durable supervisor/lease model; then split worker supervision from framework plugin execution. Training and deployment should retain their own domain state machines rather than being forced into a generic task model.
+7. Split deployment runtime around its already-visible steps and move transition validation into an explicit state model.
+8. Remove confirmed dead/working-tree residue and put expiry metadata on retained compatibility paths.
 
-The first refactor should not be a broad rewrite. The safest architectural seam is the common task contract because it eliminates duplicated code, clarifies DB/filesystem/worker boundaries, and reduces status-repair logic across several subsystems at once.
+The first architectural change should not be a repository-wide “unified task framework.” The safe seam is a small set of durable-work invariants, proven first against one duplicated task family. Shared code should remain limited to infrastructure concerns such as leasing, durable event/progress persistence, and dispatch reliability; domain transitions, payloads, execution, compensation, and results should stay with each workflow. This avoids replacing several existing services with a new generic God Service.
