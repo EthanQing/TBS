@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
 from train_platform.platform.jobs import JobStore
-from train_platform.services.v3.model_evaluation_metrics import extract_ultralytics_val_metrics
+from train_platform.domains.model_assets.evaluation.metrics import extract_ultralytics_val_metrics
 
 app = FastAPI(title="Inference Worker", version="1.0")
 

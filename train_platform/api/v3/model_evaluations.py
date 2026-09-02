@@ -12,11 +12,11 @@ from train_platform.platform.jobs import is_terminal_status
 from train_platform.schemas.v3.inference_jobs import InferenceModelCandidate
 from train_platform.schemas.v3.model_evaluations import ModelEvaluationCreate, ModelEvaluationOut
 from train_platform.services.v3.model_candidate_service import ModelCandidateService
-from train_platform.services.v3.model_evaluation_service import ModelEvaluationService
+from train_platform.domains.model_assets.evaluation.service import EvaluationService
 
 
 router = APIRouter(prefix="/model-evaluations", tags=["model-evaluations"])
-_svc = ModelEvaluationService()
+_svc = EvaluationService()
 _model_candidates = ModelCandidateService()
 
 

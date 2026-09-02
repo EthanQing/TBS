@@ -377,3 +377,13 @@ def extract_ultralytics_val_metrics(results: Any, elapsed_ms: float) -> Dict[str
         "elapsed_ms": round(float(elapsed_ms), 2),
         "class_metrics": class_metrics,
     }
+
+
+__all__ = [
+    "EvalBox",
+    "average_precision_for_class",
+    "box_iou",
+    "compute_detection_metrics",
+    "extract_ultralytics_val_metrics",
+    "safe_div",
+]

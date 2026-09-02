@@ -1166,7 +1166,7 @@ class TrainingRunService:
         iters = max(1, int(iters))
 
         for _ in range(warmup):
-            infer._run_by_engine(
+            infer.run_engine(
                 engine=engine,
                 weights_path=weights_path,
                 image_path=benchmark_image,
@@ -1178,7 +1178,7 @@ class TrainingRunService:
         timings: List[float] = []
         for _ in range(iters):
             t0 = time.perf_counter()
-            infer._run_by_engine(
+            infer.run_engine(
                 engine=engine,
                 weights_path=weights_path,
                 image_path=benchmark_image,

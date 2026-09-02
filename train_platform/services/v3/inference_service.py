@@ -134,7 +134,7 @@ class InferenceService:
         output = None
         err_msg = None
         try:
-            output = self._run_by_engine(
+            output = self.run_engine(
                 engine=str(ctx.get("engine") or "ultralytics-yolo"),
                 weights_path=Path(str(ctx["weights_path"])),
                 image_path=local_path,
@@ -314,7 +314,7 @@ class InferenceService:
             return {}
         return {self.INTERNAL_TOKEN_HEADER: token}
 
-    def _run_by_engine(
+    def run_engine(
         self,
         *,
         engine: str,
