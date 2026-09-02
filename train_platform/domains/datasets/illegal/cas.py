@@ -640,5 +640,3 @@ def replace_dir_from_manifest(manifest: Mapping[str, Any], dst: Path) -> None:
     except Exception:
         remove_tree(staging)
         raise
-
-

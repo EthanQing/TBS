@@ -13,10 +13,11 @@ from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal, session_scope
+from train_platform.domains.datasets.illegal.service import IllegalDatasetService
+from train_platform.domains.datasets.illegal import versions as illegal_versions
 from train_platform.models.v3.dataset_upload import DatasetUploadSession, DatasetUploadTask
 from train_platform.platform.filesystem import extract_archive, remove_tree
 from train_platform.services.v3.dataset_import_service import DatasetImportService
-from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
@@ -439,11 +440,10 @@ class DatasetUploadService:
                     finally:
                         remove_tree(staging, ignore_errors=True)
             else:
-                service = IllegalDatasetService()
                 if snapshot["source_type"] == "dir_link":
                     self._update_task_by_id(task_id, status="linking", stage="linking", progress=30, detail_message="Preparing mounted illegal dataset import")
                     with session_scope() as db:
-                        service.import_mounted_source_tree(
+                        illegal_versions.import_mounted_source_tree(
                             db,
                             int(snapshot["dataset_id"]),
                             source,
@@ -456,7 +456,7 @@ class DatasetUploadService:
                 elif snapshot["source_type"] == "dir":
                     self._update_task_by_id(task_id, status="validating", stage="validating", progress=30, detail_message="Validating illegal dataset source")
                     with session_scope() as db:
-                        service.import_source_tree(
+                        illegal_versions.import_source_tree(
                             db,
                             int(snapshot["dataset_id"]),
                             source,
@@ -471,7 +471,7 @@ class DatasetUploadService:
                     try:
                         self._update_task_by_id(task_id, status="validating", stage="validating", progress=75, detail_message="Validating extracted illegal dataset")
                         with session_scope() as db:
-                            service.import_source_tree(
+                            illegal_versions.import_source_tree(
                                 db,
                                 int(snapshot["dataset_id"]),
                                 extracted_root,

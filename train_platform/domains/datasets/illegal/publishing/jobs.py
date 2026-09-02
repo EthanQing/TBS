@@ -3,21 +3,24 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal, session_scope
+from train_platform.domains.datasets.illegal import labels, versions
+from train_platform.domains.datasets.illegal.publishing.workflow import (
+    cleanup_materialized_publish,
+    finalize_publish_snapshot,
+    materialize_publish_snapshot,
+    prepare_publish_snapshot,
+)
+from train_platform.domains.datasets.illegal.service import IllegalDatasetService
 from train_platform.models.v3.illegal_dataset import IllegalDatasetPublishJob
 from train_platform.schemas.v3.illegal_datasets import IllegalDatasetPublishJobOut, IllegalDatasetPublishRequest
-from train_platform.services.v3.illegal_dataset_cas import remove_tree
-from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
 from train_platform.utils.exceptions import NotFoundError
 
 
@@ -32,96 +35,11 @@ class PublishJobCancelled(RuntimeError):
 
 class IllegalDatasetPublishJobService:
     def __init__(self) -> None:
-        self._locks: dict[str, threading.RLock] = {}
-        self._locks_guard = threading.Lock()
-        self._svc = IllegalDatasetService()
+        self._core = IllegalDatasetService()
 
     @staticmethod
     def _utcnow() -> datetime:
         return datetime.now(timezone.utc)
-
-    def jobs_root(self, illegal_dataset_id: int) -> Path:
-        root = settings.temp_dir / "illegal_dataset_publish_jobs" / str(int(illegal_dataset_id))
-        root.mkdir(parents=True, exist_ok=True)
-        return root
-
-    def job_dir(self, illegal_dataset_id: int, job_id: str) -> Path:
-        path = self.jobs_root(illegal_dataset_id) / str(job_id)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def status_path(self, illegal_dataset_id: int, job_id: str) -> Path:
-        return self.job_dir(illegal_dataset_id, job_id) / "status.json"
-
-    def request_path(self, illegal_dataset_id: int, job_id: str) -> Path:
-        return self.job_dir(illegal_dataset_id, job_id) / "request.json"
-
-    def _lock(self, illegal_dataset_id: int, job_id: str) -> threading.RLock:
-        key = f"{int(illegal_dataset_id)}:{str(job_id)}"
-        with self._locks_guard:
-            lock = self._locks.get(key)
-            if lock is None:
-                lock = threading.RLock()
-                self._locks[key] = lock
-            return lock
-
-    def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        text = json.dumps(payload, ensure_ascii=False, default=str)
-        last_exc: Exception | None = None
-        for attempt in range(8):
-            try:
-                tmp.write_text(text, encoding="utf-8")
-                tmp.replace(path)
-                return
-            except PermissionError as exc:
-                last_exc = exc
-                time.sleep(0.03 * (attempt + 1))
-            finally:
-                if tmp.exists() and attempt >= 7:
-                    try:
-                        tmp.unlink()
-                    except Exception:
-                        pass
-        if last_exc:
-            raise last_exc
-
-    def _read_json_retry(self, path: Path, *, missing_message: str) -> dict[str, Any]:
-        last_exc: Exception | None = None
-        for attempt in range(8):
-            try:
-                if not path.exists():
-                    raise NotFoundError(missing_message)
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    raise NotFoundError(missing_message)
-                return data
-            except NotFoundError:
-                raise
-            except (PermissionError, OSError, json.JSONDecodeError) as exc:
-                last_exc = exc
-                time.sleep(0.03 * (attempt + 1))
-        if last_exc:
-            raise last_exc
-        raise NotFoundError(missing_message)
-
-    def _write_status_file(self, illegal_dataset_id: int, job_id: str, payload: dict[str, Any]) -> None:
-        data = dict(payload or {})
-        data["updated_at"] = self._utcnow().isoformat()
-        with self._lock(illegal_dataset_id, job_id):
-            self._write_json_atomic(self.status_path(illegal_dataset_id, job_id), data)
-
-    def _write_request_file(self, illegal_dataset_id: int, job_id: str, payload: dict[str, Any]) -> None:
-        with self._lock(illegal_dataset_id, job_id):
-            self._write_json_atomic(self.request_path(illegal_dataset_id, job_id), payload)
-
-    def _read_request_file(self, illegal_dataset_id: int, job_id: str) -> dict[str, Any]:
-        with self._lock(illegal_dataset_id, job_id):
-            return self._read_json_retry(
-                self.request_path(illegal_dataset_id, job_id),
-                missing_message="Illegal dataset publish request not found",
-            )
 
     def _append_log(self, payload: dict[str, Any], message: str) -> None:
         msg = str(message or "").strip()
@@ -206,23 +124,8 @@ class IllegalDatasetPublishJobService:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _effective_mapping_snapshot(self, db: Session, illegal_dataset_id: int, payload: dict[str, Any]) -> dict[str, str]:
-        mapping_rows = self._svc.get_label_mappings(db, int(illegal_dataset_id))
-        mapping_snapshot = {
-            raw_label: mapped_label
-            for item in mapping_rows
-            for raw_label, mapped_label in [
-                (str(item.raw_label or "").strip(), self._svc._effective_label_mapping_value(item))
-            ]
-            if raw_label and mapped_label
-        }
-        overrides = payload.get("label_mapping_overrides") or {}
-        if isinstance(overrides, dict):
-            for raw_label, raw_value in overrides.items():
-                raw_label_s = str(raw_label or "").strip()
-                mapped_label = self._svc._normalize_label_mapping_override_value(raw_value)
-                if raw_label_s and mapped_label:
-                    mapping_snapshot[raw_label_s] = mapped_label
-        return mapping_snapshot
+        overrides = payload.get("label_mapping_overrides") if isinstance(payload.get("label_mapping_overrides"), dict) else None
+        return labels.mapping_snapshot(db, int(illegal_dataset_id), overrides=overrides)
 
     def _job_to_payload(self, job: IllegalDatasetPublishJob, *, reused: bool = False) -> dict[str, Any]:
         result = job.result if isinstance(job.result, dict) else None
@@ -257,12 +160,6 @@ class IllegalDatasetPublishJobService:
 
     def _job_out(self, job: IllegalDatasetPublishJob, *, reused: bool = False) -> IllegalDatasetPublishJobOut:
         return IllegalDatasetPublishJobOut.model_validate(self._job_to_payload(job, reused=reused))
-
-    def _sync_status_file(self, job: IllegalDatasetPublishJob, *, reused: bool = False) -> None:
-        try:
-            self._write_status_file(int(job.illegal_dataset_id), str(job.job_id), self._job_to_payload(job, reused=reused))
-        except Exception:
-            pass
 
     def _get_job_row(self, db: Session, illegal_dataset_id: int, job_id: str) -> IllegalDatasetPublishJob:
         row = (
@@ -336,8 +233,8 @@ class IllegalDatasetPublishJobService:
         )
 
     def create_job(self, db: Session, illegal_dataset_id: int, payload: IllegalDatasetPublishRequest) -> IllegalDatasetPublishJobOut:
-        dataset = self._svc.get_dataset(db, int(illegal_dataset_id))
-        version = self._svc._selected_version(db, dataset, version_id=payload.version_id)
+        dataset = self._core.get_dataset(db, int(illegal_dataset_id))
+        version = versions.selected_version(db, dataset, version_id=payload.version_id)
         request_payload = payload.model_dump(mode="json")
         request_payload["version_id"] = int(version.version_id)
         mapping_snapshot = self._effective_mapping_snapshot(db, int(illegal_dataset_id), request_payload)
@@ -377,8 +274,6 @@ class IllegalDatasetPublishJobService:
 
         db.commit()
         db.refresh(job)
-        self._write_request_file(int(illegal_dataset_id), str(job.job_id), request_payload)
-        self._sync_status_file(job, reused=reused)
         return self._job_out(job, reused=reused)
 
     def get_job(self, illegal_dataset_id: int, job_id: str) -> IllegalDatasetPublishJobOut:
@@ -386,14 +281,6 @@ class IllegalDatasetPublishJobService:
         try:
             job = self._get_job_row(db, int(illegal_dataset_id), str(job_id))
             return self._job_out(job)
-        except NotFoundError:
-            with self._lock(illegal_dataset_id, job_id):
-                return IllegalDatasetPublishJobOut.model_validate(
-                    self._read_json_retry(
-                        self.status_path(illegal_dataset_id, job_id),
-                        missing_message="Illegal dataset publish job not found",
-                    )
-                )
         finally:
             db.close()
 
@@ -461,23 +348,16 @@ class IllegalDatasetPublishJobService:
         job.updated_at = self._utcnow()
         db.commit()
         db.refresh(job)
-        self._sync_status_file(job)
         return job
 
     def _is_cancel_requested(self, illegal_dataset_id: int, job_id: str) -> bool:
+        """Read cancellation state from the authoritative publish-job row."""
         db = SessionLocal()
         try:
             job = self._get_job_row(db, int(illegal_dataset_id), str(job_id))
             return bool(getattr(job, "cancel_requested", False)) or str(job.status or "").lower() == "cancelled"
         except NotFoundError:
-            try:
-                payload = self._read_json_retry(
-                    self.status_path(illegal_dataset_id, job_id),
-                    missing_message="Illegal dataset publish job not found",
-                )
-                return bool(payload.get("cancel_requested")) or str(payload.get("status") or "").lower() == "cancelled"
-            except Exception:
-                return False
+            return False
         finally:
             db.close()
 
@@ -490,7 +370,6 @@ class IllegalDatasetPublishJobService:
                 job.cancel_requested = True if status == "cancelled" else bool(getattr(job, "cancel_requested", False))
                 db.commit()
                 db.refresh(job)
-                self._sync_status_file(job)
                 return self._job_out(job)
 
             payload = self._job_to_payload(job)
@@ -513,7 +392,6 @@ class IllegalDatasetPublishJobService:
             job.updated_at = self._utcnow()
             db.commit()
             db.refresh(job)
-            self._sync_status_file(job)
             return self._job_out(job)
         finally:
             db.close()
@@ -530,7 +408,6 @@ class IllegalDatasetPublishJobService:
         try:
             job = self._get_job_row(db, int(illegal_dataset_id), str(job_id))
             if str(job.status or "").lower() in TERMINAL_STATUSES:
-                self._sync_status_file(job)
                 return self._job_to_payload(job)
             payload = self._job_to_payload(job)
             payload.update(dict(patch or {}))
@@ -556,9 +433,7 @@ class IllegalDatasetPublishJobService:
             job.updated_at = self._utcnow()
             db.commit()
             db.refresh(job)
-            synced = self._job_to_payload(job)
-            self._sync_status_file(job)
-            return synced
+            return self._job_to_payload(job)
         finally:
             db.close()
 
@@ -572,9 +447,9 @@ class IllegalDatasetPublishJobService:
                 request_payload = job.request_payload if isinstance(job.request_payload, dict) else None
                 idempotency_key = str(job.idempotency_key or "")
             if request_payload is None:
-                request_payload = self._read_request_file(int(illegal_dataset_id), str(job_id))
+                raise NotFoundError("Illegal dataset publish request is missing")
             with session_scope() as db:
-                publish_snapshot = self._svc.prepare_publish_snapshot(
+                publish_snapshot = prepare_publish_snapshot(
                     db,
                     int(illegal_dataset_id),
                     obj=request_payload,
@@ -624,7 +499,7 @@ class IllegalDatasetPublishJobService:
         try:
             if self._is_cancel_requested(int(illegal_dataset_id), str(job_id)):
                 raise PublishJobCancelled("转换任务已取消")
-            materialized = self._svc.materialize_publish_snapshot(
+            materialized = materialize_publish_snapshot(
                 publish_snapshot,
                 obj=request_payload,
                 progress_callback=progress_callback,
@@ -643,7 +518,7 @@ class IllegalDatasetPublishJobService:
                 },
             )
             with session_scope() as db:
-                result = self._svc.finalize_publish_snapshot(
+                result = finalize_publish_snapshot(
                     db,
                     publish_snapshot,
                     materialized,
@@ -666,7 +541,7 @@ class IllegalDatasetPublishJobService:
                 message=f"转换完成，已生成标准数据集 #{int(result.get('standard_dataset_id') or 0)}",
             )
         except PublishJobCancelled as exc:
-            self._cleanup_materialized_publish(materialized)
+            cleanup_materialized_publish(materialized)
             self._update_status(
                 int(illegal_dataset_id),
                 str(job_id),
@@ -680,7 +555,7 @@ class IllegalDatasetPublishJobService:
                 message=str(exc) or "转换任务已取消",
             )
         except Exception as exc:
-            self._cleanup_materialized_publish(materialized)
+            cleanup_materialized_publish(materialized)
             msg = f"{type(exc).__name__}: {exc}"
             self._update_status(
                 int(illegal_dataset_id),
@@ -688,14 +563,3 @@ class IllegalDatasetPublishJobService:
                 {"status": "failed", "phase": "failed", "progress": 100, "error_message": msg},
                 message=msg,
             )
-
-    def _cleanup_materialized_publish(self, materialized: dict[str, Any] | None) -> None:
-        if not isinstance(materialized, dict):
-            return
-        temp_dir = str(materialized.get("temp_dir") or "").strip()
-        if not temp_dir:
-            return
-        try:
-            remove_tree(Path(temp_dir))
-        except Exception:
-            pass

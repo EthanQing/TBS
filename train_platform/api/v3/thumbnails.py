@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
+from train_platform.domains.datasets.illegal.service import IllegalDatasetService
 from train_platform.domains.datasets.storage.mounted import resolve_mounted_file
 from train_platform.domains.datasets.storage.paths import resolve_storage_token
 from train_platform.services.v3.standard_dataset_service import StandardDatasetService
