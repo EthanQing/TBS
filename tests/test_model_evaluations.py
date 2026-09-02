@@ -8,10 +8,13 @@ import yaml
 
 from train_platform.models.v3.enums import DatasetSplit
 from train_platform.models.v3.standard_dataset import StandardDatasetImage
-from train_platform.services.v3.model_evaluation_metrics import box_iou, compute_detection_metrics
+from train_platform.services.v3.model_evaluation_metrics import (
+    box_iou,
+    compute_detection_metrics,
+    extract_ultralytics_val_metrics,
+)
 from train_platform.services.v3.model_evaluation_service import ModelEvaluationService
-from train_platform.workers.inference_worker import _extract_ultralytics_val_metrics
-from train_platform.workers.yolo_worker import _inference_worker_endpoint
+from train_platform.workers.yolo_worker_impl import _inference_worker_endpoint
 
 
 def test_box_iou_identical_and_disjoint() -> None:
@@ -124,7 +127,7 @@ def test_select_labeled_image_rows_skips_missing_and_empty_labels(tmp_path) -> N
         ],
     )
 
-    assert [r.path for r in labeled] == ["images/ok.jpg"]
+    assert labeled == ["images/ok.jpg"]
     assert skipped == 2
 
 
@@ -178,7 +181,7 @@ def test_cancelled_evaluation_job_cannot_be_reactivated(tmp_path, monkeypatch) -
     (job_dir / "status.json").write_text(json.dumps(status), encoding="utf-8")
 
     cancelled = svc.cancel_job(job_id)
-    svc._update_status_if_not_terminal(
+    svc._store().update(
         job_id,
         {"status": "completed", "phase": "done", "progress": 100},
         bump_seq=True,
@@ -210,7 +213,7 @@ class _FakeValResults:
 
 
 def test_extract_ultralytics_val_metrics() -> None:
-    metrics = _extract_ultralytics_val_metrics(_FakeValResults(), elapsed_ms=1234.5)
+    metrics = extract_ultralytics_val_metrics(_FakeValResults(), elapsed_ms=1234.5)
 
     assert metrics["precision"] == pytest.approx(0.75)
     assert metrics["recall"] == pytest.approx(0.6)
@@ -240,7 +243,7 @@ class _FakeSparseValResults:
 
 
 def test_extract_ultralytics_val_metrics_handles_sparse_class_ids() -> None:
-    metrics = _extract_ultralytics_val_metrics(_FakeSparseValResults(), elapsed_ms=10)
+    metrics = extract_ultralytics_val_metrics(_FakeSparseValResults(), elapsed_ms=10)
 
     by_class = {item["class_id"]: item for item in metrics["class_metrics"]}
 

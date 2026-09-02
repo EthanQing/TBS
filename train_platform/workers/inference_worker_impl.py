@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 
 from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
+from train_platform.platform.jobs import JobStore
+from train_platform.services.v3.model_evaluation_metrics import extract_ultralytics_val_metrics
 
 app = FastAPI(title="Inference Worker", version="1.0")
 
@@ -346,146 +348,6 @@ def _benchmark_ultralytics_yolo(
     return round(float(statistics.median(timings)), 4)
 
 
-def _as_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def _to_list(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    try:
-        if hasattr(value, "tolist"):
-            out = value.tolist()
-            return out if isinstance(out, list) else [out]
-    except Exception:
-        pass
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return []
-
-
-def _extract_ultralytics_val_metrics(results: Any, elapsed_ms: float) -> Dict[str, Any]:
-    box = getattr(results, "box", None)
-    names = getattr(results, "names", None) or {}
-    if not isinstance(names, dict):
-        names = {}
-
-    precision = _as_float(getattr(box, "mp", 0.0))
-    recall = _as_float(getattr(box, "mr", 0.0))
-    map50 = _as_float(getattr(box, "map50", 0.0))
-    map50_95 = _as_float(getattr(box, "map", 0.0))
-    f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-
-    ap_class_index = [int(x) for x in _to_list(getattr(box, "ap_class_index", []))]
-    p_values = [_as_float(x) for x in _to_list(getattr(box, "p", []))]
-    r_values = [_as_float(x) for x in _to_list(getattr(box, "r", []))]
-    maps = [_as_float(x) for x in _to_list(getattr(box, "maps", []))]
-
-    all_ap = _to_list(getattr(box, "all_ap", []))
-    ap50_values: list[float] = []
-    if all_ap:
-        for row in all_ap:
-            values = _to_list(row)
-            ap50_values.append(_as_float(values[0] if values else 0.0))
-
-    nt_per_class = [int(_as_float(x)) for x in _to_list(getattr(results, "nt_per_class", []))]
-
-    name_class_ids = set()
-    for key in names.keys():
-        try:
-            name_class_ids.add(int(key))
-        except Exception:
-            continue
-
-    metric_index_by_class = {class_id: idx for idx, class_id in enumerate(ap_class_index)}
-    compact_metric_arrays = bool(ap_class_index) and any(
-        class_id >= len(ap_class_index) for class_id in ap_class_index
-    )
-    has_full_target_counts = bool(nt_per_class) and (
-        not ap_class_index or len(nt_per_class) > max(ap_class_index)
-    )
-    target_class_ids = (
-        set(range(len(nt_per_class)))
-        if has_full_target_counts
-        else set(ap_class_index[: len(nt_per_class)])
-    )
-    class_ids = sorted(set(ap_class_index) | target_class_ids | name_class_ids)
-
-    def _metric_value(values: list[float], class_id: int) -> float:
-        metric_idx = metric_index_by_class.get(class_id)
-        if metric_idx is not None and metric_idx < len(values):
-            return values[metric_idx]
-        if not compact_metric_arrays and 0 <= class_id < len(values):
-            return values[class_id]
-        return 0.0
-
-    def _target_count(class_id: int) -> int:
-        metric_idx = metric_index_by_class.get(class_id)
-        if has_full_target_counts and 0 <= class_id < len(nt_per_class):
-            return nt_per_class[class_id]
-        if metric_idx is not None and metric_idx < len(nt_per_class):
-            return nt_per_class[metric_idx]
-        return 0
-
-    class_metrics: list[dict[str, Any]] = []
-    total_targets = 0
-    total_predictions = 0
-    est_tp_total = 0
-    est_fp_total = 0
-    est_fn_total = 0
-
-    for class_id in class_ids:
-        p = _metric_value(p_values, class_id)
-        r = _metric_value(r_values, class_id)
-        ap50 = _metric_value(ap50_values, class_id)
-        ap5095 = _metric_value(maps, class_id)
-        gt_count = _target_count(class_id)
-        est_tp = int(round(r * gt_count)) if gt_count > 0 else 0
-        pred_count = int(round(est_tp / p)) if p > 0 else 0
-        est_fp = max(0, pred_count - est_tp)
-        est_fn = max(0, gt_count - est_tp)
-        cf1 = (2.0 * p * r / (p + r)) if (p + r) else 0.0
-        total_targets += gt_count
-        total_predictions += pred_count
-        est_tp_total += est_tp
-        est_fp_total += est_fp
-        est_fn_total += est_fn
-        class_metrics.append(
-            {
-                "class_id": int(class_id),
-                "class_name": str(names.get(class_id, names.get(str(class_id), class_id))),
-                "gt_count": int(gt_count),
-                "pred_count": int(pred_count),
-                "tp": int(est_tp),
-                "fp": int(est_fp),
-                "fn": int(est_fn),
-                "precision": float(p),
-                "recall": float(r),
-                "f1": float(cf1),
-                "ap50": float(ap50),
-                "ap50_95": float(ap5095),
-            }
-        )
-
-    return {
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1),
-        "map50": float(map50),
-        "map50_95": float(map50_95),
-        "tp": int(est_tp_total),
-        "fp": int(est_fp_total),
-        "fn": int(est_fn_total),
-        "total_targets": int(total_targets),
-        "total_predictions": int(total_predictions),
-        "elapsed_ms": round(float(elapsed_ms), 2),
-        "class_metrics": class_metrics,
-    }
-
-
 @app.post("/internal/inference/yolo", response_model=InferenceResponse)
 def run_inference(
     req: InferenceRequest,
@@ -579,7 +441,7 @@ def run_yolo_validation(
         results = model.val(**kwargs)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return YoloValidationResponse(
-            output=_extract_ultralytics_val_metrics(results, elapsed_ms),
+            output=extract_ultralytics_val_metrics(results, elapsed_ms),
             elapsed_ms=round(elapsed_ms, 2),
         )
     except Exception as e:
@@ -592,7 +454,7 @@ def start_inference_job(
     _: None = Depends(_verify_internal_auth),
 ) -> WorkerStatusResponse:
     weights_path = _resolve_training_path(req.weights_path, label="weights", must_exist=True)
-    status_path = settings.temp_dir / "inference_jobs" / str(req.job_id) / "status.json"
+    status_path = JobStore(settings.temp_dir / "inference_jobs").status_path(req.job_id)
     if not status_path.exists():
         return WorkerStatusResponse(
             status="error",

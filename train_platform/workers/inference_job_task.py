@@ -1,97 +1,28 @@
 from __future__ import annotations
 
-import json
-import os
-import threading
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from train_platform.core.config import settings
+from train_platform.platform.jobs import JobStatus, JobStore, is_running_status
 from train_platform.utils.exceptions import ValidationError
 from train_platform.utils.path_utils import resolve_temp_path
 
 InferenceFn = Callable[[Path], Dict[str, Any]]
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _to_iso(dt: Optional[datetime] = None) -> str:
-    return (dt or _utcnow()).isoformat()
+def _job_store() -> JobStore:
+    return JobStore(settings.temp_dir / "inference_jobs")
 
 
 def _job_dir(job_id: str) -> Path:
-    return settings.temp_dir / "inference_jobs" / str(job_id)
-
-
-def _status_path(job_id: str) -> Path:
-    return _job_dir(job_id) / "status.json"
-
-
-def _results_path(job_id: str) -> Path:
-    return _job_dir(job_id) / "results.jsonl"
-
-
-def _read_status(job_id: str) -> Dict[str, Any]:
-    path = _status_path(job_id)
-    if not path.exists():
-        raise ValidationError("Inference job status not found")
-    data = json.loads(path.read_text(encoding="utf-8") or "{}")
-    if not isinstance(data, dict):
-        raise ValidationError("Invalid inference job status payload")
-    return data
-
-
-def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    payload = dict(data or {})
-    payload["updated_at"] = _to_iso()
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-    tmp.replace(path)
-
-
-def _write_status(job_id: str, data: Dict[str, Any]) -> None:
-    _write_json_atomic(_status_path(job_id), data)
-
-
-def _update_status(job_id: str, patch: Dict[str, Any], *, bump_seq: bool = True) -> Dict[str, Any]:
-    current = _read_status(job_id)
-    current.update(dict(patch or {}))
-    current["progress"] = max(0, min(100, int(current.get("progress") or 0)))
-    current["processed"] = max(0, int(current.get("processed") or 0))
-    current["total"] = max(0, int(current.get("total") or 0))
-    if bump_seq:
-        current["seq"] = int(current.get("seq") or 0) + 1
-    _write_status(job_id, current)
-    return current
-
-
-def _append_item(job_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
-    status = _read_status(job_id)
-    rid = int(status.get("last_result_id") or 0) + 1
-    row = dict(item or {})
-    row["result_id"] = rid
-    path = _results_path(job_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-    status["last_result_id"] = rid
-    status["seq"] = int(status.get("seq") or 0) + 1
-    _write_status(job_id, status)
-    return row
+    return _job_store().job_dir(job_id)
 
 
 def _is_cancel_requested(job_id: str) -> bool:
-    try:
-        return bool(_read_status(job_id).get("cancel_requested"))
-    except Exception:
-        return True
+    return bool(_job_store().read_status(job_id).get("cancel_requested"))
 
 
 def _static_temp_url(path: Path) -> Optional[str]:
@@ -203,11 +134,11 @@ def _run_image_job(
     show_confidence: bool,
 ) -> None:
     total = len(input_tokens)
-    _update_status(job_id, {"phase": "inferring", "total": total, "processed": 0, "progress": 0}, bump_seq=True)
+    _job_store().update(job_id, {"phase": "inferring", "total": total, "processed": 0, "progress": 0}, bump_seq=True)
 
     for idx, token in enumerate(input_tokens, start=1):
         if _is_cancel_requested(job_id):
-            _update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+            _job_store().update(job_id, {"status": JobStatus.CANCELLED, "phase": "cancelled"}, bump_seq=True)
             return
 
         src_path = resolve_temp_path(token)
@@ -240,7 +171,7 @@ def _run_image_job(
             except Exception:
                 out_url = None
 
-        _append_item(
+        _job_store().append_result(
             job_id,
             {
                 "filename": Path(token).name,
@@ -256,7 +187,7 @@ def _run_image_job(
         )
 
         progress = int((idx / total) * 100) if total > 0 else 100
-        _update_status(
+        _job_store().update(
             job_id,
             {
                 "processed": idx,
@@ -267,8 +198,8 @@ def _run_image_job(
             bump_seq=True,
         )
 
-    mode = str(_read_status(job_id).get("mode") or "image")
-    _update_status(job_id, {"result": {"mode": mode, "items": []}, "phase": "finalizing"}, bump_seq=True)
+    mode = str(_job_store().read_status(job_id).get("mode") or "image")
+    _job_store().update(job_id, {"result": {"mode": mode, "items": []}, "phase": "finalizing"}, bump_seq=True)
 
 
 def _run_video_job(
@@ -327,7 +258,7 @@ def _run_video_job(
 
     start_t = time.perf_counter()
     processed = 0
-    _update_status(
+    _job_store().update(
         job_id,
         {"phase": "inferring", "total": max(0, total_frames), "processed": 0, "progress": 0},
         bump_seq=True,
@@ -351,7 +282,7 @@ def _run_video_job(
             writer.write(handle_frame(first_frame))
             processed += 1
             progress0 = int((processed / total_frames) * 100) if total_frames > 0 else 0
-            _update_status(
+            _job_store().update(
                 job_id,
                 {
                     "processed": processed,
@@ -367,13 +298,13 @@ def _run_video_job(
             if not ok:
                 break
             if _is_cancel_requested(job_id):
-                _update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+                _job_store().update(job_id, {"status": JobStatus.CANCELLED, "phase": "cancelled"}, bump_seq=True)
                 return
 
             writer.write(handle_frame(frame))
             processed += 1
             progress = int((processed / total_frames) * 100) if total_frames > 0 else 0
-            _update_status(
+            _job_store().update(
                 job_id,
                 {
                     "processed": processed,
@@ -392,7 +323,7 @@ def _run_video_job(
             pass
 
     if _is_cancel_requested(job_id):
-        _update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+        _job_store().update(job_id, {"status": JobStatus.CANCELLED, "phase": "cancelled"}, bump_seq=True)
         return
 
     if not out_video.exists() or out_video.stat().st_size <= 0:
@@ -402,7 +333,7 @@ def _run_video_job(
         raise ValidationError("Failed to resolve output video URL")
 
     elapsed_ms = round((time.perf_counter() - start_t) * 1000.0, 2)
-    _update_status(
+    _job_store().update(
         job_id,
         {
             "phase": "finalizing",
@@ -437,13 +368,13 @@ def run_inference_job(
     show_confidence: bool,
 ) -> None:
     try:
-        _update_status(
+        _job_store().update(
             job_id,
-            {"status": "running", "phase": "preparing", "progress": 0, "error_message": None},
+            {"status": JobStatus.RUNNING, "phase": "preparing", "progress": 0, "error_message": None},
             bump_seq=True,
         )
         if _is_cancel_requested(job_id):
-            _update_status(job_id, {"status": "cancelled", "phase": "cancelled"}, bump_seq=True)
+            _job_store().update(job_id, {"status": JobStatus.CANCELLED, "phase": "cancelled"}, bump_seq=True)
             return
 
         normalized_mode = str(mode or "").strip().lower()
@@ -469,19 +400,19 @@ def run_inference_job(
         else:
             raise ValidationError(f"Unsupported inference job mode: {mode}")
 
-        final = _read_status(job_id)
-        if str(final.get("status")) == "running":
-            _update_status(
+        final = _job_store().read_status(job_id)
+        if is_running_status(final.get("status")):
+            _job_store().update(
                 job_id,
-                {"status": "completed", "phase": "done", "progress": 100, "error_message": None},
+                {"status": JobStatus.COMPLETED, "phase": "done", "progress": 100, "error_message": None},
                 bump_seq=True,
             )
     except Exception as e:
         try:
-            _update_status(
+            _job_store().update(
                 job_id,
                 {
-                    "status": "failed",
+                    "status": JobStatus.FAILED,
                     "phase": "failed",
                     "progress": 100,
                     "error_message": f"{type(e).__name__}: {e}",

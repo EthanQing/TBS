@@ -8,13 +8,16 @@ from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
+from train_platform.platform.jobs import is_terminal_status
 from train_platform.schemas.v3.inference_jobs import InferenceModelCandidate
 from train_platform.schemas.v3.model_evaluations import ModelEvaluationCreate, ModelEvaluationOut
+from train_platform.services.v3.model_candidate_service import ModelCandidateService
 from train_platform.services.v3.model_evaluation_service import ModelEvaluationService
 
 
 router = APIRouter(prefix="/model-evaluations", tags=["model-evaluations"])
 _svc = ModelEvaluationService()
+_model_candidates = ModelCandidateService()
 
 
 def _parse_cursor(raw: Any) -> int:
@@ -28,7 +31,7 @@ def _parse_cursor(raw: Any) -> int:
 
 @router.get("/models", response_model=list[InferenceModelCandidate])
 def list_evaluation_models(project_id: int | None = Query(None), db: Session = Depends(get_db)):
-    return _svc.list_evaluable_models(db, project_id=project_id)
+    return _model_candidates.list_inferable_models(db, project_id=project_id)
 
 
 @router.post("", response_model=ModelEvaluationOut, status_code=201)
@@ -111,8 +114,8 @@ async def stream_model_evaluation(websocket: WebSocket, job_id: str):
                 await websocket.send_json({"type": "item", "data": row})
                 last_result_id = rid
 
-            status = str(payload.get("status") or "").strip().lower()
-            if status in {"completed", "failed", "cancelled"}:
+            status = payload.get("status")
+            if is_terminal_status(status):
                 await websocket.send_json(
                     {
                         "type": "done",
