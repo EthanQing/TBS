@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import shutil
-import uuid
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.core.config import settings
+from train_platform.domains.inference.input import save_uploaded_file
+from train_platform.domains.inference.service import InferenceService
 from train_platform.models.v3.deployment import Deployment
 from train_platform.models.v3.enums import DeploymentStatus
 from train_platform.schemas.v3.deployments import (
@@ -18,7 +16,6 @@ from train_platform.schemas.v3.deployments import (
     ServingJobOut,
 )
 from train_platform.services.v3.deployment_runtime_service import verify_api_key
-from train_platform.services.v3.inference_service import InferenceService
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 
 
@@ -56,20 +53,6 @@ def _assert_key(dep: Deployment, request: Request) -> None:
         raise HTTPException(status_code=401, detail="Missing deployment API key")
     if not verify_api_key(raw, str(dep.api_key_hash or "")):
         raise HTTPException(status_code=401, detail="Invalid deployment API key")
-
-
-def _save_uploaded_file(file: UploadFile) -> str:
-    suffix = Path(file.filename or "").suffix or ".jpg"
-    settings.temp_dir.mkdir(parents=True, exist_ok=True)
-    out_dir = settings.temp_dir / "serving_uploads"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    token = f"serving_uploads/{uuid.uuid4().hex}{suffix}"
-    out_path = (settings.temp_dir / token).resolve(strict=False)
-    if settings.temp_dir.resolve() not in out_path.parents:
-        raise ValidationError("Unsafe upload path")
-    with open(out_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    return token
 
 
 def _normalize_output(raw: dict[str, Any] | None) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]]]:
@@ -147,7 +130,12 @@ async def serving_infer(
             file = up
 
     if file is not None:
-        input_path = _save_uploaded_file(file)
+        input_path = save_uploaded_file(
+            file.filename or "",
+            file.file,
+            subdir="serving_uploads",
+            validate_suffix=False,
+        )
 
     if bool(input_path) == bool(image_url):
         raise ValidationError("Provide exactly one of file or image_url")

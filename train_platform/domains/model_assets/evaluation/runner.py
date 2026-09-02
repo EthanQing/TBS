@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
+from train_platform.platform.runtime import ModelWorkerClient
 from train_platform.services.v3.dataset_common import guess_label_path, read_yolo_boxes
-from train_platform.services.v3.inference_service import InferenceService
 from train_platform.utils.exceptions import ValidationError
 
 from .metrics import compute_detection_metrics
@@ -47,7 +47,7 @@ def run_evaluation(
     prepared: PreparedEvaluation,
     *,
     job_dir: Path,
-    inference_service: InferenceService,
+    worker_client: ModelWorkerClient,
     observer: EvaluationObserver,
 ) -> EvaluationRunResult:
     """Execute one prepared evaluation using its engine's current strategy."""
@@ -81,7 +81,7 @@ def run_evaluation(
 
         data_yaml = materialize_ultralytics_eval_data(prepared, job_dir)
         observer.update_phase("calculating", progress=5)
-        metrics = inference_service.run_ultralytics_yolo_validation(
+        metrics = worker_client.validate_ultralytics_yolo(
             weights_path=prepared.model.weights_path,
             data_yaml=data_yaml,
             conf=float(prepared.conf),
@@ -171,7 +171,7 @@ def run_evaluation(
         try:
             if observer.is_cancel_requested():
                 return cancelled_result(index - 1)
-            output = inference_service.run_engine(
+            output = worker_client.execute_model(
                 engine=engine or "ultralytics-yolo",
                 weights_path=prepared.model.weights_path,
                 image_path=image_path,

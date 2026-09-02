@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import requests
 import shutil
 import statistics
 import time
@@ -34,6 +33,7 @@ from train_platform.models.v3.training_run import (
     TrainingRunResult,
 )
 from train_platform.models.v3.training_run_meta import TrainingRunMeta
+from train_platform.platform.runtime import ModelWorkerClient
 from train_platform.repositories.v3.training_run_meta_repo import TrainingRunMetaRepository
 from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
 from train_platform.training.registry import get_plugin
@@ -44,7 +44,6 @@ from train_platform.utils.training_augmentations import normalize_training_augme
 from train_platform.utils.training_loss_weights import normalize_training_loss_weights
 from train_platform.utils.training_params import validate_training_params_for_engine
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
-from train_platform.services.v3.inference_service import InferenceService
 from train_platform.services.v3.alarm_service import AlarmService
 
 try:
@@ -187,6 +186,7 @@ class TrainingRunService:
     def __init__(self) -> None:
         self.runs = TrainingRunRepository()
         self.meta_repo = TrainingRunMetaRepository()
+        self._worker = ModelWorkerClient()
 
     def _try_eval_alarms(self, db: Session, run_ids: List[str]) -> None:
         AlarmService.try_evaluate_training_rules(db, run_ids=run_ids)
@@ -925,30 +925,20 @@ class TrainingRunService:
         if not weights_path.exists() or not weights_path.is_file():
             return {}
 
-        worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
-        timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "120"))
-        payload = {
-            "weights_path": str(weights_path),
-            "image_path": str(self._ensure_benchmark_image()),
-            "imgsz": self._run_image_size(run),
-            "conf": 0.25,
-            "iou": 0.45,
-            "warmup": 1,
-            "iters": 5,
-        }
-        resp = requests.post(
-            f"{worker_url}/internal/model-stats/yolo",
-            json=payload,
-            timeout=timeout,
-            headers=InferenceService()._internal_request_headers(),
-        )
-        if resp.status_code != 200:
+        try:
+            return self._worker.get_yolo_model_stats(
+                weights_path=weights_path,
+                image_path=self._ensure_benchmark_image(),
+                imgsz=self._run_image_size(run),
+                conf=0.25,
+                iou=0.45,
+                warmup=1,
+                iters=5,
+            )
+        except Exception:
+            # Report artifact statistics are best effort; worker failures should not
+            # make an otherwise completed training run unavailable.
             return {}
-
-        data = resp.json()
-        if data.get("error"):
-            return {}
-        return data if isinstance(data, dict) else {}
 
     def _ensure_report_artifacts(self, db: Session, run: TrainingRun) -> TrainingRunResult | None:
         result = run.result
@@ -1156,7 +1146,6 @@ class TrainingRunService:
         arch = run.architecture
         engine = str(getattr(arch, "engine", "") or "ultralytics-yolo").strip().lower()
 
-        infer = InferenceService()
         config_path = None
         if engine == "paddle-det":
             config_path = resolve_architecture_config_path(arch)
@@ -1167,7 +1156,7 @@ class TrainingRunService:
         iters = max(1, int(iters))
 
         for _ in range(warmup):
-            infer.run_engine(
+            self._worker.execute_model(
                 engine=engine,
                 weights_path=weights_path,
                 image_path=benchmark_image,
@@ -1179,7 +1168,7 @@ class TrainingRunService:
         timings: List[float] = []
         for _ in range(iters):
             t0 = time.perf_counter()
-            infer.run_engine(
+            self._worker.execute_model(
                 engine=engine,
                 weights_path=weights_path,
                 image_path=benchmark_image,

@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session
 from train_platform.core.config import settings
 from train_platform.db.session import session_scope
 from train_platform.platform.jobs import JobNotFoundError, JobStatus, JobStore, JobStoreError, is_active_status
+from train_platform.platform.runtime import ModelWorkerClient
 from train_platform.schemas.v3.model_evaluations import ModelEvaluationCreate, ModelEvaluationOut
-from train_platform.services.v3.inference_service import InferenceService
 from train_platform.utils.exceptions import ConflictError, ValidationError
 
 from ..runtime import resolve_model_runtime
@@ -94,8 +94,8 @@ class _JobExecutionObserver:
 class EvaluationService:
     ACTIVE_STALE_AFTER = timedelta(hours=4)
 
-    def __init__(self) -> None:
-        self._infer = InferenceService()
+    def __init__(self, worker_client: ModelWorkerClient | None = None) -> None:
+        self._worker = worker_client or ModelWorkerClient()
         self._versions = ModelVersionService()
 
     def jobs_root(self) -> Path:
@@ -266,7 +266,7 @@ class EvaluationService:
         result = run_evaluation(
             prepared,
             job_dir=self.job_dir(job_id),
-            inference_service=self._infer,
+            worker_client=self._worker,
             observer=observer,
         )
         if result.cancelled:

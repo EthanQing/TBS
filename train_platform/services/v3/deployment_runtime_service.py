@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import secrets
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,8 +29,8 @@ from train_platform.models.v3.enums import (
     ModelStage,
 )
 from train_platform.models.v3.model_registry import ModelVersion
+from train_platform.platform.runtime import ModelWorkerClient
 from train_platform.services.v3.deployment_adapters import DeploymentAdapterContext, get_deployment_adapter
-from train_platform.services.v3.inference_service import InferenceService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -72,8 +73,8 @@ class DeploymentRuntimeService:
     _THREADS_LOCK = threading.Lock()
     _RUN_THREADS: dict[str, threading.Thread] = {}
 
-    def __init__(self) -> None:
-        self._infer = InferenceService()
+    def __init__(self, worker_client: ModelWorkerClient | None = None) -> None:
+        self._worker = worker_client or ModelWorkerClient()
 
     def get_run(self, db: Session, run_id: str) -> DeploymentRun:
         rid = str(run_id or "").strip()
@@ -436,18 +437,21 @@ class DeploymentRuntimeService:
         smoke_image = smoke_dir / f"{run_id}.jpg"
         Image.new("RGB", (64, 64), color=(0, 0, 0)).save(smoke_image)
 
-        out = self._infer.run_inference_output_for_model(
-            model,
-            input_path=str(smoke_image),
-            stored_token=str(smoke_image),
-            conf=float(defaults["conf"]),
-            iou=float(defaults["iou"]),
-        )
-        err = str(out.get("error_message") or "").strip()
-        if err:
-            raise RuntimeError(f"Smoke test failed: {err}")
+        started = time.perf_counter()
+        try:
+            output = self._worker.execute_model(
+                engine=model.engine,
+                weights_path=model.weights_path,
+                image_path=smoke_image,
+                conf=float(defaults["conf"]),
+                iou=float(defaults["iou"]),
+                config_path=model.config_path,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Smoke test failed: {type(exc).__name__}: {exc}") from exc
+        inference_time_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
-        output = out.get("output") if isinstance(out.get("output"), dict) else {}
+        output = output if isinstance(output, dict) else {}
         preds = output.get("predictions") if isinstance(output, dict) else None
         pred_count = len(preds) if isinstance(preds, list) else 0
         with session_scope() as db:
@@ -461,7 +465,7 @@ class DeploymentRuntimeService:
                 message="Smoke test passed",
                 step_key="smoke_test",
                 action="completed",
-                detail={"detections": pred_count, "inference_time_ms": out.get("inference_time_ms")},
+                detail={"detections": pred_count, "inference_time_ms": inference_time_ms},
             )
 
     def _step_activate(
