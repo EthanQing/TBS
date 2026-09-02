@@ -13,17 +13,14 @@ from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
-from train_platform.models.v3.enums import ModelStage, TrainingRunStatus
-from train_platform.models.v3.model_registry import ModelVersion
-from train_platform.models.v3.training_run import TrainingRun
+from train_platform.domains.model_assets.runtime import ModelRuntimeSpec, resolve_model_runtime
+from train_platform.domains.model_assets.versions.service import ModelVersionService
 from train_platform.platform.jobs import JobNotFoundError, JobStatus, JobStore, JobStoreError, is_active_status
 from train_platform.schemas.v3.inference_jobs import (
     InferenceJobCreate,
     InferenceJobOut,
 )
-from train_platform.services.v3.inference_service import InferenceService
-from train_platform.services.v3.model_version_service import ModelVersionService
-from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
+from train_platform.utils.exceptions import ConflictError, ValidationError
 
 _CREATE_JOB_PROCESS_LOCK = threading.Lock()
 
@@ -50,8 +47,7 @@ class InferenceJobService:
     CREATE_JOB_LOCK_TIMEOUT_SEC = float(os.getenv("INFERENCE_JOB_CREATE_LOCK_TIMEOUT_SEC", "5"))
 
     def __init__(self) -> None:
-        self._infer = InferenceService()
-        self._mv_svc = ModelVersionService()
+        self._versions = ModelVersionService()
 
     def jobs_root(self) -> Path:
         root = settings.temp_dir / "inference_jobs"
@@ -94,17 +90,6 @@ class InferenceJobService:
         except Exception:
             pass
 
-    def _resolve_run(self, db: Session, run_id: str | None) -> TrainingRun | None:
-        if not run_id:
-            return None
-        return db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id)).first()
-
-    def _resolve_model_version(self, db: Session, model_version_id: int) -> ModelVersion:
-        row = db.query(ModelVersion).filter(ModelVersion.model_version_id == int(model_version_id)).first()
-        if not row:
-            raise NotFoundError("Model version not found")
-        return row
-
     def _new_job_id(self) -> str:
         return uuid.uuid4().hex
 
@@ -122,48 +107,6 @@ class InferenceJobService:
                 continue
             return data
         return None
-
-    def _ensure_model_version_for_payload(
-        self, db: Session, *, model_version_id: int | None, run_id: str | None
-    ) -> int:
-        if model_version_id is not None:
-            mv = self._resolve_model_version(db, int(model_version_id))
-            return int(mv.model_version_id)
-
-        rid = str(run_id or "").strip()
-        if not rid:
-            raise ValidationError("Missing model_version_id/run_id")
-
-        existing = (
-            db.query(ModelVersion)
-            .filter(ModelVersion.run_id == rid)
-            .order_by(ModelVersion.created_at.desc(), ModelVersion.model_version_id.desc())
-            .first()
-        )
-        if existing:
-            return int(existing.model_version_id)
-
-        run = self._resolve_run(db, rid)
-        if not run:
-            raise NotFoundError("Training run not found")
-        if run.status != TrainingRunStatus.COMPLETED:
-            raise ConflictError("Only completed runs can be used for inference")
-
-        base = f"run-{rid[:8]}"
-        for i in range(1, 200):
-            version = base if i == 1 else f"{base}-{i}"
-            try:
-                mv = self._mv_svc.register_from_run(
-                    db,
-                    run_id=rid,
-                    version=version,
-                    stage=ModelStage.DEVELOPMENT,
-                    description="Auto-created for inference jobs",
-                )
-                return int(mv.model_version_id)
-            except ConflictError:
-                continue
-        raise ConflictError("Failed to auto-register model version for run")
 
     def _normalize_inputs(self, payload: InferenceJobCreate) -> tuple[list[str], Optional[str]]:
         if payload.mode == "video":
@@ -188,15 +131,21 @@ class InferenceJobService:
             return {}
         return {"X-Internal-Token": token}
 
-    def _dispatch_job_to_worker(self, job_id: str, *, status: Dict[str, Any], ctx: Dict[str, Any]) -> None:
-        engine = str(ctx.get("engine") or status.get("engine") or "ultralytics-yolo").strip().lower()
+    def _dispatch_job_to_worker(
+        self,
+        job_id: str,
+        *,
+        status: Dict[str, Any],
+        model: ModelRuntimeSpec,
+    ) -> None:
+        engine = str(model.engine or status.get("engine") or "ultralytics-yolo").strip().lower()
         worker_url = self._worker_url_for_engine(engine)
         timeout = float(os.getenv("INFERENCE_JOB_WORKER_DISPATCH_TIMEOUT", "10"))
 
         payload: Dict[str, Any] = {
             "job_id": job_id,
             "mode": str(status.get("mode") or "image"),
-            "weights_path": str(ctx.get("weights_path") or ""),
+            "weights_path": str(model.weights_path),
             "input_tokens": list(status.get("input_tokens") or []),
             "video_token": status.get("video_token"),
             "conf": float(status.get("conf") or 0.5),
@@ -205,7 +154,7 @@ class InferenceJobService:
             "show_confidence": bool(status.get("show_confidence", True)),
         }
         if engine == "paddle-det":
-            payload["config_path"] = str(ctx.get("config_path") or "")
+            payload["config_path"] = str(model.config_path or "")
 
         resp = requests.post(
             f"{worker_url}/internal/inference-jobs/run",
@@ -238,10 +187,13 @@ class InferenceJobService:
                     st = active.get("status") or JobStatus.RUNNING.value
                     raise ConflictError(f"Another inference job is active (job_id={jid}, status={st})")
 
-                mv_id = self._ensure_model_version_for_payload(
-                    db, model_version_id=payload.model_version_id, run_id=payload.run_id
+                model_version = self._versions.resolve_for_execution(
+                    db,
+                    model_version_id=payload.model_version_id,
+                    run_id=payload.run_id,
+                    description="Auto-created for inference jobs",
                 )
-                ctx = self._infer.resolve_model_context(db, model_version_id=mv_id)
+                model = resolve_model_runtime(db, model_version=model_version)
 
                 tokens, video_token = self._normalize_inputs(payload)
                 mode = str(payload.mode)
@@ -261,11 +213,11 @@ class InferenceJobService:
                     "total": int(total),
                     "seq": 1,
                     "last_result_id": 0,
-                    "model_version_id": int(mv_id),
-                    "run_id": str(ctx.get("run_id") or payload.run_id or ""),
-                    "engine": str(ctx.get("engine") or ""),
-                    "family": str(ctx.get("family") or "") or None,
-                    "variant": str(ctx.get("variant") or "") or None,
+                    "model_version_id": int(model.model_version_id),
+                    "run_id": str(model.run_id or payload.run_id or ""),
+                    "engine": str(model.engine or ""),
+                    "family": model.family,
+                    "variant": model.variant,
                     "conf": float(payload.conf),
                     "iou": float(payload.iou),
                     "show_labels": bool(payload.show_labels),
@@ -283,7 +235,7 @@ class InferenceJobService:
                 self._release_create_job_lock()
 
         try:
-            self._dispatch_job_to_worker(job_id, status=status, ctx=ctx)
+            self._dispatch_job_to_worker(job_id, status=status, model=model)
         except Exception as e:
             self._store().update(
                 job_id,

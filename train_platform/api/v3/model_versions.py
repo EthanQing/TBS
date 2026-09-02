@@ -8,7 +8,7 @@ from train_platform.models.v3.enums import ModelStage
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.schemas.v3.common import Page, PageMeta
 from train_platform.schemas.v3.model_versions import ModelVersionCreate, ModelVersionOut, ModelVersionUpdate
-from train_platform.services.v3.model_version_service import ModelVersionService
+from train_platform.domains.model_assets.versions.service import ModelVersionService
 from train_platform.utils.exceptions import ValidationError
 
 

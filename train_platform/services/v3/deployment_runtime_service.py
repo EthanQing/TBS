@@ -15,6 +15,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.domains.model_assets.runtime import ModelRuntimeSpec, resolve_model_runtime
 from train_platform.db.session import session_scope
 from train_platform.models.v3.deployment import Deployment, DeploymentLog
 from train_platform.models.v3.deployment_run import DeploymentRun
@@ -236,11 +237,11 @@ class DeploymentRuntimeService:
         if not snapshot:
             return
         try:
-            model_context = self._step_validate_artifacts(str(run_id))
+            model = self._step_validate_artifacts(str(run_id))
             if self._check_cancelled_by_id(str(run_id)):
                 return
 
-            snapshot["model_context"] = model_context
+            snapshot["model_context"] = model.to_payload()
             adapter = get_deployment_adapter(snapshot["platform"])
             ctx = self._make_adapter_context(snapshot)
             adapter_prepare_output = adapter.prepare(ctx)
@@ -248,7 +249,7 @@ class DeploymentRuntimeService:
             if self._check_cancelled_by_id(str(run_id)):
                 return
 
-            self._step_smoke_test(str(run_id), model_context)
+            self._step_smoke_test(str(run_id), model)
             if self._check_cancelled_by_id(str(run_id)):
                 return
 
@@ -317,7 +318,7 @@ class DeploymentRuntimeService:
             "iou": float(defaults.get("iou", 0.45)),
         }
 
-    def _step_validate_artifacts(self, run_id: str) -> Dict[str, Any]:
+    def _step_validate_artifacts(self, run_id: str) -> ModelRuntimeSpec:
         with session_scope() as db:
             run = self.get_run(db, run_id)
             run.phase = DeploymentRunPhase.VALIDATE_ARTIFACTS
@@ -336,7 +337,7 @@ class DeploymentRuntimeService:
             model_version_id = int(run.model_version_id)
 
         with session_scope() as db:
-            model_context = self._infer.resolve_model_context(db, model_version_id=model_version_id)
+            model = resolve_model_runtime(db, model_version_id=model_version_id)
 
         with session_scope() as db:
             run = self.get_run(db, run_id)
@@ -349,9 +350,9 @@ class DeploymentRuntimeService:
                 message="Artifacts validated",
                 step_key="validate_artifacts",
                 action="completed",
-                detail={"engine": model_context.get("engine"), "weights_path": model_context.get("weights_path")},
+                detail={"engine": model.engine, "weights_path": str(model.weights_path)},
             )
-        return model_context
+        return model
 
     def _step_materialize_runtime(
         self,
@@ -412,7 +413,7 @@ class DeploymentRuntimeService:
                 detail={"endpoint_url": deployment.endpoint_url, "health_check_url": deployment.health_check_url},
             )
 
-    def _step_smoke_test(self, run_id: str, model_context: dict[str, Any]) -> None:
+    def _step_smoke_test(self, run_id: str, model: ModelRuntimeSpec) -> None:
         with session_scope() as db:
             run = self.get_run(db, run_id)
             run.phase = DeploymentRunPhase.SMOKE_TEST
@@ -435,8 +436,8 @@ class DeploymentRuntimeService:
         smoke_image = smoke_dir / f"{run_id}.jpg"
         Image.new("RGB", (64, 64), color=(0, 0, 0)).save(smoke_image)
 
-        out = self._infer.run_inference_output_from_context(
-            model_context,
+        out = self._infer.run_inference_output_for_model(
+            model,
             input_path=str(smoke_image),
             stored_token=str(smoke_image),
             conf=float(defaults["conf"]),

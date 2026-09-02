@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
+from train_platform.domains.model_assets.runtime import resolve_architecture_config_path
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.standard_dataset import StandardDataset
 from train_platform.models.v3.deployment import Deployment
@@ -1158,7 +1159,7 @@ class TrainingRunService:
         infer = InferenceService()
         config_path = None
         if engine == "paddle-det":
-            config_path = infer._resolve_paddle_config_path(arch)
+            config_path = resolve_architecture_config_path(arch)
             if not config_path:
                 raise ValidationError("Paddle model missing valid config_path")
 

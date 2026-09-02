@@ -12,14 +12,12 @@ import requests
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.models.v3.architecture import ModelArchitecture
+from train_platform.domains.model_assets.runtime import ModelRuntimeSpec, resolve_model_runtime
 from train_platform.models.v3.deployment import Deployment
 from train_platform.models.v3.inference import InferenceRun
 from train_platform.models.v3.model_registry import ModelVersion
-from train_platform.models.v3.training_run import TrainingRun
 from train_platform.utils.exceptions import NotFoundError, ValidationError
-from train_platform.utils.paddledet_paths import resolve_paddledet_config_path
-from train_platform.utils.path_utils import resolve_temp_path, resolve_training_path
+from train_platform.utils.path_utils import resolve_temp_path
 
 
 class InferenceService:
@@ -50,48 +48,6 @@ class InferenceService:
         db.refresh(row)
         return row
 
-    def resolve_model_context(self, db: Session, *, model_version_id: int) -> Dict[str, Any]:
-        mv = db.query(ModelVersion).filter(ModelVersion.model_version_id == int(model_version_id)).first()
-        if not mv:
-            raise NotFoundError("Model version not found")
-
-        weights = str(mv.weights_path or "").strip()
-        if not weights:
-            raise ValidationError("Model version has no weights_path; register from a completed training run first")
-
-        weights_path = resolve_training_path(weights)
-        if not weights_path.exists() or not weights_path.is_file():
-            raise NotFoundError(f"Weights file not found: {weights_path}")
-
-        run = None
-        if mv.run_id:
-            run = db.query(TrainingRun).filter(TrainingRun.run_id == str(mv.run_id)).first()
-
-        arch = None
-        if run:
-            arch = db.query(ModelArchitecture).filter(ModelArchitecture.architecture_id == int(run.architecture_id)).first()
-
-        engine = str(getattr(arch, "engine", "") or "ultralytics-yolo").strip().lower()
-        family = str(getattr(arch, "family", "") or "").strip() or None
-        variant = str(getattr(arch, "variant", "") or "").strip() or None
-
-        config_path = None
-        if engine == "paddle-det":
-            config_path = self._resolve_paddle_config_path(arch)
-            if not config_path:
-                raise ValidationError("Paddle model missing valid config_path in architecture.default_params")
-
-        return {
-            "model_version_id": int(mv.model_version_id),
-            "run_id": str(mv.run_id or ""),
-            "project_id": int(mv.project_id),
-            "engine": engine,
-            "family": family,
-            "variant": variant,
-            "weights_path": str(weights_path),
-            "config_path": str(config_path) if config_path else None,
-        }
-
     def run_inference_output(
         self,
         db: Session,
@@ -108,9 +64,9 @@ class InferenceService:
             raise ValidationError("Provide only one of input_path and image_url")
 
         local_path, stored_token, derived_meta = self._materialize_input(input_path=input_path, image_url=image_url)
-        ctx = self.resolve_model_context(db, model_version_id=int(model_version_id))
-        return self.run_inference_output_from_context(
-            ctx,
+        model = resolve_model_runtime(db, model_version_id=int(model_version_id))
+        return self.run_inference_output_for_model(
+            model,
             input_path=str(local_path),
             stored_token=stored_token,
             derived_meta=derived_meta,
@@ -118,9 +74,9 @@ class InferenceService:
             iou=float(iou),
         )
 
-    def run_inference_output_from_context(
+    def run_inference_output_for_model(
         self,
-        ctx: Dict[str, Any],
+        model: ModelRuntimeSpec,
         *,
         input_path: str,
         stored_token: Optional[str] = None,
@@ -135,28 +91,28 @@ class InferenceService:
         err_msg = None
         try:
             output = self.run_engine(
-                engine=str(ctx.get("engine") or "ultralytics-yolo"),
-                weights_path=Path(str(ctx["weights_path"])),
+                engine=model.engine,
+                weights_path=model.weights_path,
                 image_path=local_path,
                 conf=float(conf),
                 iou=float(iou),
-                config_path=Path(str(ctx["config_path"])) if ctx.get("config_path") else None,
+                config_path=model.config_path,
             )
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         return {
-            "model_version_id": int(ctx.get("model_version_id") or 0),
+            "model_version_id": int(model.model_version_id),
             "input_path": token,
             "input_meta": {**(derived_meta or {}), "conf": float(conf), "iou": float(iou)},
             "output": output,
             "error_message": err_msg,
             "inference_time_ms": elapsed_ms,
-            "engine": ctx.get("engine"),
-            "family": ctx.get("family"),
-            "variant": ctx.get("variant"),
-            "run_id": ctx.get("run_id"),
+            "engine": model.engine,
+            "family": model.family,
+            "variant": model.variant,
+            "run_id": model.run_id,
         }
 
     def run_inference(
@@ -203,19 +159,6 @@ class InferenceService:
         db.commit()
         db.refresh(row)
         return row
-
-    def _resolve_paddle_config_path(self, arch: ModelArchitecture | None) -> Optional[Path]:
-        if not arch:
-            return None
-        params = arch.default_params if isinstance(arch.default_params, dict) else {}
-        raw = params.get("config_path")
-        if raw is None:
-            return None
-        txt = str(raw).strip().replace("\\", "/")
-        if not txt:
-            return None
-
-        return resolve_paddledet_config_path(txt)
 
     def _materialize_input(self, *, input_path: Optional[str], image_url: Optional[str]) -> tuple[Path, str, Dict[str, Any]]:
         meta: Dict[str, Any] = {}

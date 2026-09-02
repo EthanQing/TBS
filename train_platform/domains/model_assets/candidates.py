@@ -6,12 +6,12 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
+from train_platform.domains.model_assets.runtime import resolve_architecture_config_path
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.training_run import TrainingRun
 from train_platform.schemas.v3.inference_jobs import InferenceModelCandidate
-from train_platform.utils.paddledet_paths import resolve_paddledet_config_path
 from train_platform.utils.path_utils import resolve_training_path
 
 
@@ -23,19 +23,6 @@ class ModelCandidateService:
         if engine == "paddle-det":
             return ext == ".pdparams"
         return ext in {".pt", ".pth"}
-
-    def _resolve_paddle_config(self, arch: ModelArchitecture | None) -> Optional[Path]:
-        if not arch:
-            return None
-        params = arch.default_params if isinstance(arch.default_params, dict) else {}
-        raw = params.get("config_path")
-        if not raw:
-            return None
-
-        txt = str(raw).strip().replace("\\", "/")
-        if not txt:
-            return None
-        return resolve_paddledet_config_path(txt)
 
     def _build_candidate(
         self,
@@ -65,7 +52,7 @@ class ModelCandidateService:
 
         config_path = None
         if engine == "paddle-det":
-            cfg = self._resolve_paddle_config(arch)
+            cfg = resolve_architecture_config_path(arch)
             if cfg is None:
                 return None
             config_path = str(cfg)

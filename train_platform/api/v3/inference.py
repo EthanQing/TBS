@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
 from train_platform.core.config import settings
+from train_platform.domains.model_assets.runtime import resolve_model_runtime
 from train_platform.schemas.v3.inference import (
     BatchInferenceCreate,
     BatchInferenceOut,
@@ -120,9 +121,8 @@ def video_inference(payload: VideoInferenceCreate, db: Session = Depends(get_db)
     """
     Run inference on a video file, extracting frames at the given interval.
     """
-    svc = InferenceService()
-    ctx = svc.resolve_model_context(db, model_version_id=int(payload.model_version_id))
-    engine = str(ctx.get("engine") or "ultralytics-yolo").strip().lower()
+    model = resolve_model_runtime(db, model_version_id=int(payload.model_version_id))
+    engine = model.engine
     if engine == "paddle-det":
         worker_url = os.getenv("PADDLE_INFERENCE_WORKER_URL", "http://127.0.0.1:18003").rstrip("/")
         timeout = float(os.getenv("PADDLE_INFERENCE_WORKER_TIMEOUT", "240"))
@@ -135,14 +135,14 @@ def video_inference(payload: VideoInferenceCreate, db: Session = Depends(get_db)
     if token:
         headers["X-Internal-Token"] = token
     worker_payload: Dict[str, Any] = {
-        "weights_path": str(ctx.get("weights_path") or ""),
+        "weights_path": str(model.weights_path),
         "video_token": payload.video_token,
         "frame_interval": int(payload.frame_interval),
         "conf": float(payload.conf),
         "iou": float(payload.iou),
     }
     if engine == "paddle-det":
-        worker_payload["config_path"] = str(ctx.get("config_path") or "")
+        worker_payload["config_path"] = str(model.config_path or "")
     try:
         resp = requests.post(
             f"{worker_url}/internal/inference/video-frames",

@@ -73,7 +73,7 @@ def run_evaluation(
         )
 
     observer.update_phase("validating", progress=1, total=total, processed=0)
-    engine = str(prepared.model_context.get("engine") or "").strip().lower()
+    engine = prepared.model.engine
 
     if engine == "ultralytics-yolo":
         if observer.is_cancel_requested():
@@ -82,7 +82,7 @@ def run_evaluation(
         data_yaml = materialize_ultralytics_eval_data(prepared, job_dir)
         observer.update_phase("calculating", progress=5)
         metrics = inference_service.run_ultralytics_yolo_validation(
-            weights_path=Path(str(prepared.model_context["weights_path"])),
+            weights_path=prepared.model.weights_path,
             data_yaml=data_yaml,
             conf=float(prepared.conf),
             iou=float(prepared.iou),
@@ -173,15 +173,11 @@ def run_evaluation(
                 return cancelled_result(index - 1)
             output = inference_service.run_engine(
                 engine=engine or "ultralytics-yolo",
-                weights_path=Path(str(prepared.model_context["weights_path"])),
+                weights_path=prepared.model.weights_path,
                 image_path=image_path,
                 conf=float(prepared.conf),
                 iou=float(prepared.iou),
-                config_path=(
-                    Path(str(prepared.model_context["config_path"]))
-                    if prepared.model_context.get("config_path")
-                    else None
-                ),
+                config_path=prepared.model.config_path,
             )
             predictions = output.get("predictions") if isinstance(output, dict) else []
             predictions = predictions if isinstance(predictions, list) else []

@@ -10,15 +10,13 @@ from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
 from train_platform.db.session import session_scope
-from train_platform.models.v3.enums import ModelStage, TrainingRunStatus
-from train_platform.models.v3.model_registry import ModelVersion
-from train_platform.models.v3.training_run import TrainingRun
 from train_platform.platform.jobs import JobNotFoundError, JobStatus, JobStore, JobStoreError, is_active_status
 from train_platform.schemas.v3.model_evaluations import ModelEvaluationCreate, ModelEvaluationOut
 from train_platform.services.v3.inference_service import InferenceService
-from train_platform.services.v3.model_version_service import ModelVersionService
-from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
+from train_platform.utils.exceptions import ConflictError, ValidationError
 
+from ..runtime import resolve_model_runtime
+from ..versions.service import ModelVersionService
 from .preparation import PreparedEvaluation, prepare_evaluation
 from .runner import run_evaluation
 
@@ -98,7 +96,7 @@ class EvaluationService:
 
     def __init__(self) -> None:
         self._infer = InferenceService()
-        self._mv_svc = ModelVersionService()
+        self._versions = ModelVersionService()
 
     def jobs_root(self) -> Path:
         root = settings.temp_dir / "model_evaluations"
@@ -138,54 +136,6 @@ class EvaluationService:
             return None
         return self.get_job(job_id, include_items=include_items)
 
-    def _ensure_model_version_for_payload(
-        self,
-        db: Session,
-        *,
-        model_version_id: int | None,
-        run_id: str | None,
-    ) -> int:
-        if model_version_id is not None:
-            row = db.query(ModelVersion).filter(ModelVersion.model_version_id == int(model_version_id)).first()
-            if not row:
-                raise NotFoundError("Model version not found")
-            return int(row.model_version_id)
-
-        rid = str(run_id or "").strip()
-        if not rid:
-            raise ValidationError("Missing model_version_id/run_id")
-
-        existing = (
-            db.query(ModelVersion)
-            .filter(ModelVersion.run_id == rid)
-            .order_by(ModelVersion.created_at.desc(), ModelVersion.model_version_id.desc())
-            .first()
-        )
-        if existing:
-            return int(existing.model_version_id)
-
-        run = db.query(TrainingRun).filter(TrainingRun.run_id == rid).first()
-        if not run:
-            raise NotFoundError("Training run not found")
-        if run.status != TrainingRunStatus.COMPLETED:
-            raise ConflictError("Only completed runs can be evaluated")
-
-        base = f"run-{rid[:8]}"
-        for index in range(1, 200):
-            version = base if index == 1 else f"{base}-{index}"
-            try:
-                model_version = self._mv_svc.register_from_run(
-                    db,
-                    run_id=rid,
-                    version=version,
-                    stage=ModelStage.DEVELOPMENT,
-                    description="Auto-created for model evaluation jobs",
-                )
-                return int(model_version.model_version_id)
-            except ConflictError:
-                continue
-        raise ConflictError("Failed to auto-register model version for evaluation")
-
     def create_job(self, db: Session, payload: ModelEvaluationCreate) -> ModelEvaluationOut:
         with _ACTIVE_CREATE_LOCK:
             active = self._has_active_job()
@@ -194,21 +144,21 @@ class EvaluationService:
                 status = active.get("status") or JobStatus.RUNNING.value
                 raise ConflictError(f"Another evaluation job is active (job_id={job_id}, status={status})")
 
-            model_version_id = self._ensure_model_version_for_payload(
+            model_version = self._versions.resolve_for_execution(
                 db,
                 model_version_id=payload.model_version_id,
                 run_id=payload.run_id,
+                description="Auto-created for model evaluation jobs",
             )
+            runtime = resolve_model_runtime(db, model_version=model_version)
             prepared = prepare_evaluation(
                 db,
                 standard_dataset_id=payload.standard_dataset_id,
                 scope=payload.scope,
-                model_version_id=model_version_id,
+                model=runtime,
                 conf=float(payload.conf),
                 iou=float(payload.iou),
-                inference_service=self._infer,
             )
-            context = prepared.model_context
             job_id = self._new_job_id()
             self.job_dir(job_id)
             status: Dict[str, Any] = {
@@ -220,16 +170,16 @@ class EvaluationService:
                 "total": int(prepared.total_images),
                 "seq": 1,
                 "last_result_id": 0,
-                "model_version_id": int(model_version_id),
-                "run_id": str(context.get("run_id") or payload.run_id or ""),
+                "model_version_id": int(runtime.model_version_id),
+                "run_id": str(runtime.run_id or payload.run_id or ""),
                 "standard_dataset_id": int(prepared.standard_dataset_id),
                 "dataset_name": prepared.dataset_name,
                 "scope": prepared.scope,
                 "conf": float(prepared.conf),
                 "iou": float(prepared.iou),
-                "engine": str(context.get("engine") or ""),
-                "family": context.get("family"),
-                "variant": context.get("variant"),
+                "engine": str(runtime.engine or ""),
+                "family": runtime.family,
+                "variant": runtime.variant,
                 "cancel_requested": False,
                 "skipped_images": int(prepared.skipped_images),
                 "result": {"metrics": None},
@@ -299,14 +249,14 @@ class EvaluationService:
     def _prepare_job_snapshot(self, job_id: str) -> tuple[Dict[str, Any], PreparedEvaluation]:
         status = self._read_job_status(job_id)
         with session_scope() as db:
+            runtime = resolve_model_runtime(db, model_version_id=int(status["model_version_id"]))
             prepared = prepare_evaluation(
                 db,
                 standard_dataset_id=int(status["standard_dataset_id"]),
                 scope=str(status.get("scope") or "all"),
-                model_version_id=int(status["model_version_id"]),
+                model=runtime,
                 conf=float(status.get("conf") or 0.25),
                 iou=float(status.get("iou") or 0.5),
-                inference_service=self._infer,
             )
         return status, prepared
 

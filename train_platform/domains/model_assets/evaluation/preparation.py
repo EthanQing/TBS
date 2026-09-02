@@ -2,16 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
-
 import yaml
 from sqlalchemy.orm import Session
 
 from train_platform.models.v3.enums import DatasetSplit, DatasetType
 from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetImage
 from train_platform.services.v3.dataset_common import guess_label_path, read_class_names, resolve_storage_token
-from train_platform.services.v3.inference_service import InferenceService
 from train_platform.utils.exceptions import NotFoundError, ValidationError
+
+from ..runtime import ModelRuntimeSpec
 
 
 @dataclass(frozen=True)
@@ -23,7 +22,7 @@ class PreparedEvaluation:
     labeled_paths: tuple[str, ...]
     skipped_images: int
     class_names: tuple[str, ...]
-    model_context: Mapping[str, Any]
+    model: ModelRuntimeSpec
     conf: float
     iou: float
 
@@ -118,16 +117,11 @@ def prepare_evaluation(
     *,
     standard_dataset_id: int,
     scope: str,
-    model_version_id: int,
+    model: ModelRuntimeSpec,
     conf: float,
     iou: float,
-    inference_service: InferenceService | None = None,
 ) -> PreparedEvaluation:
     dataset, root = _resolve_dataset(db, standard_dataset_id)
-    model_context = (inference_service or InferenceService()).resolve_model_context(
-        db,
-        model_version_id=int(model_version_id),
-    )
     selected_paths = _select_image_paths(db, dataset, scope)
     if not selected_paths:
         raise ValidationError("No images found for selected evaluation scope")
@@ -144,7 +138,7 @@ def prepare_evaluation(
         labeled_paths=labeled_paths,
         skipped_images=int(skipped_images),
         class_names=tuple(read_class_names(root)),
-        model_context=dict(model_context),
+        model=model,
         conf=float(conf),
         iou=float(iou),
     )

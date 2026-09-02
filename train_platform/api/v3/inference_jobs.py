@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from train_platform.api.deps import get_db
 from train_platform.platform.jobs import is_terminal_status
 from train_platform.schemas.v3.inference_jobs import InferenceJobCreate, InferenceJobOut, InferenceModelCandidate
-from train_platform.services.v3.model_candidate_service import ModelCandidateService
+from train_platform.domains.model_assets.candidates import ModelCandidateService
 from train_platform.services.v3.inference_job_service import InferenceJobService
 
 
