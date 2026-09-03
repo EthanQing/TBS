@@ -63,23 +63,52 @@ def _pair_key(root: Path, path: Path) -> str:
     return "/".join(parts).lower()
 
 
-def collect_image_json_pairs(source_root: Path) -> tuple[list[tuple[Path, Path]], list[str]]:
+def collect_image_json_pair_details(
+    source_root: Path,
+    *,
+    skip_dirs: set[str] | None = None,
+    skip_files: set[str] | None = None,
+) -> tuple[list[tuple[Path, Path]], list[str], list[str]]:
     root = Path(source_root).resolve(strict=False)
+    excluded_dirs = _SKIP_DIRS | {str(name).lower() for name in (skip_dirs or set())}
+    excluded_files = {str(name).lower() for name in (skip_files or set())}
     image_by_key: dict[str, Path] = {}
     json_by_key: dict[str, Path] = {}
-    for path in iter_regular_files(root):
-        ext = path.suffix.lower()
-        if ext in IMAGE_EXTS:
-            image_by_key.setdefault(_pair_key(root, path), path)
-        elif ext == ".json":
-            json_by_key.setdefault(_pair_key(root, path), path)
+    for cur, dirnames, filenames in os.walk(root):
+        cur_path = Path(cur)
+        rel = cur_path.relative_to(root)
+        if rel.parts and rel.parts[0].lower() in excluded_dirs:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [directory for directory in dirnames if directory.lower() not in excluded_dirs]
+        for filename in filenames:
+            if filename.lower() in excluded_files:
+                continue
+            path = cur_path / filename
+            ext = path.suffix.lower()
+            if ext in IMAGE_EXTS:
+                image_by_key.setdefault(_pair_key(root, path), path)
+            elif ext == ".json":
+                json_by_key.setdefault(_pair_key(root, path), path)
     keys = sorted(set(image_by_key) & set(json_by_key))
     warnings: list[str] = []
-    if len(image_by_key) > len(keys):
-        warnings.append(f"Unmatched images: {len(image_by_key) - len(keys)}")
-    if len(json_by_key) > len(keys):
-        warnings.append(f"Unmatched json: {len(json_by_key) - len(keys)}")
-    return [(image_by_key[key], json_by_key[key]) for key in keys], warnings
+    unmatched_details: list[str] = []
+    extra_images = sorted(set(image_by_key) - set(json_by_key))
+    extra_json = sorted(set(json_by_key) - set(image_by_key))
+    if extra_images:
+        warnings.append(f"Unmatched images: {len(extra_images)}")
+        unmatched_details.extend(f"{image_by_key[key].name}: missing json annotation" for key in extra_images[:50])
+    if extra_json:
+        warnings.append(f"Unmatched json: {len(extra_json)}")
+        unmatched_details.extend(f"{json_by_key[key].name}: missing image file" for key in extra_json[:50])
+    if unmatched_details:
+        warnings.extend(f"Skipped {item}" for item in unmatched_details[:50])
+    return [(image_by_key[key], json_by_key[key]) for key in keys], warnings, unmatched_details
+
+
+def collect_image_json_pairs(source_root: Path) -> tuple[list[tuple[Path, Path]], list[str]]:
+    pairs, warnings, _details = collect_image_json_pair_details(source_root)
+    return pairs, [warning for warning in warnings if not warning.startswith("Skipped ")]
 
 
 def choose_image_link(source_root: Path) -> tuple[Path, str]:
@@ -127,7 +156,7 @@ def extract_label(raw_label: str, strategy, separator: str = "%") -> str:
     return raw_label
 
 
-def _normalize_label_key(value: Any) -> str:
+def normalize_label_key(value: Any) -> str:
     if value is None:
         return ""
     s = str(value)
@@ -183,9 +212,22 @@ def _normalize_annotation_points(points: list, *, bottom_left_origin: bool, imag
     return normalized
 
 
-def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
+def _load_annotation_data(json_path: str) -> Any:
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        with open(json_path, "r", encoding="gbk", errors="ignore") as f:
+            return json.load(f)
+
+
+def resolve_annotation_shapes(
+    cfg: dict,
+    *,
+    data: Any = None,
+) -> list[tuple[dict[str, Any], str]]:
+    """Return annotation shapes after applying shared LabelMe filtering and mapping rules."""
     json_path = cfg["annotation_path"]
-    label_map = cfg["label_map"]
     label_strategy = cfg["label_strategy"]
     label_sep = cfg["label_separator"]
     min_prob = cfg["min_probability"]
@@ -200,11 +242,10 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
         label_mapping = {str(k): v for k, v in raw_mapping.items()}
         label_mapping_norm = {}
         for k, v in label_mapping.items():
-            nk = _normalize_label_key(k)
+            nk = normalize_label_key(k)
             if nk in label_mapping_norm and label_mapping_norm[nk] != v:
                 raise ValidationError(f"Conflicting label mappings for normalized key: {nk}")
             label_mapping_norm[nk] = v
-    missing_labels: set[str] = set()
 
     def mapping_value_is_discard(value: Any) -> bool:
         return str(value if value is not None else "").strip() in {"", "__DISCARD__"}
@@ -215,7 +256,7 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
         if label in label_mapping:
             return label_mapping.get(label), True
         if label_mapping_norm is not None:
-            norm_key = _normalize_label_key(label)
+            norm_key = normalize_label_key(label)
             if norm_key in label_mapping_norm:
                 return label_mapping_norm.get(norm_key), True
         return None, False
@@ -224,7 +265,7 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
         if not label_sep:
             return
         seen: set[str] = set()
-        for candidate in (str(label or "").strip(), _normalize_label_key(label)):
+        for candidate in (str(label or "").strip(), normalize_label_key(label)):
             parts = [part.strip() for part in str(candidate).split(label_sep) if part.strip()]
             for index in range(1, len(parts)):
                 parent = label_sep.join(parts[:index])
@@ -241,21 +282,8 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
                 return True
         return False
 
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        with open(json_path, "r", encoding="gbk", errors="ignore") as f:
-            data = json.load(f)
-
-    bboxes: List[BBox] = []
-    auto_map: Dict[str, int] = label_map.copy() if label_map else {}
-
-    def get_cid(name: str) -> int:
-        if name not in auto_map:
-            auto_map[name] = len(auto_map)
-        return auto_map[name]
-
+    if data is None:
+        data = _load_annotation_data(json_path)
     if isinstance(data, dict) and "shapes" in data:
         shapes = data["shapes"]
     elif isinstance(data, list):
@@ -263,9 +291,8 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
     else:
         raise ValidationError(f"Unrecognized json structure: {json_path}")
 
-    bottom_left_origin = isinstance(data, dict) and _uses_bottom_left_origin(data.get("version"))
-    image_height = _annotation_image_height(cfg, data, json_path) if bottom_left_origin else None
-
+    missing_labels: set[str] = set()
+    valid: list[tuple[dict[str, Any], str]] = []
     for shape in shapes:
         if skip_hidden and shape.get("hidden", False):
             continue
@@ -273,24 +300,15 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
             continue
         if shape.get("probability", 1.0) < min_prob:
             continue
-
-        pts = shape.get("points", [])
-        if not pts or len(pts) < 2:
+        points = shape.get("points", [])
+        if not points or len(points) < 2:
             continue
-        pts = _normalize_annotation_points(
-            pts,
-            bottom_left_origin=bottom_left_origin,
-            image_height=image_height,
-        )
 
-        raw_label = str(shape.get("label", "unknown"))
-        raw_label_stripped = raw_label.strip()
+        raw_label_stripped = str(shape.get("label", "unknown")).strip()
         if not raw_label_stripped:
             continue
-
         if label_mapping is not None:
             mapped_label, matched_mapping = lookup_mapping_value(raw_label_stripped)
-
             if matched_mapping and mapping_value_is_discard(mapped_label):
                 continue
             if has_discarded_parent(raw_label_stripped):
@@ -302,8 +320,40 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
                 continue
 
         label_name = extract_label(raw_label_stripped, label_strategy, label_sep).strip()
-        if not label_name:
-            continue
+        if label_name:
+            valid.append((shape, label_name))
+
+    if missing_labels:
+        sample = ", ".join(list(missing_labels)[:10])
+        raise ValidationError(
+            f"Missing label mappings for {len(missing_labels)} labels in {json_path}: {sample}"
+        )
+    return valid
+
+
+def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
+    json_path = cfg["annotation_path"]
+    label_map = cfg["label_map"]
+    data = _load_annotation_data(json_path)
+    valid_shapes = resolve_annotation_shapes(cfg, data=data)
+
+    auto_map: Dict[str, int] = label_map.copy() if label_map else {}
+
+    def get_cid(name: str) -> int:
+        if name not in auto_map:
+            auto_map[name] = len(auto_map)
+        return auto_map[name]
+
+    bottom_left_origin = isinstance(data, dict) and _uses_bottom_left_origin(data.get("version"))
+    image_height = _annotation_image_height(cfg, data, json_path) if bottom_left_origin else None
+
+    bboxes: List[BBox] = []
+    for shape, label_name in valid_shapes:
+        pts = _normalize_annotation_points(
+            shape.get("points", []),
+            bottom_left_origin=bottom_left_origin,
+            image_height=image_height,
+        )
         stype = str(shape.get("shape_type", "polygon")).lower()
 
         if stype == "rectangle" and len(pts) == 2:
@@ -322,16 +372,8 @@ def parse_annotations(cfg: dict) -> Tuple[List[BBox], Dict[str, int]]:
 
         if bbox.width <= 0 or bbox.height <= 0:
             continue
-
         bbox.class_id = get_cid(label_name)
         bboxes.append(bbox)
-
-    if missing_labels:
-        sample = ", ".join(list(missing_labels)[:10])
-        raise ValidationError(
-            f"Missing label mappings for {len(missing_labels)} labels in {json_path}: {sample}"
-        )
-
     return bboxes, auto_map
 
 

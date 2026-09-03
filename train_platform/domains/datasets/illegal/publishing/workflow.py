@@ -14,9 +14,9 @@ from train_platform.domains.datasets.illegal.cas import (
     materialize_manifest_to_dir,
 )
 from train_platform.domains.datasets.illegal.events import add_event
+from train_platform.domains.datasets.illegal.publishing.converter import convert_dataset
 from train_platform.domains.datasets.storage.mounted import validate_mounted_source_root
 from train_platform.platform.filesystem import remove_tree
-from train_platform.services.v3.illegal_dataset_publish_service import IllegalDatasetPublishService
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 
 
@@ -149,7 +149,7 @@ def materialize_publish_snapshot(
             materialize_manifest_to_dir(load_version_manifest(version), source_root, replace=True)
         if callable(progress_callback):
             progress_callback("converting", {"message": "原始数据已准备完成，开始执行格式转换"})
-        result = IllegalDatasetPublishService().convert_dataset(
+        result = convert_dataset(
             source_root,
             processed_root,
             label_mapping=mapping_snapshot,
