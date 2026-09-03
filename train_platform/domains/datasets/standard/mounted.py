@@ -3,33 +3,37 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
+from sqlalchemy.orm import Session
 
+from train_platform.core.config import settings
 from train_platform.domains.datasets import yolo
 from train_platform.domains.datasets.labelme import (
     bbox_to_yolo,
-    collect_image_json_pairs,
     choose_image_link,
+    collect_image_json_pairs,
     image_rel_for_source,
     label_rel_for_image,
     parse_annotations,
 )
-from train_platform.domains.datasets.storage.mounted import (
-    validate_mounted_source_root,
-    write_mounted_manifest,
-)
+from train_platform.domains.datasets.storage.files import count_tree
+from train_platform.domains.datasets.storage.mounted import validate_mounted_source_root, write_mounted_manifest
 from train_platform.models.v3.enums import DatasetSplit
-from train_platform.platform.filesystem import remove_path
-from train_platform.utils.exceptions import NotFoundError, ValidationError
+from train_platform.models.v3.standard_dataset import StandardDataset
+from train_platform.platform.filesystem import clear_directory, remove_path, remove_tree
+from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
+
+from .service import StandardDatasetService
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 
 def create_directory_link(source: Path, target: Path) -> str:
@@ -60,7 +64,6 @@ def create_directory_link(source: Path, target: Path) -> str:
         return "junction"
 
 
-
 def _write_class_files(root: Path, class_names: list[str]) -> list[str]:
     names = [str(name).strip() for name in class_names if str(name).strip()]
     if not names:
@@ -81,7 +84,7 @@ def _infer_class_names_from_labels(labels_root: Path) -> list[str]:
         except Exception:
             continue
         for line in lines:
-            parts = [p for p in line.split() if p]
+            parts = [part for part in line.split() if part]
             if len(parts) < 5:
                 continue
             try:
@@ -100,9 +103,7 @@ def write_yolo_yaml(root: Path, class_names: list[str], image_rels: list[str]) -
     for rel in sorted(image_rels):
         split = yolo.detect_split_from_relpath(rel)
         key = split.value if isinstance(split, DatasetSplit) else "train"
-        if key not in buckets:
-            key = "train"
-        buckets[key].append(rel)
+        buckets.setdefault(key, []).append(rel)
     if not buckets["train"] and (buckets["val"] or buckets["test"]):
         buckets["train"] = buckets["val"] or buckets["test"]
     for split_name, rels in buckets.items():
@@ -132,9 +133,9 @@ def _copy_source_label(source_root: Path, image_path: Path, image_rel: str, targ
     ]
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
-            dst = target_root / label_rel_for_image(image_rel)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(candidate, dst)
+            destination = target_root / label_rel_for_image(image_rel)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(candidate, destination)
             return True
     return False
 
@@ -184,7 +185,6 @@ def link_json_source_tree(target_root: Path, source_root: Path) -> dict[str, Any
     pairs, warnings = collect_image_json_pairs(source_root)
     if not pairs:
         raise ValidationError("No image/json pairs found in mounted directory")
-
     label_map: dict[str, int] = {}
     image_rels: list[str] = []
     skipped: list[str] = []
@@ -208,12 +208,7 @@ def link_json_source_tree(target_root: Path, source_root: Path) -> dict[str, Any
             skipped.append(f"{image_path.name}: cannot read image size")
             continue
         try:
-            bboxes, label_map = parse_annotations({
-                **base_cfg,
-                "label_map": label_map,
-                "annotation_path": str(json_path),
-                "image_height": int(height),
-            })
+            bboxes, label_map = parse_annotations({**base_cfg, "label_map": label_map, "annotation_path": str(json_path), "image_height": int(height)})
         except Exception as exc:
             skipped.append(f"{json_path.name}: {exc}")
             continue
@@ -261,7 +256,82 @@ def link_source_tree(target_root: Path, source_root: Path, *, prefer_yolo: bool 
     if not source_root.exists() or not source_root.is_dir():
         raise NotFoundError("Mounted source directory not found")
     target_root.mkdir(parents=True, exist_ok=True)
-    has_yolo = (source_root / "labels").exists() or any((source_root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml"))
+    has_yolo = (source_root / "labels").exists() or any(
+        (source_root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")
+    )
     if prefer_yolo and has_yolo:
         return link_yolo_source_tree(target_root, source_root)
     return link_json_source_tree(target_root, source_root)
+
+
+def import_mounted_source_tree(
+    db: Session,
+    standard_dataset_id: int,
+    source_root: Path,
+    *,
+    created_by: str | None = None,
+    filename: str | None = None,
+) -> StandardDataset:
+    service = StandardDatasetService()
+    dataset = service.get_dataset(db, standard_dataset_id)
+    root = service.dataset_root(dataset)
+    existing_files, _ = count_tree(root)
+    if existing_files > 0:
+        raise ConflictError("Standard dataset content is immutable after upload")
+    source = validate_mounted_source_root(Path(source_root))
+    from .content import _resolve_uploaded_yolo_root
+
+    detected_yolo_root = _resolve_uploaded_yolo_root(source)
+    yolo_root = detected_yolo_root or source
+    staging_parent = settings.dataset_staging_dir / "standard"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    materialized = staging_parent / f"{int(dataset.standard_dataset_id)}-linked-{uuid.uuid4().hex}"
+    try:
+        materialized.mkdir(parents=True, exist_ok=True)
+        manifest = link_source_tree(materialized, yolo_root, prefer_yolo=detected_yolo_root is not None)
+        clear_directory(root)
+        for item in materialized.iterdir():
+            shutil.move(str(item), str(root / item.name))
+        dataset.source_type = "mounted_dir_link"
+        dataset.publish_config = {
+            **(dataset.publish_config or {}),
+            "mounted_import": {
+                "source_root": str(source.resolve(strict=False)),
+                "linked_source": str(yolo_root.resolve(strict=False)),
+                "format": manifest.get("format"),
+                "link_type": manifest.get("link_type"),
+                "image_count": int(manifest.get("image_count") or 0),
+                "filename": str(filename or ""),
+            },
+        }
+        from .content import index_mounted_images
+        from .queries import refresh_statistics, refresh_view_index
+
+        index_mounted_images(db, dataset, root)
+        refresh_statistics(db, dataset, commit=False)
+        refresh_view_index(db, dataset, commit=False)
+        from .events import add_event
+
+        add_event(
+            db,
+            int(dataset.standard_dataset_id),
+            "mounted_imported",
+            message="Standard dataset imported from mounted directory",
+            created_by=created_by,
+            data=dataset.publish_config.get("mounted_import"),
+        )
+        db.commit()
+        db.refresh(dataset)
+        return dataset
+    finally:
+        remove_tree(materialized, ignore_errors=True)
+
+
+__all__ = [
+    "create_directory_link",
+    "import_mounted_source_tree",
+    "link_json_source_tree",
+    "link_source_tree",
+    "link_yolo_source_tree",
+    "write_yolo_yaml",
+]

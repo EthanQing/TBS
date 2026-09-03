@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 import json
-import shutil
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetImage
+from train_platform.models.v3.standard_dataset import StandardDataset
 from train_platform.schemas.v3.dataset_augmentations import (
-    DatasetAugmentationCancelOut,
-    DatasetAugmentationConfig,
     DatasetAugmentationCreate,
     DatasetAugmentationJobOut,
     DatasetAugmentationPreviewOut,
@@ -24,8 +21,9 @@ from train_platform.schemas.v3.dataset_augmentations import (
 )
 from train_platform.domains.datasets.storage.paths import resolve_storage_token
 from train_platform.platform.filesystem import copy_tree
-from train_platform.services.v3.dataset_common import count_tree, iter_image_files
-from train_platform.services.v3.standard_dataset_service import StandardDatasetService
+from train_platform.domains.datasets.storage.files import count_tree, iter_image_files
+from train_platform.domains.datasets.standard import StandardDatasetService
+from train_platform.domains.datasets.standard.content import materialize_from_source_tree
 from train_platform.utils.exceptions import ConflictError, NotFoundError
 
 
@@ -174,7 +172,7 @@ class DatasetAugmentationService:
         source = self._datasets.get_dataset(db, int(standard_dataset_id))
         out_dir = self.output_dir(int(standard_dataset_id), str(job_id))
         target_name = f"{source.name}-aug-{str(job_id)[:8]}"
-        published = self._datasets.materialize_from_source_tree(
+        published = materialize_from_source_tree(
             db,
             name=target_name,
             dataset_type=source.dataset_type,

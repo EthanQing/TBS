@@ -177,7 +177,7 @@ def finalize_publish_snapshot(
     *,
     obj: dict[str, Any],
 ) -> dict[str, Any]:
-    from train_platform.services.v3.standard_dataset_service import StandardDatasetService
+    from train_platform.domains.datasets.standard.content import materialize_from_source_tree
 
     temp_dir_value = str(materialized.get("temp_dir") or "").strip()
     if not temp_dir_value:
@@ -190,7 +190,7 @@ def finalize_publish_snapshot(
         if not processed_root_value:
             raise ValidationError("Publish materialization is missing its processed source root")
         processed_root = Path(processed_root_value)
-        standard = StandardDatasetService().materialize_from_source_tree(
+        standard = materialize_from_source_tree(
             db,
             name=str(obj.get("name") or "").strip(),
             dataset_type=snapshot["dataset_type"],

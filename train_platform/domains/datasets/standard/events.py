@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from train_platform.models.v3.standard_dataset import StandardDatasetEvent
+
+
+def add_event(
+    db: Session,
+    dataset_id: int,
+    event_type: str,
+    *,
+    message: str | None = None,
+    created_by: str | None = None,
+    data: dict[str, Any] | None = None,
+) -> StandardDatasetEvent:
+    event = StandardDatasetEvent(
+        standard_dataset_id=int(dataset_id),
+        event_type=str(event_type),
+        message=message,
+        created_by=created_by,
+        data=data,
+    )
+    db.add(event)
+    db.flush()
+    return event
+
+
+def list_events(
+    db: Session,
+    dataset_id: int,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[StandardDatasetEvent]:
+    return (
+        db.query(StandardDatasetEvent)
+        .filter(StandardDatasetEvent.standard_dataset_id == int(dataset_id))
+        .order_by(StandardDatasetEvent.created_at.desc(), StandardDatasetEvent.event_id.desc())
+        .offset(max(0, int(skip)))
+        .limit(max(0, int(limit)))
+        .all()
+    )
+
+
+__all__ = ["add_event", "list_events"]

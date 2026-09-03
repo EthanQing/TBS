@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import mimetypes
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -32,7 +32,16 @@ from train_platform.schemas.v3.dataset_uploads import (
     DatasetUploadSessionOut,
 )
 from train_platform.services.v3.dataset_upload_service import DatasetUploadService
-from train_platform.services.v3.standard_dataset_service import StandardDatasetService
+from train_platform.domains.datasets.standard import StandardDatasetService
+from train_platform.domains.datasets.standard.events import list_events
+from train_platform.domains.datasets.standard.queries import (
+    get_file_path,
+    get_image_annotations,
+    get_statistics,
+    get_view,
+    list_files,
+)
+from train_platform.domains.datasets.standard.splits import get_split_result, split_dataset
 
 
 router = APIRouter(prefix="/standard-datasets", tags=["standard-datasets"])
@@ -178,7 +187,7 @@ def split_standard_dataset(
     payload: DatasetSplitRequest,
     db: Session = Depends(get_db),
 ):
-    return svc.split_dataset(db, standard_dataset_id, **payload.model_dump())
+    return split_dataset(db, standard_dataset_id, **payload.model_dump())
 
 
 @router.get("/{standard_dataset_id}/split", response_model=DatasetSplitResultOut)
@@ -192,7 +201,7 @@ def get_standard_dataset_split(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    items, summary, total = svc.get_split_result(
+    items, summary, total = get_split_result(
         db,
         standard_dataset_id,
         split=split,
@@ -213,7 +222,8 @@ def list_standard_dataset_events(
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
     total = db.query(StandardDatasetEvent).filter(StandardDatasetEvent.standard_dataset_id == int(standard_dataset_id)).count()
-    items = svc.list_events(db, standard_dataset_id, skip=skip, limit=page_size)
+    svc.get_dataset(db, standard_dataset_id)
+    items = list_events(db, standard_dataset_id, skip=skip, limit=page_size)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
@@ -225,7 +235,7 @@ def get_standard_dataset_view(
     page_size: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    return svc.get_view(db, standard_dataset_id, class_id=class_id, page=page, page_size=page_size)
+    return get_view(db, svc.get_dataset(db, standard_dataset_id), class_id=class_id, page=page, page_size=page_size)
 
 
 @router.get("/{standard_dataset_id}/image-annotations", response_model=DatasetImageAnnotationsOut)
@@ -234,12 +244,12 @@ def get_standard_dataset_image_annotations(
     image_path: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    return svc.get_image_annotations(db, standard_dataset_id, image_path=image_path)
+    return get_image_annotations(svc.get_dataset(db, standard_dataset_id), image_path=image_path)
 
 
 @router.get("/{standard_dataset_id}/statistics", response_model=DatasetStatisticsOut)
 def get_standard_dataset_statistics(standard_dataset_id: int, db: Session = Depends(get_db)):
-    return svc.get_statistics(db, standard_dataset_id)
+    return get_statistics(db, svc.get_dataset(db, standard_dataset_id))
 
 
 @router.get("/{standard_dataset_id}/file/{file_path:path}")
@@ -248,7 +258,7 @@ def get_standard_dataset_file(
     file_path: str,
     db: Session = Depends(get_db),
 ):
-    path = svc.get_file_path(db, standard_dataset_id, file_path)
+    path = get_file_path(svc.get_dataset(db, standard_dataset_id), file_path)
     media_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
     return FileResponse(path=str(path), media_type=media_type)
 
@@ -262,5 +272,5 @@ def list_standard_dataset_files(
 ):
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
-    items, total = svc.list_files(db, standard_dataset_id, page=page, page_size=page_size)
+    items, total = list_files(svc.get_dataset(db, standard_dataset_id), page=page, page_size=page_size)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}

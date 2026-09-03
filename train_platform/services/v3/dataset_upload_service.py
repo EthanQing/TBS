@@ -15,10 +15,12 @@ from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal, session_scope
 from train_platform.domains.datasets.illegal.service import IllegalDatasetService
 from train_platform.domains.datasets.illegal import versions as illegal_versions
+from train_platform.domains.datasets.standard import StandardDatasetService
+from train_platform.domains.datasets.standard.content import import_source_tree
+from train_platform.domains.datasets.standard.mounted import import_mounted_source_tree
 from train_platform.models.v3.dataset_upload import DatasetUploadSession, DatasetUploadTask
 from train_platform.platform.filesystem import extract_archive, remove_tree
 from train_platform.services.v3.dataset_import_service import DatasetImportService
-from train_platform.services.v3.standard_dataset_service import StandardDatasetService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -404,11 +406,10 @@ class DatasetUploadService:
             source = Path(snapshot["source_path"])
             logger.info("Dataset upload task started task_id=%s session_id=%s", snapshot["task_id"], snapshot["session_id"])
             if snapshot["dataset_kind"] == "standard":
-                service = StandardDatasetService()
                 if snapshot["source_type"] == "dir_link":
                     self._update_task_by_id(task_id, status="linking", stage="linking", progress=30, detail_message="Preparing mounted standard dataset import")
                     with session_scope() as db:
-                        service.import_mounted_source_tree(
+                        import_mounted_source_tree(
                             db,
                             int(snapshot["dataset_id"]),
                             source,
@@ -418,7 +419,7 @@ class DatasetUploadService:
                 elif snapshot["source_type"] == "dir":
                     self._update_task_by_id(task_id, status="validating", stage="validating", progress=30, detail_message="Validating standard dataset source")
                     with session_scope() as db:
-                        service.import_source_tree(
+                        import_source_tree(
                             db,
                             int(snapshot["dataset_id"]),
                             source,
@@ -430,7 +431,7 @@ class DatasetUploadService:
                     try:
                         self._update_task_by_id(task_id, status="validating", stage="validating", progress=75, detail_message="Validating extracted standard dataset")
                         with session_scope() as db:
-                            service.import_source_tree(
+                            import_source_tree(
                                 db,
                                 int(snapshot["dataset_id"]),
                                 extracted_root,

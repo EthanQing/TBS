@@ -8,6 +8,7 @@ from .paths import (
     resolve_storage_token,
     to_storage_token,
 )
+from .files import count_tree, iter_files, iter_image_files
 
 __all__ = [
     "datasets_root",
@@ -16,4 +17,7 @@ __all__ = [
     "resolve_dataset_storage_path",
     "resolve_storage_token",
     "to_storage_token",
+    "count_tree",
+    "iter_files",
+    "iter_image_files",
 ]
