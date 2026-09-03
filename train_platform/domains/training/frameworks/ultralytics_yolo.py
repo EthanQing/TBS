@@ -11,6 +11,7 @@ from typing import Any, Dict
 import yaml
 
 from train_platform.core.config import settings
+from train_platform.platform.runtime.ultralytics import apply_torch_safe_load_patches
 from .contract import TrainingCallbacks, TrainingExecutionSpec
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
@@ -91,40 +92,6 @@ def _patch_ultralytics_dataloader_pin_memory(pin_memory_enabled: bool) -> None:
                 getattr(module, "build_dataloader"),
                 pin_memory_enabled,
             )
-
-
-def _apply_torch_safe_load_patches() -> None:
-    try:
-        import torch
-        import torch.nn as nn
-        import torch.serialization
-        from ultralytics.nn.modules import Bottleneck, BottleneckCSP, C2f, Conv, SPPF
-        from ultralytics.nn.tasks import ClassificationModel, DetectionModel, SegmentationModel
-
-        safe_classes = [
-            DetectionModel,
-            SegmentationModel,
-            ClassificationModel,
-            nn.modules.container.Sequential,
-            Conv,
-            Bottleneck,
-            BottleneckCSP,
-            C2f,
-            SPPF,
-        ]
-        torch.serialization.add_safe_globals(safe_classes)
-
-        import ultralytics.nn.tasks
-
-        def patched_torch_safe_load(weight):
-            try:
-                return torch.load(weight, map_location="cpu"), weight
-            except Exception:
-                return torch.load(weight, map_location="cpu", weights_only=False), weight
-
-        ultralytics.nn.tasks.torch_safe_load = patched_torch_safe_load
-    except Exception:
-        pass
 
 
 def _ensure_amp_check_weight() -> bool:
@@ -320,7 +287,7 @@ class UltralyticsYOLOTrainer:
             use_pretrained,
         )
 
-        _apply_torch_safe_load_patches()
+        apply_torch_safe_load_patches()
         amp_probe_ready = _ensure_amp_check_weight()
         try:
             model = model_loader_cls(model_path)
@@ -504,4 +471,4 @@ class UltralyticsYOLOTrainer:
                     pass
 
 
-__all__ = ["UltralyticsYOLOTrainer", "_apply_torch_safe_load_patches"]
+__all__ = ["UltralyticsYOLOTrainer"]

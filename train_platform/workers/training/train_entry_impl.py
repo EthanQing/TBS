@@ -25,7 +25,11 @@ from train_platform.domains.training.frameworks import (
 )
 from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
 from train_platform.models.v3.training_run import TrainingRun
-from train_platform.utils.mlflow_utils import init_mlflow_logger
+from train_platform.domains.training.integrations.mlflow import (
+    get_mlflow_binding,
+    initialize_mlflow_logger,
+    set_mlflow_binding,
+)
 from train_platform.utils.training_params import build_device_runtime, parse_visible_host_gpu_ids
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
@@ -260,7 +264,21 @@ def main(argv: list[str] | None = None) -> int:
             trainer=trainer,
         )
 
-        mlflow_logger = init_mlflow_logger(run, dataset_path=str(dataset_path), run_dir=str(run_dir))
+        try:
+            existing_binding = get_mlflow_binding(db, run_id)
+            mlflow_logger = initialize_mlflow_logger(
+                run,
+                existing_binding=existing_binding,
+                dataset_path=str(dataset_path),
+                run_dir=str(run_dir),
+            )
+            if mlflow_logger is not None and mlflow_logger.binding_to_persist:
+                set_mlflow_binding(db, run_id, mlflow_logger.binding_to_persist)
+                db.commit()
+        except Exception:
+            # MLflow metadata is optional and must not alter training
+            # lifecycle state when its transaction cannot be persisted.
+            db.rollback()
 
         def upsert_epoch_metrics(epoch: int, metrics: Dict[str, float]) -> None:
             persist_epoch_metrics(run_id, epoch, metrics, expected_pid=execution_pid)

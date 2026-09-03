@@ -36,7 +36,11 @@ The worker owns candidate selection, device eligibility, subprocess spawning,
 termination, and exit observation. It delegates all state changes to the
 lifecycle capabilities. The training subprocess owns execution setup, trainer
 selection, MLflow/VisualDL integration, and invokes the shared heartbeat,
-progress, and finalization capabilities.
+progress, and finalization capabilities. MLflow is an optional Training-owned
+integration under `domains/training/integrations`: the subprocess explicitly
+loads and persists its `TrainingRunMeta.extra` binding with its own database
+session, while logger initialization, metric writes, and termination remain
+best-effort external side effects.
 
 ## Finalization and recovery
 
@@ -89,7 +93,8 @@ domain:
 ONNX export communicates through the existing
 `platform.runtime.ModelWorkerClient`; API routes do not call inference worker
 HTTP endpoints directly. Report DOCX rendering and MLflow query fallback remain
-external seams. The Training domain does not depend on Alarm/Monitoring, and
+external seams. Epoch metric reads preserve `mlflow` as MLflow-only and `auto`
+as MLflow-first with database fallback. The Training domain does not depend on Alarm/Monitoring, and
 none of these capabilities changes Training Run lifecycle semantics.
 
 ## Framework execution boundary

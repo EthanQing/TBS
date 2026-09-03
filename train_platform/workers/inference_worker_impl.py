@@ -137,9 +137,9 @@ def _resolve_training_path(raw: str, *, label: str, must_exist: bool = True) -> 
 
 def _apply_ultralytics_safe_load_patches() -> None:
     try:
-        from train_platform.domains.training.frameworks.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
+        from train_platform.platform.runtime.ultralytics import apply_torch_safe_load_patches
 
-        _apply_torch_safe_load_patches()
+        apply_torch_safe_load_patches()
     except Exception:
         pass
 
@@ -519,43 +519,27 @@ def start_model_conversion(
     req: ModelConversionRequest,
     _: None = Depends(_verify_internal_auth),
 ) -> WorkerStatusResponse:
-    job_root = settings.temp_dir / "model_conversions" / str(req.job_id)
-    status_path = job_root / "status.json"
-    input_path = job_root / "input.pt"
-    missing = []
-    if not status_path.exists():
-        missing.append("status.json")
-    if not input_path.exists():
-        missing.append("input.pt")
-    if missing:
-        return WorkerStatusResponse(
-            status="error",
-            error=(
-                "Job artifacts are not visible to inference worker: "
-                + ", ".join(missing)
-                + f" under {job_root}"
-            ),
-        )
+    from train_platform.domains.model_assets.conversion.jobs import input_path, read_job
 
     try:
-        from train_platform.utils.model_conversion_jobs import _append_log, _read_status, _write_status
-        from train_platform.workers.model_conversion_task import _run_pt_to_onnx
-    except Exception as e:
-        return WorkerStatusResponse(status="error", error=f"Failed to import conversion worker: {type(e).__name__}: {e}")
+        read_job(req.job_id)
+        model_input = input_path(req.job_id)
+    except Exception as exc:
+        return WorkerStatusResponse(status="error", error=str(exc))
+
+    if not model_input.exists() or not model_input.is_file():
+        return WorkerStatusResponse(
+            status="error",
+            error=f"Job artifact input.pt is not visible to inference worker: {model_input}",
+        )
+
+    from train_platform.domains.model_assets.conversion.runner import record_failure, run_job
 
     def _runner() -> None:
         try:
-            _run_pt_to_onnx(req.job_id, opset=req.opset, dynamic=req.dynamic)
-        except Exception as e:
-            try:
-                data = _read_status(req.job_id)
-                data["status"] = "failed"
-                data["progress"] = 100
-                data["error_message"] = f"{type(e).__name__}: {e}"
-                _append_log(data, data["error_message"])
-                _write_status(req.job_id, data)
-            except Exception:
-                pass
+            run_job(req.job_id, opset=req.opset, dynamic=req.dynamic)
+        except Exception as exc:
+            record_failure(req.job_id, exc)
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()

@@ -57,7 +57,7 @@ from train_platform.schemas.v3.training_runs import (
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 from train_platform.utils.training_augmentations import get_training_augmentation_options
 from train_platform.utils.training_loss_weights import get_training_loss_weight_options
-from train_platform.utils.mlflow_utils import fetch_mlflow_epoch_metrics
+from train_platform.domains.training.integrations.mlflow import fetch_mlflow_epoch_metrics
 
 
 router = APIRouter(prefix="/training-runs", tags=["training-runs"])
