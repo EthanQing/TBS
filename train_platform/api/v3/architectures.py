@@ -4,9 +4,12 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
+from train_platform.domains.training.frameworks import (
+    create_architecture as create_architecture_record,
+    list_architectures as list_architecture_records,
+)
 from train_platform.models.v3.enums import TaskType
 from train_platform.schemas.v3.architectures import ArchitectureCreate, ArchitectureOut
-from train_platform.services.v3.architecture_service import ArchitectureService
 from train_platform.utils.exceptions import ValidationError
 
 
@@ -27,10 +30,10 @@ def list_architectures(
             tt = TaskType(str(task_type))
         except Exception:
             raise ValidationError("Invalid task_type")
-    return ArchitectureService().list_architectures(db, family=family, task_type=tt, engine=engine, q=q)
+    return list_architecture_records(db, family=family, task_type=tt, engine=engine, q=q)
 
 
 @router.post("", response_model=ArchitectureOut, status_code=201)
 def create_architecture(payload: ArchitectureCreate, db: Session = Depends(get_db)):
-    return ArchitectureService().create_architecture(db, obj=payload.model_dump())
+    return create_architecture_record(db, **payload.model_dump())
 

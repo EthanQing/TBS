@@ -4,14 +4,17 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.models.v3.qualified_model import QualifiedModel
+from train_platform.domains.model_assets.qualification import (
+    get_qualified_model as get_qualified_model_record,
+    list_qualified_models as list_qualified_model_records,
+    mark_model_qualified as mark_model_qualified_record,
+)
 from train_platform.schemas.v3.common import Page, PageMeta
 from train_platform.schemas.v3.qualified_models import (
     QualifiedModelCreate,
     QualifiedModelMarkResponse,
     QualifiedModelOut,
 )
-from train_platform.services.v3.qualified_model_service import QualifiedModelService
 
 
 router = APIRouter(prefix="/qualified-models", tags=["qualified-models"])
@@ -31,18 +34,7 @@ def list_qualified_models(
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
 
-    q = db.query(QualifiedModel)
-    if project_id is not None:
-        q = q.filter(QualifiedModel.project_id == int(project_id))
-    if standard_dataset_id is not None:
-        q = q.filter(QualifiedModel.standard_dataset_id == int(standard_dataset_id))
-    if run_id:
-        q = q.filter(QualifiedModel.run_id == str(run_id))
-    if model_version_id is not None:
-        q = q.filter(QualifiedModel.model_version_id == int(model_version_id))
-    total = q.count()
-
-    items = QualifiedModelService().list_qualified_models(
+    items, total = list_qualified_model_records(
         db,
         project_id=project_id,
         standard_dataset_id=standard_dataset_id,
@@ -56,7 +48,7 @@ def list_qualified_models(
 
 @router.post("", response_model=QualifiedModelMarkResponse)
 def mark_model_qualified(payload: QualifiedModelCreate, db: Session = Depends(get_db)):
-    item, created = QualifiedModelService().mark_model_qualified(
+    item, created = mark_model_qualified_record(
         db,
         model_version_id=payload.model_version_id,
         qualified_by=payload.qualified_by,
@@ -71,4 +63,4 @@ def mark_model_qualified(payload: QualifiedModelCreate, db: Session = Depends(ge
 
 @router.get("/{qualified_model_id}", response_model=QualifiedModelOut)
 def get_qualified_model(qualified_model_id: int, db: Session = Depends(get_db)):
-    return QualifiedModelService().get_qualified_model(db, qualified_model_id)
+    return get_qualified_model_record(db, qualified_model_id)
