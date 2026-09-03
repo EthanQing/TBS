@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from train_platform.training.registry import FrameworkPluginInfo, get_plugin, list_plugins
+from train_platform.domains.training.frameworks import FrameworkPluginInfo, get_plugin, list_plugins
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 
 

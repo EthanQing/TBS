@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TaskType
 from train_platform.repositories.v3.architecture_repo import ArchitectureRepository
-from train_platform.training.registry import get_plugin
+from train_platform.domains.training.frameworks import get_plugin
 from train_platform.utils.exceptions import ConflictError, ValidationError
 
 

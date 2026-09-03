@@ -79,7 +79,7 @@ def _bench_torch_yolo(weights_path: Path, *, imgsz: int, device: str) -> tuple[f
     from ultralytics import YOLO
 
     try:
-        from train_platform.training.plugins.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
+        from train_platform.domains.training.frameworks.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
 
         _apply_torch_safe_load_patches()
     except Exception:
@@ -175,7 +175,7 @@ def _run_pt_to_onnx(job_id: str, *, opset: int | None, dynamic: bool) -> None:
         return
 
     try:
-        from train_platform.training.plugins.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
+        from train_platform.domains.training.frameworks.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
 
         _apply_torch_safe_load_patches()
     except Exception:

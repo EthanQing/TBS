@@ -11,14 +11,14 @@ from typing import Any, Dict
 import yaml
 
 from train_platform.core.config import settings
-from train_platform.training.plugins.base import TrainContext
+from .contract import TrainingCallbacks, TrainingExecutionSpec
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
 from train_platform.utils.training_augmentations import ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY
 from train_platform.utils.training_loss_weights import ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY
 from train_platform.utils.training_params import AUTO_BATCH_SIZE, extract_selected_gpu_ids, normalize_device_spec, normalize_lr_scheduler
 
-logger = logging.getLogger("train_platform.training.ultralytics")
+logger = logging.getLogger("train_platform.domains.training.frameworks.ultralytics")
 
 
 def _lr_scheduler_to_ultralytics_args(value: Any) -> Dict[str, bool]:
@@ -233,59 +233,32 @@ class UltralyticsYOLOTrainer:
     def normalize_config(self, raw: Dict[str, Any] | None) -> Dict[str, Any]:
         return dict(raw or {})
 
-    def run(self, ctx: TrainContext, *, config: Dict[str, Any] | None = None) -> None:
-        def _coerce_bool(value, default: bool) -> bool:
-            if value is None:
-                return bool(default)
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, (int, float)):
-                return bool(value)
-            if isinstance(value, str):
-                s = value.strip().lower()
-                if s in ("1", "true", "yes", "y", "on"):
-                    return True
-                if s in ("0", "false", "no", "n", "off", ""):
-                    return False
-            return bool(value)
-
+    def run(self, spec: TrainingExecutionSpec, callbacks: TrainingCallbacks) -> None:
         try:
             import torch
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError("PyTorch not installed") from e
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("PyTorch not installed") from exc
         try:
             from ultralytics import YOLO
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError("Ultralytics not installed") from e
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("Ultralytics not installed") from exc
 
-        job = ctx.job
-        add = getattr(getattr(job, "parameters", None), "additional_params", None) or {}
-        if isinstance(add.get("framework_config"), dict):
-            add = {**add, **dict(add.get("framework_config") or {})}
-        if config:
-            add = {**add, **self.normalize_config(config)}
-
-        model_variant = ""
-        if getattr(job, "architecture", None) is not None:
-            model_variant = str(getattr(job.architecture, "variant", "") or "")
-        model_variant = (model_variant or "yolov8n").strip()
+        model_variant = (str(spec.variant or "") or "yolov8n").strip()
         model_variant_lower = model_variant.lower()
         is_rtdetr_variant = model_variant_lower.startswith("rtdetr")
+        framework_config = dict(spec.framework_config)
 
-        resume_training = _coerce_bool(add.get("resume_training", False), False)
-        resume_job_id = add.get("resume_job_id")
-        use_pretrained = _coerce_bool(
-            add.get("use_pretrained", None),
-            getattr(getattr(job, "parameters", None), "use_pretrained", True),
-        )
-        pretrained_model_path = add.get("pretrained_model_path")
+        resume_training = bool(spec.resume_training)
+        resume_job_id = spec.resume_job_id
+        use_pretrained = bool(spec.use_pretrained)
+        pretrained_model_path = spec.pretrained_model_path
 
         model_loader_cls = YOLO
         if is_rtdetr_variant:
             try:
                 from ultralytics import RTDETR
-            except Exception as e:  # pragma: no cover
-                raise RuntimeError("Ultralytics RT-DETR runtime not available") from e
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError("Ultralytics RT-DETR runtime not available") from exc
             model_loader_cls = RTDETR
 
         cleanup_candidate: Path | None = None
@@ -294,26 +267,18 @@ class UltralyticsYOLOTrainer:
         model_load_mode = "yaml"
 
         if resume_training:
-            # Case 1: Resume from another job (transfer learning / continue from checkpoint)
-            if resume_job_id and str(resume_job_id) != str(ctx.job_id):
+            if resume_job_id and str(resume_job_id) != str(spec.run_id):
                 resume_weights_path = settings.training_dir / str(resume_job_id) / "weights" / "last.pt"
                 if not resume_weights_path.exists():
                     raise ValueError(f"resume weights not found: {resume_weights_path}")
                 model_path = str(resume_weights_path)
                 model_load_mode = "resume"
-            
-            # Case 2: Resume this same job (continue interrupted training)
             else:
-                # For self-resume, we point to our own last.pt. 
-                # Ultralytics handles 'resume=True' automatically if we pass the weights file 
-                # or if we just set resume=True with the same project/name, but explicit path is safer.
-                my_weights = ctx.run_dir / "weights" / "last.pt"
+                my_weights = spec.run_dir / "weights" / "last.pt"
                 if my_weights.exists():
                     model_path = str(my_weights)
                     model_load_mode = "resume"
                 else:
-                    # Fallback: if no weights yet, just start fresh or use pretrained
-                    # This happens if user clicked 'Resume' on a job that failed before first save.
                     resume_training = False
 
         if not model_path and use_pretrained:
@@ -347,7 +312,7 @@ class UltralyticsYOLOTrainer:
 
         logger.info(
             "Preparing training run_id=%s variant=%s loader=%s mode=%s resume=%s use_pretrained=%s",
-            ctx.job_id,
+            spec.run_id,
             model_variant,
             model_loader_cls.__name__,
             model_load_mode,
@@ -360,8 +325,6 @@ class UltralyticsYOLOTrainer:
         try:
             model = model_loader_cls(model_path)
 
-            # Disable Ultralytics' built-in MLflow integration to avoid URI conflicts
-            # We handle MLflow logging through our own MlflowRunLogger in train_entry.py
             try:
                 from ultralytics import settings as ultralytics_settings
                 ultralytics_settings.update({"mlflow": False})
@@ -375,13 +338,13 @@ class UltralyticsYOLOTrainer:
                 if now - last_cancel_check["t"] < 2.0:
                     return False
                 last_cancel_check["t"] = now
-                return bool(ctx.cancel_requested())
+                return bool(callbacks.cancel_requested())
 
             def on_epoch_end(trainer):
                 epoch = int(getattr(trainer, "epoch", 0))
                 metrics = _collect_metrics(trainer)
                 if metrics:
-                    ctx.upsert_epoch_metrics(epoch, metrics)
+                    callbacks.upsert_epoch_metrics(epoch, metrics)
                 if should_cancel():
                     raise SystemExit(0)
 
@@ -392,41 +355,35 @@ class UltralyticsYOLOTrainer:
             model.add_callback("on_train_epoch_end", on_epoch_end)
             model.add_callback("on_train_batch_end", on_batch_end)
 
-            run_dir = ctx.run_dir
+            run_dir = spec.run_dir
             run_dir.mkdir(parents=True, exist_ok=True)
 
-            dataset_name = None
-            try:
-                dataset_name = str(getattr(getattr(getattr(job, "project", None), "dataset", None), "name", None) or "") or None
-            except Exception:
-                dataset_name = None
-
-            data_yaml = find_yolo_dataset_yaml(ctx.dataset_path, dataset_name=dataset_name)
+            data_yaml = find_yolo_dataset_yaml(spec.dataset_path, dataset_name=spec.dataset_name)
             if data_yaml is None:
-                raise ValueError(f"Dataset YAML not found under: {ctx.dataset_path}")
+                raise ValueError(f"Dataset YAML not found under: {spec.dataset_path}")
             run_data_yaml = data_yaml
             try:
-                with open(data_yaml, "r", encoding="utf-8", errors="replace") as f:
-                    data_cfg = yaml.safe_load(f) or {}
+                with open(data_yaml, "r", encoding="utf-8", errors="replace") as file:
+                    data_cfg = yaml.safe_load(file) or {}
                 if not isinstance(data_cfg, dict):
                     data_cfg = {}
                 data_cfg.pop("path", None)
-                data_cfg["path"] = str(ctx.dataset_path)
+                data_cfg["path"] = str(spec.dataset_path)
                 run_data_yaml = run_dir / "data.runtime.yaml"
-                with open(run_data_yaml, "w", encoding="utf-8") as f:
-                    yaml.safe_dump(data_cfg, f, allow_unicode=True, sort_keys=False)
+                with open(run_data_yaml, "w", encoding="utf-8") as file:
+                    yaml.safe_dump(data_cfg, file, allow_unicode=True, sort_keys=False)
             except Exception:
                 run_data_yaml = data_yaml
 
-            batch_size = int(getattr(job.parameters, "batch_size", 16) or 16)
-            requested_device_value = normalize_device_spec(getattr(job.parameters, "device", "auto") or "auto")
-            device_value = normalize_device_spec(os.getenv("TRAIN_PLATFORM_DEVICE_RUNTIME") or requested_device_value)
+            batch_size = int(spec.batch_size or 16)
+            requested_device_value = normalize_device_spec(spec.requested_device or "auto")
+            device_value = normalize_device_spec(spec.runtime_device or requested_device_value)
             selected_gpu_ids = extract_selected_gpu_ids(device_value)
             multi_gpu = len(selected_gpu_ids) > 1
 
             logger.info(
                 "Resolved Ultralytics device run_id=%s requested=%s runtime=%s visible=%s",
-                ctx.job_id,
+                spec.run_id,
                 requested_device_value,
                 device_value,
                 os.getenv("CUDA_VISIBLE_DEVICES", "<inherit>"),
@@ -454,75 +411,70 @@ class UltralyticsYOLOTrainer:
                 )
 
             pin_memory_default = os.name != "nt"
-            pin_memory_enabled = _coerce_bool_config(add.get("pin_memory"), pin_memory_default)
+            pin_memory_enabled = _coerce_bool_config(framework_config.get("pin_memory"), pin_memory_default)
             _patch_ultralytics_dataloader_pin_memory(pin_memory_enabled)
             logger.info(
                 "Ultralytics dataloader pin_memory=%s run_id=%s default=%s",
                 pin_memory_enabled,
-                ctx.job_id,
+                spec.run_id,
                 pin_memory_default,
             )
 
             train_args: Dict[str, Any] = {
                 "data": str(run_data_yaml),
-                "epochs": int(job.parameters.epochs),
+                "epochs": int(spec.epochs),
                 "batch": batch_size,
-                "imgsz": int(job.parameters.image_size),
-                "workers": int(getattr(job.parameters, "workers", 8) or 8),
+                "imgsz": int(spec.image_size),
+                "workers": int(spec.workers or 8),
                 "project": str(settings.training_dir),
-                "name": ctx.job_id,
+                "name": spec.run_id,
                 "device": device_value,
                 "exist_ok": True,
-                "save_period": int(add.get("save_period", -1)),
-                "amp": _coerce_bool(add.get("amp", True), True),
+                "save_period": int(framework_config.get("save_period", -1)),
+                "amp": _coerce_bool_config(framework_config.get("amp", True), True),
             }
 
             if train_args["amp"] and not amp_probe_ready:
                 train_args["amp"] = False
                 logger.warning(
                     "AMP probe weights are not available; disable AMP for run_id=%s to avoid check_amp failure",
-                    ctx.job_id,
+                    spec.run_id,
                 )
 
             if is_rtdetr_variant:
-                # RT-DETR does not support some YOLO-only hyperparameters.
                 train_args.update(
                     {
-                        "lr0": float(job.parameters.learning_rate),
-                        **_lr_scheduler_to_ultralytics_args(getattr(job.parameters, "lr_scheduler", "linear")),
-                        "optimizer": str(job.parameters.optimizer or "auto"),
-                        "patience": int(getattr(job.parameters, "patience", 50) or 50),
-                        "weight_decay": float(add.get("weight_decay", 0.0005)),
+                        "lr0": float(spec.learning_rate),
+                        **_lr_scheduler_to_ultralytics_args(spec.lr_scheduler),
+                        "optimizer": str(spec.optimizer or "auto"),
+                        "patience": int(spec.patience or 50),
+                        "weight_decay": float(spec.weight_decay if spec.weight_decay is not None else 0.0005),
                     }
                 )
             else:
                 train_args.update(
                     {
-                        "lr0": float(job.parameters.learning_rate),
-                        **_lr_scheduler_to_ultralytics_args(getattr(job.parameters, "lr_scheduler", "linear")),
-                        "optimizer": str(job.parameters.optimizer or "auto"),
-                        "patience": int(getattr(job.parameters, "patience", 50) or 50),
-                        "momentum": float(add.get("momentum", 0.937)),
-                        "weight_decay": float(add.get("weight_decay", 0.0005)),
-                        "warmup_epochs": float(add.get("warmup_epochs", 3.0)),
-                        "warmup_momentum": float(add.get("warmup_momentum", 0.8)),
-                        "warmup_bias_lr": float(add.get("warmup_bias_lr", 0.1)),
+                        "lr0": float(spec.learning_rate),
+                        **_lr_scheduler_to_ultralytics_args(spec.lr_scheduler),
+                        "optimizer": str(spec.optimizer or "auto"),
+                        "patience": int(spec.patience or 50),
+                        "momentum": float(spec.momentum if spec.momentum is not None else 0.937),
+                        "weight_decay": float(spec.weight_decay if spec.weight_decay is not None else 0.0005),
+                        "warmup_epochs": float(spec.warmup_epochs if spec.warmup_epochs is not None else 3.0),
+                        "warmup_momentum": float(spec.warmup_momentum if spec.warmup_momentum is not None else 0.8),
+                        "warmup_bias_lr": float(spec.warmup_bias_lr if spec.warmup_bias_lr is not None else 0.1),
                     }
                 )
 
-            augmentation = getattr(getattr(job, "parameters", None), "augmentation", None) or {}
-            if isinstance(augmentation, dict):
-                for key, value in augmentation.items():
-                    key_s = str(key or "").strip()
-                    if key_s in ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY:
-                        train_args[key_s] = value
+            for key, value in spec.augmentation.items():
+                key_s = str(key or "").strip()
+                if key_s in ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY:
+                    train_args[key_s] = value
 
-            loss_weights = getattr(getattr(job, "parameters", None), "loss_weights", None) or {}
-            if isinstance(loss_weights, dict):
-                for key, value in loss_weights.items():
-                    key_s = str(key or "").strip()
-                    if key_s in ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY:
-                        train_args[key_s] = value
+            for key, value in spec.loss_weights.items():
+                key_s = str(key or "").strip()
+                if key_s in ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY:
+                    train_args[key_s] = value
 
             if resume_training:
                 train_args["resume"] = True
@@ -533,14 +485,12 @@ class UltralyticsYOLOTrainer:
 
             logger.info(
                 "Training args prepared run_id=%s variant=%s keys=%s",
-                ctx.job_id,
+                spec.run_id,
                 model_variant,
                 ",".join(sorted(train_args.keys())),
             )
 
             model.train(**train_args)
-            
-            # Run validation after training to ensure final metrics are captured and available
             try:
                 model.val()
             except Exception:
@@ -552,3 +502,6 @@ class UltralyticsYOLOTrainer:
                         cleanup_candidate.unlink()
                 except Exception:
                     pass
+
+
+__all__ = ["UltralyticsYOLOTrainer", "_apply_torch_safe_load_patches"]

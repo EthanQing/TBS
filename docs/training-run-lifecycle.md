@@ -91,3 +91,30 @@ ONNX export communicates through the existing
 HTTP endpoints directly. Report DOCX rendering and MLflow query fallback remain
 external seams. The Training domain does not depend on Alarm/Monitoring, and
 none of these capabilities changes Training Run lifecycle semantics.
+
+## Framework execution boundary
+
+`train_platform/domains/training/frameworks` owns the framework execution
+contract, static framework registry, and the Ultralytics/PaddleDetection
+adapters. `TrainingExecutionSpec` is an immutable, process-memory description
+of one execution. It exposes resolved dataset and output paths, architecture
+identity, standard training parameters, resume/pretrained intent, requested and
+runtime devices, and a filtered framework-specific configuration mapping.
+`TrainingCallbacks` exposes only cancellation observation and epoch-metric
+recording; framework code does not receive heartbeat or lifecycle capabilities.
+
+`workers/training/train_entry_impl.py` is the sole ORM-to-execution adapter. It
+loads the authoritative run and relationships once, resolves dataset/device
+state, normalizes the selected plugin configuration, materializes the typed
+specification, and wires callbacks to PID-bound run progress plus MLflow. The
+framework adapters do not import ORM models, SQLAlchemy sessions, repositories,
+or Training Run lifecycle modules.
+
+The PaddleDetection adapter separates three framework-specific capabilities:
+YOLO-to-COCO dataset preparation, Paddle configuration transformation, and
+runtime compatibility patches. Its plugin module retains the readable training
+orchestration and native checkpoint handling. Ultralytics remains a cohesive
+single adapter because its compatibility, argument construction, callbacks,
+and invocation flow are already readable together. Registry membership remains
+a simple static list of the two supported plugins; there is no dynamic discovery
+or execution framework.

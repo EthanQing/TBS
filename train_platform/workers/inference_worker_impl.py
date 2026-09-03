@@ -137,7 +137,7 @@ def _resolve_training_path(raw: str, *, label: str, must_exist: bool = True) -> 
 
 def _apply_ultralytics_safe_load_patches() -> None:
     try:
-        from train_platform.training.plugins.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
+        from train_platform.domains.training.frameworks.ultralytics_yolo import _apply_torch_safe_load_patches  # type: ignore
 
         _apply_torch_safe_load_patches()
     except Exception:

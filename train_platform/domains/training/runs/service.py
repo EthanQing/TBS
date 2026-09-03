@@ -25,7 +25,7 @@ from train_platform.models.v3.training_run import (
 )
 from train_platform.platform.filesystem import remove_tree
 from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
-from train_platform.training.registry import get_plugin
+from train_platform.domains.training.frameworks import get_plugin
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.path_utils import resolve_training_path
