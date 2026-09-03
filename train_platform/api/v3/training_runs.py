@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from train_platform.api.deps import get_db
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
+from train_platform.domains.training.runs import TrainingRunService as TrainingRunDomainService
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun, TrainingRunArtifact, TrainingRunEpochMetric, TrainingRunEvent
@@ -43,6 +44,7 @@ from train_platform.schemas.v3.training_runs import (
     TrainingRunUpdate,
 )
 from train_platform.services.v3.training_run_service import FrameworkCompareConflict, TrainingRunService
+from train_platform.services.v3.alarm_service import AlarmService
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 from train_platform.utils.training_augmentations import get_training_augmentation_options
 from train_platform.utils.training_loss_weights import get_training_loss_weight_options
@@ -51,6 +53,11 @@ from train_platform.utils.training_report_docx import build_training_report_docx
 
 
 router = APIRouter(prefix="/training-runs", tags=["training-runs"])
+run_svc = TrainingRunDomainService()
+
+
+def _evaluate_run_alarm(db: Session, run_id: str) -> None:
+    AlarmService.try_evaluate_training_rules(db, run_ids=[str(run_id)])
 
 
 def _export_onnx_via_worker(
@@ -161,7 +168,7 @@ def list_training_runs(
         q = q.filter(TrainingRun.status == st)
     total = q.count()
 
-    items = TrainingRunService().list_runs(
+    items = run_svc.list_runs(
         db,
         project_id=project_id,
         standard_dataset_id=standard_dataset_id,
@@ -176,7 +183,7 @@ def list_training_runs(
 
 @router.post("", response_model=TrainingRunOut, status_code=201)
 def create_training_run(payload: TrainingRunCreate, db: Session = Depends(get_db)):
-    return TrainingRunService().create_run(db, obj=payload.model_dump())
+    return run_svc.create_run(db, obj=payload.model_dump())
 
 
 @router.get("/augmentation-options", response_model=TrainingAugmentationOptionsOut)
@@ -219,27 +226,33 @@ def get_training_loss_weight_options_endpoint(
 
 @router.get("/{run_id}", response_model=TrainingRunOut)
 def get_training_run(run_id: str, db: Session = Depends(get_db)):
-    return TrainingRunService().get_run(db, run_id)
+    return run_svc.get_run(db, run_id)
 
 
 @router.patch("/{run_id}", response_model=TrainingRunOut)
 def update_training_run(run_id: str, payload: TrainingRunUpdate, db: Session = Depends(get_db)):
-    return TrainingRunService().update_run(db, run_id, patch=payload.model_dump(exclude_unset=True))
+    return run_svc.update_run(db, run_id, patch=payload.model_dump(exclude_unset=True))
 
 
 @router.post("/{run_id}/queue", response_model=TrainingRunOut)
 def queue_training_run(run_id: str, db: Session = Depends(get_db)):
-    return TrainingRunService().queue_run(db, run_id)
+    run = run_svc.queue_run(db, run_id)
+    _evaluate_run_alarm(db, str(run.run_id))
+    return run
 
 
 @router.post("/{run_id}/resume", response_model=TrainingRunOut)
 def resume_training_run(run_id: str, db: Session = Depends(get_db)):
-    return TrainingRunService().resume_run(db, run_id)
+    run = run_svc.resume_run(db, run_id)
+    _evaluate_run_alarm(db, str(run.run_id))
+    return run
 
 
 @router.post("/{run_id}/cancel", response_model=TrainingRunOut)
 def cancel_training_run(run_id: str, reason: str | None = Body(None), db: Session = Depends(get_db)):
-    return TrainingRunService().request_cancel(db, run_id, reason=reason)
+    run = run_svc.request_cancel(db, run_id, reason=reason)
+    _evaluate_run_alarm(db, str(run.run_id))
+    return run
 
 
 @router.post("/{run_id}/review", response_model=TrainingRunReviewOut)
@@ -257,7 +270,9 @@ def delete_training_run(
     force: bool = Query(False, description="Delete training run and related model versions/deployments"),
     db: Session = Depends(get_db),
 ):
-    return TrainingRunService().delete_run(db, run_id, force=bool(force))
+    run = run_svc.delete_run(db, run_id, force=bool(force))
+    _evaluate_run_alarm(db, str(run.run_id))
+    return run
 
 
 @router.get("/{run_id}/events", response_model=list[TrainingRunEventOut])
@@ -297,7 +312,7 @@ def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Sess
     - pt: raw weights download (best/last)
     - onnx: Ultralytics export (YOLOv8 -> ONNX)
     """
-    run = TrainingRunService().get_run(db, run_id)
+    run = run_svc.get_run(db, run_id)
 
     fmt = str(payload.format or "pt").strip().lower()
     weights = str(payload.weights or "best").strip().lower()
@@ -398,7 +413,7 @@ def download_training_run_export(
     include_report: bool = Query(False, description="package model export with DOCX training report"),
     db: Session = Depends(get_db),
 ):
-    run = TrainingRunService().get_run(db, run_id)
+    run = run_svc.get_run(db, run_id)
 
     fmt = str(format or "pt").strip().lower()
     weights_key = str(weights or "best").strip().lower()

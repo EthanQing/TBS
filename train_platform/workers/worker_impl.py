@@ -16,11 +16,11 @@ from sqlalchemy.orm import Session
 from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
 from train_platform.db.session import SessionLocal
+from train_platform.domains.training.runs import finalize_execution, mark_started, release_stale_claim, touch_heartbeat
 from train_platform.models.v3.architecture import ModelArchitecture
-from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
-from train_platform.models.v3.training_run import TrainingRun, TrainingRunEvent
+from train_platform.models.v3.enums import TrainingRunStatus
+from train_platform.models.v3.training_run import TrainingRun
 from train_platform.services.v3.alarm_service import AlarmService
-from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
 from train_platform.utils.training_params import parse_visible_host_gpu_ids, worker_can_run_device
 
 
@@ -36,10 +36,6 @@ def _safe_remove_dir(path: Path) -> None:
             shutil.rmtree(path, ignore_errors=True)
     except Exception:
         pass
-
-
-def _add_event(db: Session, run_id: str, event_type: str, message: str, *, level: LogLevel = LogLevel.INFO) -> None:
-    db.add(TrainingRunEvent(run_id=run_id, level=level, event_type=event_type, message=message))
 
 
 def _spawn_training_subprocess(run_id: str, *, stdout_f: TextIO, stderr_f: TextIO) -> subprocess.Popen:
@@ -78,27 +74,6 @@ def _terminate_process_tree(proc: subprocess.Popen, *, timeout_sec: int = 20) ->
             proc.terminate()
         except Exception:
             pass
-
-
-def _file_tail_contains(path: Path, needle: str, *, max_bytes: int = 65536) -> bool:
-    """
-    Best-effort substring search in the tail of a file.
-
-    Used to recover terminal status when the worker heartbeat is lost but the training subprocess
-    actually completed (e.g. worker process restart).
-    """
-    try:
-        if not path.exists() or not path.is_file():
-            return False
-        size = int(path.stat().st_size)
-        with open(path, "rb") as f:
-            if size > int(max_bytes):
-                f.seek(-int(max_bytes), os.SEEK_END)
-            data = f.read()
-        text = data.decode("utf-8", errors="replace")
-        return str(needle) in text
-    except Exception:
-        return False
 
 
 def _parse_worker_engines(raw: Optional[str]) -> Optional[set[str]]:
@@ -179,68 +154,35 @@ class DbQueueWorker:
                 should_cleanup = True
                 return
 
-            # Heartbeat
             now = _utcnow()
             if self._last_heartbeat_at is None or (now - self._last_heartbeat_at).total_seconds() >= self.heartbeat_interval:
-                run.heartbeat_at = now
-                db.commit()
-                self._last_heartbeat_at = now
+                if touch_heartbeat(db, run_id, execution_owner=self.worker_id, heartbeat_at=now):
+                    self._last_heartbeat_at = now
 
-            # Cancel / delete request handling
             cancel_requested = bool(run.cancel_requested_at is not None or run.delete_requested_at is not None)
             if cancel_requested and self._running.proc.poll() is None:
-                _add_event(db, run_id, "cancel", "Terminating training subprocess due to cancel/delete request")
-                db.commit()
                 _terminate_process_tree(self._running.proc)
 
             rc = self._running.proc.poll()
             if rc is None:
                 return
 
-            # Subprocess ended
-            run.finished_at = now
-
-            delete_requested = run.delete_requested_at is not None
-            if delete_requested:
-                run.status = TrainingRunStatus.DELETED
-                run.hidden = True
-                _add_event(db, run_id, "deleted", "Run marked as deleted")
-            elif run.cancel_requested_at is not None:
-                run.status = TrainingRunStatus.CANCELLED
-                _add_event(db, run_id, "cancelled", "Run cancelled")
-            elif rc == 0:
-                run.status = TrainingRunStatus.COMPLETED
-                _add_event(db, run_id, "completed", "Run completed")
-            else:
-                run.status = TrainingRunStatus.FAILED
-                run.error_message = f"Training subprocess exited with code {rc}"
-                _add_event(db, run_id, "failed", run.error_message, level=LogLevel.ERROR)
-
-            # Index artifacts (best-effort) and persist results.
-            try:
-                _index_completion_artifacts(db, run_id)
-            except Exception:
-                pass
-
-            # Release claim
-            run.worker_id = None
-            run.claimed_at = None
-            run.pid = None
-            run.heartbeat_at = None
-
-            db.commit()
-            AlarmService.try_evaluate_training_rules(db, run_ids=[str(run.run_id)])
-
-            # Optionally cleanup files if deleted
-            if delete_requested:
-                _safe_remove_dir(settings.training_dir / run_id)
+            result = finalize_execution(
+                db,
+                run_id,
+                exit_code=int(rc),
+                error_message=f"Training subprocess exited with code {rc}" if rc != 0 else None,
+            )
             should_cleanup = True
+            if result.changed:
+                AlarmService.try_evaluate_training_rules(db, run_ids=[str(result.run_id)])
 
+            if result.status == TrainingRunStatus.DELETED:
+                _safe_remove_dir(settings.training_dir / run_id)
         finally:
             db.close()
             if should_cleanup:
                 self._cleanup_running()
-
     def _cleanup_running(self) -> None:
         if self._running is None:
             return
@@ -301,17 +243,20 @@ class DbQueueWorker:
 
             proc = _spawn_training_subprocess(run.run_id, stdout_f=stdout_f, stderr_f=stderr_f)
 
-            run.claimed_at = now
-            run.worker_id = self.worker_id
-            run.pid = int(proc.pid)
-            run.heartbeat_at = now
-            run.started_at = now
-            run.status = TrainingRunStatus.RUNNING
-            run.run_dir = run.run_dir or run.run_id
-
-            _add_event(db, run.run_id, "started", f"Run started by worker {self.worker_id}")
-            db.commit()
-            AlarmService.try_evaluate_training_rules(db, run_ids=[str(run.run_id)])
+            try:
+                started = mark_started(
+                    db,
+                    run.run_id,
+                    worker_id=self.worker_id,
+                    pid=int(proc.pid),
+                    started_at=now,
+                )
+            except Exception:
+                _terminate_process_tree(proc)
+                stdout_f.close()
+                stderr_f.close()
+                raise
+            AlarmService.try_evaluate_training_rules(db, run_ids=[str(started.run_id)])
 
             self._running = RunningJob(
                 run_id=run.run_id,
@@ -341,14 +286,11 @@ class DbQueueWorker:
             )
             .all()
         )
+        changed_ids: list[str] = []
         for run in stale_queued:
-            _add_event(db, run.run_id, "requeue", "Released stale claim; re-queued for another worker")
-            run.worker_id = None
-            run.claimed_at = None
-            run.pid = None
-            run.heartbeat_at = None
+            release_stale_claim(db, str(run.run_id))
+            changed_ids.append(str(run.run_id))
 
-        changed_ids: list[str] = [str(r.run_id) for r in stale_queued]
         stale_running = (
             db.query(TrainingRun)
             .filter(TrainingRun.status == TrainingRunStatus.RUNNING)
@@ -360,42 +302,18 @@ class DbQueueWorker:
             .all()
         )
         for run in stale_running:
-            # If the training subprocess actually completed but the worker heartbeat was lost
-            # (e.g. worker restart), recover the status by inspecting stdout tail.
-            marker = f"[train_entry] completed run_id={run.run_id}"
-            stdout_path = settings.training_dir / str(run.run_id) / "logs" / "train.stdout.log"
-            if _file_tail_contains(stdout_path, marker):
-                run.status = TrainingRunStatus.COMPLETED
-                run.finished_at = now
-                run.error_message = None
-                try:
-                    run.progress = max(int(getattr(run, "progress", 0) or 0), 100)
-                except Exception:
-                    run.progress = 100
-                _add_event(
-                    db,
-                    run.run_id,
-                    "recovered",
-                    "Recovered run status to COMPLETED (completion marker found in stdout)",
-                )
-                try:
-                    _index_completion_artifacts(db, run.run_id)
-                except Exception:
-                    pass
-            else:
-                run.status = TrainingRunStatus.FAILED
-                run.finished_at = now
-                run.error_message = "Worker heartbeat lost; marking as failed"
-                _add_event(db, run.run_id, "failed", run.error_message, level=LogLevel.ERROR)
-            run.worker_id = None
-            run.claimed_at = None
-            run.pid = None
-            run.heartbeat_at = None
-            changed_ids.append(str(run.run_id))
+            result = finalize_execution(
+                db,
+                str(run.run_id),
+                exit_code=1,
+                error_message="Worker heartbeat lost; marking as failed",
+            )
+            if result.changed:
+                changed_ids.append(str(result.run_id))
 
-        if stale_queued or stale_running:
-            db.commit()
+        if changed_ids:
             AlarmService.try_evaluate_training_rules(db, run_ids=changed_ids)
+
 
 
 def main() -> None:

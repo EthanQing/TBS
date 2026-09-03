@@ -4,105 +4,26 @@ import argparse
 import os
 import sys
 import threading
-import time
 import traceback
-from datetime import datetime, timezone
 from typing import Dict
 
 from train_platform.core.config import settings
 from train_platform.domains.datasets.storage.paths import resolve_legacy_dataset_path
 from train_platform.core.license import assert_valid_license
 from train_platform.db.session import SessionLocal
-from sqlalchemy.orm import Session
-from train_platform.models.v3.enums import TrainingRunStatus
-from train_platform.models.v3.training_run import TrainingRun, TrainingRunEpochMetric
+from train_platform.domains.training.runs import (
+    finalize_execution,
+    touch_heartbeat,
+    upsert_epoch_metrics as persist_epoch_metrics,
+)
 from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
+from train_platform.models.v3.training_run import TrainingRun
 from train_platform.services.v3.alarm_service import AlarmService
 from train_platform.training.plugins.base import TrainContext
 from train_platform.training.registry import get_trainer
 from train_platform.utils.mlflow_utils import init_mlflow_logger
-from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
 from train_platform.utils.training_params import build_device_runtime, parse_visible_host_gpu_ids
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-_HEARTBEAT_LOST_ERROR = "Worker heartbeat lost; marking as failed"
-
-
-def _touch_run_liveness(db: Session, run: TrainingRun) -> None:
-    """
-    Keep the run from being marked stale when the queue worker is restarted/crashed.
-
-    We update `heartbeat_at` from the training subprocess itself (best-effort) and also
-    repair the common false FAILED status caused by worker heartbeat loss while training
-    is still producing progress/metrics.
-    """
-    now = _utcnow()
-    run.heartbeat_at = now
-
-    # If a worker falsely marked the run as FAILED due to heartbeat loss, but we are still
-    # actively training (we're inside the training subprocess), heal it back to RUNNING.
-    if run.status == TrainingRunStatus.FAILED and (str(run.error_message or "").strip() == _HEARTBEAT_LOST_ERROR):
-        run.status = TrainingRunStatus.RUNNING
-        run.finished_at = None
-        run.error_message = None
-
-
-def _finalize_run_status(run_id: str, *, exit_code: int, error_message: str | None = None) -> None:
-    """
-    Best-effort terminal status update from the training subprocess.
-
-    This prevents UI from getting stuck in FAILED (heartbeat lost) while training is still
-    running, and also lets runs become COMPLETED even if the queue worker died.
-    """
-    db = SessionLocal()
-    try:
-        run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
-        if not run:
-            return
-
-        _touch_run_liveness(db, run)
-
-        # Match the worker's priority: delete > cancel > exit_code.
-        delete_requested = run.delete_requested_at is not None
-        cancel_requested = (run.cancel_requested_at is not None) or delete_requested
-
-        if delete_requested:
-            run.status = TrainingRunStatus.DELETED
-            run.hidden = True
-            run.error_message = None
-            run.finished_at = run.finished_at or _utcnow()
-        elif cancel_requested:
-            run.status = TrainingRunStatus.CANCELLED
-            run.error_message = None
-            run.finished_at = run.finished_at or _utcnow()
-        elif int(exit_code) == 0:
-            run.status = TrainingRunStatus.COMPLETED
-            run.error_message = None
-            run.finished_at = _utcnow()
-            try:
-                run.progress = max(int(getattr(run, "progress", 0) or 0), 100)
-            except Exception:
-                run.progress = 100
-            try:
-                _index_completion_artifacts(db, run_id)
-            except Exception:
-                pass
-        else:
-            run.status = TrainingRunStatus.FAILED
-            run.finished_at = _utcnow()
-            if error_message:
-                run.error_message = str(error_message)
-
-        db.commit()
-    except Exception:
-        db.rollback()
-    finally:
-        db.close()
 
 
 def _cancel_requested(run_id: str) -> bool:
@@ -111,8 +32,6 @@ def _cancel_requested(run_id: str) -> bool:
         run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
         if not run:
             return False
-        _touch_run_liveness(db, run)
-        db.commit()
         return bool(run.cancel_requested_at is not None or run.delete_requested_at is not None)
     except Exception:
         db.rollback()
@@ -127,9 +46,8 @@ def _heartbeat_tick(run_id: str) -> None:
         run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
         if not run:
             return
-        _touch_run_liveness(db, run)
-        db.commit()
-        AlarmService.try_evaluate_training_rules(db, run_ids=[str(run_id)])
+        if touch_heartbeat(db, run_id):
+            AlarmService.try_evaluate_training_rules(db, run_ids=[str(run_id)])
     except Exception:
         db.rollback()
     finally:
@@ -139,46 +57,6 @@ def _heartbeat_tick(run_id: str) -> None:
 def _heartbeat_loop(run_id: str, stop_event: threading.Event, *, interval_sec: float = 5.0) -> None:
     while not stop_event.wait(max(1.0, float(interval_sec))):
         _heartbeat_tick(run_id)
-
-
-def _merge_metrics_payload(existing: Dict[str, float] | dict | None, incoming: Dict[str, float] | dict | None) -> Dict[str, float]:
-    merged: Dict[str, float] = {}
-    if isinstance(existing, dict):
-        for k, v in existing.items():
-            merged[str(k)] = v
-    if isinstance(incoming, dict):
-        for k, v in incoming.items():
-            merged[str(k)] = v
-    return merged
-
-
-def _upsert_epoch_metrics(run_id: str, epoch: int, metrics: Dict[str, float]) -> None:
-    db = SessionLocal()
-    try:
-        row = (
-            db.query(TrainingRunEpochMetric)
-            .filter(TrainingRunEpochMetric.run_id == run_id, TrainingRunEpochMetric.epoch == int(epoch))
-            .first()
-        )
-        payload = _merge_metrics_payload({}, metrics)
-        if row:
-            row.metrics = _merge_metrics_payload(row.metrics, payload)
-        else:
-            db.add(TrainingRunEpochMetric(run_id=run_id, epoch=int(epoch), metrics=payload))
-
-        run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
-        if run:
-            _touch_run_liveness(db, run)
-            run.current_epoch = int(epoch)
-            if run.total_epochs and int(run.total_epochs) > 0:
-                # Ultralytics epoch is 0-based; progress is best-effort.
-                pct = int(min(100, max(0, 100 * float(epoch + 1) / float(run.total_epochs))))
-                run.progress = pct
-        db.commit()
-    except Exception:
-        db.rollback()
-    finally:
-        db.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -250,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         mlflow_logger = init_mlflow_logger(run, dataset_path=str(dataset_path), run_dir=str(run_dir))
 
         def upsert_epoch_metrics(epoch: int, metrics: Dict[str, float]) -> None:
-            _upsert_epoch_metrics(run_id, epoch, metrics)
+            persist_epoch_metrics(run_id, epoch, metrics)
             if mlflow_logger:
                 mlflow_logger.log_metrics(metrics, step=int(epoch))
 
@@ -326,9 +204,19 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat_thread.join(timeout=2.0)
         if vdl_bridge is not None:
             vdl_bridge.stop()
-        # Best-effort: ensure DB status does not incorrectly remain FAILED due to worker heartbeat loss.
         try:
-            _finalize_run_status(run_id, exit_code=exit_code, error_message=error_message)
+            lifecycle_db = SessionLocal()
+            try:
+                result = finalize_execution(
+                    lifecycle_db,
+                    run_id,
+                    exit_code=exit_code,
+                    error_message=error_message,
+                )
+                if result.changed:
+                    AlarmService.try_evaluate_training_rules(lifecycle_db, run_ids=[str(result.run_id)])
+            finally:
+                lifecycle_db.close()
         except Exception:
             pass
         if mlflow_logger:
