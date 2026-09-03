@@ -10,17 +10,18 @@ from typing import Any
 import yaml
 
 from train_platform.domains.datasets import yolo
-from train_platform.domains.datasets.illegal.mounted import (
+from train_platform.domains.datasets.labelme import (
+    bbox_to_yolo,
     collect_image_json_pairs,
     choose_image_link,
     image_rel_for_source,
     label_rel_for_image,
+    parse_annotations,
 )
 from train_platform.domains.datasets.storage.mounted import (
     validate_mounted_source_root,
     write_mounted_manifest,
 )
-from train_platform.domains.datasets.illegal.annotations import bbox_to_yolo, parse_annotations
 from train_platform.models.v3.enums import DatasetSplit
 from train_platform.platform.filesystem import remove_path
 from train_platform.utils.exceptions import NotFoundError, ValidationError

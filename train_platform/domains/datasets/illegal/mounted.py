@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from train_platform.core.config import settings
+from train_platform.domains.datasets.labelme import (
+    choose_image_link,
+    collect_image_json_pairs,
+    image_rel_for_source,
+    iter_regular_files,
+)
 from train_platform.domains.datasets.storage.mounted import mounted_file_entry, validate_mounted_source_root
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
@@ -32,47 +37,6 @@ def _read_json_shapes(path: Path) -> tuple[list[Any], list[str]]:
     if isinstance(data, list):
         return data, []
     return [], []
-
-
-def _iter_regular_files(root: Path) -> list[Path]:
-    out: list[Path] = []
-    for cur, dirnames, filenames in os.walk(root):
-        cur_path = Path(cur)
-        rel = cur_path.relative_to(root)
-        if rel.parts and rel.parts[0].lower() in _SKIP_DIRS:
-            dirnames[:] = []
-            continue
-        dirnames[:] = [d for d in dirnames if d.lower() not in _SKIP_DIRS]
-        for name in filenames:
-            out.append(cur_path / name)
-    return out
-
-
-def _pair_key(root: Path, path: Path) -> str:
-    rel = path.relative_to(root).with_suffix("")
-    parts = list(rel.parts)
-    if parts and parts[0].lower() in {"image", "images", "annotation", "annotations", "json", "labels"}:
-        parts = parts[1:]
-    return "/".join(parts).lower()
-
-
-def collect_image_json_pairs(source_root: Path) -> tuple[list[tuple[Path, Path]], list[str]]:
-    root = Path(source_root).resolve(strict=False)
-    image_by_key: dict[str, Path] = {}
-    json_by_key: dict[str, Path] = {}
-    for path in _iter_regular_files(root):
-        ext = path.suffix.lower()
-        if ext in IMAGE_EXTS:
-            image_by_key.setdefault(_pair_key(root, path), path)
-        elif ext == ".json":
-            json_by_key.setdefault(_pair_key(root, path), path)
-    keys = sorted(set(image_by_key) & set(json_by_key))
-    warnings: list[str] = []
-    if len(image_by_key) > len(keys):
-        warnings.append(f"Unmatched images: {len(image_by_key) - len(keys)}")
-    if len(json_by_key) > len(keys):
-        warnings.append(f"Unmatched json: {len(json_by_key) - len(keys)}")
-    return [(image_by_key[key], json_by_key[key]) for key in keys], warnings
 
 
 def _emit_manifest_progress(
@@ -118,7 +82,7 @@ def build_illegal_mounted_manifest(
         files: dict[str, dict[str, Any]] = {}
         image_paths: list[str] = []
         label_count = 0
-        for path in sorted(_iter_regular_files(source_root), key=lambda p: p.relative_to(source_root).as_posix()):
+        for path in sorted(iter_regular_files(source_root), key=lambda p: p.relative_to(source_root).as_posix()):
             rel = path.relative_to(source_root).as_posix()
             ext = path.suffix.lower()
             lower_name = path.name.lower()
@@ -292,26 +256,3 @@ def build_illegal_mounted_manifest(
         "files": files,
         "warnings": warnings[:50],
     }
-
-
-def choose_image_link(source_root: Path) -> tuple[Path, str]:
-    source_root = Path(source_root).resolve(strict=False)
-    images_dir = source_root / "images"
-    if images_dir.exists() and images_dir.is_dir():
-        return images_dir.resolve(strict=False), "images"
-    return source_root, "images/source"
-
-
-def image_rel_for_source(source_root: Path, source_image_root: Path, image_path: Path, image_rel_prefix: str) -> str:
-    rel = Path(image_path).resolve(strict=False).relative_to(Path(source_image_root).resolve(strict=False)).as_posix()
-    return f"{image_rel_prefix.strip('/')}/{rel}".strip("/")
-
-
-def label_rel_for_image(image_rel: str | Path) -> str:
-    rel = Path(str(image_rel).replace("\\", "/"))
-    parts = list(rel.parts)
-    if "images" in parts:
-        idx = parts.index("images")
-        parts[idx] = "labels"
-        return Path(*parts).with_suffix(".txt").as_posix()
-    return rel.with_suffix(".txt").as_posix()

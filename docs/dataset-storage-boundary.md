@@ -29,4 +29,6 @@ Mounted resolution reads import-root policy directly from this boundary. It does
 
 `train_platform/domains/datasets/yolo.py` owns YOLO filesystem semantics, including class-name discovery, dataset YAML handling, split detection, image-to-label resolution, annotation parsing, export-root discovery, structure validation, and class-compatible append behavior.
 
+`train_platform/domains/datasets/labelme.py` owns dataset-level LabelMe annotation and mounted JSON format semantics, including image/JSON pairing, source image linking, label-path derivation, bounding boxes, and annotation parsing. It is shared by mounted import paths and is not part of the Illegal Dataset domain.
+
 View and database compatibility helpers remain temporarily in `services/v3/dataset_common.py`. Illegal dataset content hashing, version manifests, CAS storage, manifest-backed reads, and version-derived statistics are owned by `train_platform/domains/datasets/illegal`.

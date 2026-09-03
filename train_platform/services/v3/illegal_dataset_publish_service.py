@@ -18,7 +18,7 @@ from PIL import Image, UnidentifiedImageError
 from rasterio.windows import Window
 
 from train_platform.core.config import settings
-from train_platform.domains.datasets.illegal.annotations import (
+from train_platform.domains.datasets.labelme import (
     BBox,
     _normalize_label_key,
     bbox_to_yolo,

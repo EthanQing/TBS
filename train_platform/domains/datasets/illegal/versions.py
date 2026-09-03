@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import threading
@@ -38,9 +39,8 @@ from train_platform.models.v3.illegal_dataset import (
     IllegalDatasetImage,
     IllegalDatasetVersion,
 )
-from train_platform.platform.filesystem import extract_archive, remove_tree, safe_relative_path
+from train_platform.platform.filesystem import atomic_write_json, extract_archive, remove_tree, safe_relative_path
 from train_platform.repositories.v3.illegal_dataset_version_repo import IllegalDatasetVersionRepository
-from train_platform.services.v3.dataset_common import load_cached_json_file, write_cached_json_file
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -71,6 +71,16 @@ def raw_labels_cache_path(dataset: IllegalDataset, version: IllegalDatasetVersio
     root = version_root(int(dataset.illegal_dataset_id), int(version.version))
     root.parent.mkdir(parents=True, exist_ok=True)
     return root.with_suffix(".raw_labels.json")
+
+
+def _load_raw_labels_cache(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def active_version(db: Session, dataset: IllegalDataset) -> IllegalDatasetVersion | None:
@@ -187,7 +197,7 @@ def refresh_raw_labels_cache(
         if not json_labels_loaded:
             found.update(str(label).strip() for label in extract_json_labels_from_manifest(manifest) if str(label).strip())
     payload = {"labels": sorted(label for label in found if label)}
-    write_cached_json_file(raw_labels_cache_path(dataset, version), payload)
+    atomic_write_json(raw_labels_cache_path(dataset, version), payload)
     return list(payload["labels"])
 
 
@@ -197,7 +207,7 @@ def load_raw_labels(
     *,
     manifest: dict[str, Any] | None = None,
 ) -> list[str]:
-    cached = load_cached_json_file(raw_labels_cache_path(dataset, version))
+    cached = _load_raw_labels_cache(raw_labels_cache_path(dataset, version))
     if isinstance(cached, dict) and isinstance(cached.get("labels"), list):
         return [str(label).strip() for label in cached["labels"] if str(label).strip()]
     return refresh_raw_labels_cache(dataset, version, manifest=manifest)
