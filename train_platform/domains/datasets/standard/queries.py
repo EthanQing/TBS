@@ -12,12 +12,12 @@ from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
 from train_platform.domains.datasets import yolo
+from train_platform.domains.datasets.thumbnails import prewarm_dataset_thumbnails as prewarm_thumbnails
 from train_platform.domains.datasets.storage.files import count_tree, iter_files, iter_image_files
 from train_platform.domains.datasets.storage.mounted import resolve_dataset_file
 from train_platform.domains.datasets.storage.paths import ensure_dataset_relative_path
 from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetImage
 from train_platform.platform import filesystem as _filesystem
-from train_platform.services.v3.thumbnail_service import ThumbnailService
 from train_platform.utils.image_exts import IMAGE_EXTS
 
 
@@ -389,17 +389,25 @@ def prewarm_dataset_thumbnails(root: Path, dataset_id: int, view_index: dict[str
     items = view_index.get("items") if isinstance(view_index, dict) else []
     if limit <= 0 or not isinstance(items, list) or not items:
         return
-    rel_paths = [str(item.get("path") or "") for item in items[:limit] if str(item.get("path") or "")]
-    if not rel_paths:
+    entries: list[tuple[Path, str]] = []
+    for item in items[:limit]:
+        rel_path = str(item.get("path") or "")
+        if not rel_path:
+            continue
+        try:
+            source_path = resolve_dataset_file(root, rel_path)
+        except Exception:
+            continue
+        entries.append((source_path, rel_path))
+    if not entries:
         return
     try:
-        ThumbnailService().pregenerate_for_dataset(
+        prewarm_thumbnails(
             dataset_id=int(dataset_id),
-            dataset_root=root,
+            entries=entries,
             size=int(settings.thumbnail_size or 200),
             max_workers=int(settings.thumbnail_max_workers or 4),
             dataset_namespace="standard",
-            rel_paths=rel_paths,
         )
     except Exception:
         pass
