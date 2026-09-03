@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from train_platform.api.deps import get_db
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
+from train_platform.domains.monitoring.alarms.training import evaluate_training_alerts_best_effort
 from train_platform.domains.training.runs import (
     FrameworkCompareConflict,
     TrainingRunBenchmarkService,
@@ -53,7 +54,6 @@ from train_platform.schemas.v3.training_runs import (
     TrainingRunReviewRequest,
     TrainingRunUpdate,
 )
-from train_platform.services.v3.alarm_service import AlarmService
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 from train_platform.utils.training_augmentations import get_training_augmentation_options
 from train_platform.utils.training_loss_weights import get_training_loss_weight_options
@@ -65,7 +65,7 @@ run_svc = TrainingRunDomainService()
 
 
 def _evaluate_run_alarm(db: Session, run_id: str) -> None:
-    AlarmService.try_evaluate_training_rules(db, run_ids=[str(run_id)])
+    evaluate_training_alerts_best_effort(db, run_ids=[str(run_id)])
 
 
 def _training_export_download_url(run_id: str, fmt: str, weights: str, include_report: bool = False) -> str:

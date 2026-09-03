@@ -25,7 +25,6 @@ from train_platform.domains.training.frameworks import (
 )
 from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
 from train_platform.models.v3.training_run import TrainingRun
-from train_platform.services.v3.alarm_service import AlarmService
 from train_platform.utils.mlflow_utils import init_mlflow_logger
 from train_platform.utils.training_params import build_device_runtime, parse_visible_host_gpu_ids
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
@@ -168,8 +167,7 @@ def _heartbeat_tick(run_id: str, *, expected_pid: int) -> None:
         run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
         if not run:
             return
-        if touch_heartbeat(db, run_id, expected_pid=expected_pid):
-            AlarmService.try_evaluate_training_rules(db, run_ids=[str(run_id)])
+        touch_heartbeat(db, run_id, expected_pid=expected_pid)
     except Exception:
         db.rollback()
     finally:
@@ -333,15 +331,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             lifecycle_db = SessionLocal()
             try:
-                result = finalize_execution(
+                finalize_execution(
                     lifecycle_db,
                     run_id,
                     exit_code=exit_code,
                     expected_pid=execution_pid,
                     error_message=error_message,
                 )
-                if result.changed:
-                    AlarmService.try_evaluate_training_rules(lifecycle_db, run_ids=[str(result.run_id)])
             finally:
                 lifecycle_db.close()
         except Exception:

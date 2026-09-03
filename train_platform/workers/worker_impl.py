@@ -17,10 +17,10 @@ from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
 from train_platform.db.session import SessionLocal
 from train_platform.domains.training.runs import finalize_execution, mark_started, release_stale_claim, touch_heartbeat
+from train_platform.domains.monitoring.alarms.training import evaluate_training_alerts_best_effort
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun
-from train_platform.services.v3.alarm_service import AlarmService
 from train_platform.utils.training_params import parse_visible_host_gpu_ids, worker_can_run_device
 
 
@@ -182,7 +182,7 @@ class DbQueueWorker:
             )
             should_cleanup = True
             if result.changed:
-                AlarmService.try_evaluate_training_rules(db, run_ids=[str(result.run_id)])
+                evaluate_training_alerts_best_effort(db, run_ids=[str(result.run_id)])
 
             if result.status == TrainingRunStatus.DELETED:
                 _safe_remove_dir(settings.training_dir / run_id)
@@ -263,7 +263,7 @@ class DbQueueWorker:
                 stdout_f.close()
                 stderr_f.close()
                 raise
-            AlarmService.try_evaluate_training_rules(db, run_ids=[str(started.run_id)])
+            evaluate_training_alerts_best_effort(db, run_ids=[str(started.run_id)])
 
             self._running = RunningJob(
                 run_id=run.run_id,
@@ -320,7 +320,7 @@ class DbQueueWorker:
                 changed_ids.append(str(result.run_id))
 
         if changed_ids:
-            AlarmService.try_evaluate_training_rules(db, run_ids=changed_ids)
+            evaluate_training_alerts_best_effort(db, run_ids=changed_ids)
 
 
 

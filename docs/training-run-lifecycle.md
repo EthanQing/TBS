@@ -65,9 +65,9 @@ finalized as `FAILED` through the same lifecycle owner. Stdout, weights, MLflow,
 and result files are not used to infer business state. Normal get/list queries
 perform no repair, commits, artifact indexing, or alarm evaluation.
 
-Monitoring remains an integration seam. API and worker entrypoints may invoke
-the legacy Alarm service after lifecycle operations; the Training domain does
-not depend on `services/v3`.
+Monitoring remains an integration seam. API and worker entrypoints invoke the
+Monitoring domain after lifecycle operations; the training subprocess and
+Training domain do not depend on Monitoring.
 
 ## Read, report, benchmark, and export capabilities
 
