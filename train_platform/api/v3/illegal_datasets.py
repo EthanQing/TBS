@@ -32,7 +32,7 @@ from train_platform.schemas.v3.dataset_uploads import (
     DatasetUploadSessionCreate,
     DatasetUploadSessionOut,
 )
-from train_platform.services.v3.dataset_upload_service import DatasetUploadService
+from train_platform.domains.datasets.uploads import DatasetUploadService, DatasetUploadTaskService
 from train_platform.domains.datasets.illegal import labels, versions
 from train_platform.domains.datasets.illegal.publishing.jobs import IllegalDatasetPublishJobService
 from train_platform.domains.datasets.illegal.service import IllegalDatasetService
@@ -41,6 +41,7 @@ from train_platform.domains.datasets.illegal.service import IllegalDatasetServic
 router = APIRouter(prefix="/illegal-datasets", tags=["illegal-datasets"])
 svc = IllegalDatasetService()
 upload_svc = DatasetUploadService()
+upload_task_svc = DatasetUploadTaskService()
 publish_job_svc = IllegalDatasetPublishJobService()
 
 
@@ -134,7 +135,7 @@ def upload_illegal_session_part(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    return upload_svc.save_part(db, "illegal", illegal_dataset_id, session_id, part_no, file)
+    return upload_svc.save_part(db, "illegal", illegal_dataset_id, session_id, part_no, file.file)
 
 
 @router.get("/{illegal_dataset_id}/upload-sessions/{session_id}", response_model=DatasetUploadSessionOut)
@@ -151,7 +152,7 @@ def complete_illegal_upload_session(
     db: Session = Depends(get_db),
 ):
     task = upload_svc.complete_session(db, "illegal", illegal_dataset_id, session_id, message=message)
-    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    background_tasks.add_task(upload_task_svc.run_task, task.task_id)
     return {"task_id": task.task_id, "session_id": session_id, "status": task.status}
 
 
@@ -178,7 +179,7 @@ def import_illegal_dataset_from_path(
         created_by=payload.created_by,
         message=payload.message,
     )
-    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    background_tasks.add_task(upload_task_svc.run_task, task.task_id)
     return {"task_id": task.task_id, "session_id": None, "status": task.status}
 
 

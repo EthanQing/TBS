@@ -34,3 +34,5 @@ Mounted resolution reads import-root policy directly from this boundary. It does
 Dataset tree scanning primitives live in `train_platform/domains/datasets/storage/files.py`. Standard Dataset views, statistics, derived caches, and URL payloads are owned by `train_platform/domains/datasets/standard/queries.py`; the former `services/v3/dataset_common.py` compatibility module has been removed.
 
 Illegal dataset content hashing, version manifests, CAS storage, manifest-backed reads, and version-derived statistics are owned by `train_platform/domains/datasets/illegal`.
+
+Import-root administration, browsing, source inspection, and root-relative source resolution are owned by `train_platform/domains/datasets/imports`. Chunk upload sessions and DB-backed dataset import task orchestration are owned by `train_platform/domains/datasets/uploads`. These domains acquire and prepare sources, then dispatch content mutation to the Standard or Illegal Dataset owner; they do not provide a unified dataset mutation layer.

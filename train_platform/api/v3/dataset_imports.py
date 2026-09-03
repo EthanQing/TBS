@@ -11,7 +11,7 @@ from train_platform.schemas.v3.dataset_imports import (
     DatasetImportRootDeleteOut,
     DatasetImportRootOut,
 )
-from train_platform.services.v3.dataset_import_service import DatasetImportService
+from train_platform.domains.datasets.imports import DatasetImportService
 
 
 router = APIRouter(prefix="/dataset-imports", tags=["dataset-imports"])
@@ -25,7 +25,7 @@ def list_dataset_import_roots():
 
 @router.post("/roots", response_model=DatasetImportRootOut, status_code=201)
 def create_dataset_import_root(payload: DatasetImportRootCreate):
-    return svc.add_root(payload)
+    return svc.add_root(path=payload.path, label=payload.label)
 
 
 @router.delete("/roots/{root_id}", response_model=DatasetImportRootDeleteOut)

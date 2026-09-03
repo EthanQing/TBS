@@ -31,7 +31,7 @@ from train_platform.schemas.v3.dataset_uploads import (
     DatasetUploadSessionCreate,
     DatasetUploadSessionOut,
 )
-from train_platform.services.v3.dataset_upload_service import DatasetUploadService
+from train_platform.domains.datasets.uploads import DatasetUploadService, DatasetUploadTaskService
 from train_platform.domains.datasets.standard import StandardDatasetService
 from train_platform.domains.datasets.standard.events import list_events
 from train_platform.domains.datasets.standard.queries import (
@@ -47,6 +47,7 @@ from train_platform.domains.datasets.standard.splits import get_split_result, sp
 router = APIRouter(prefix="/standard-datasets", tags=["standard-datasets"])
 svc = StandardDatasetService()
 upload_svc = DatasetUploadService()
+upload_task_svc = DatasetUploadTaskService()
 
 
 @router.post("", response_model=StandardDatasetOut, status_code=201)
@@ -134,7 +135,7 @@ def upload_standard_session_part(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    return upload_svc.save_part(db, "standard", standard_dataset_id, session_id, part_no, file)
+    return upload_svc.save_part(db, "standard", standard_dataset_id, session_id, part_no, file.file)
 
 
 @router.get("/{standard_dataset_id}/upload-sessions/{session_id}", response_model=DatasetUploadSessionOut)
@@ -150,7 +151,7 @@ def complete_standard_upload_session(
     db: Session = Depends(get_db),
 ):
     task = upload_svc.complete_session(db, "standard", standard_dataset_id, session_id)
-    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    background_tasks.add_task(upload_task_svc.run_task, task.task_id)
     return {"task_id": task.task_id, "session_id": session_id, "status": task.status}
 
 
@@ -177,7 +178,7 @@ def import_standard_dataset_from_path(
         created_by=payload.created_by,
         message=payload.message,
     )
-    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    background_tasks.add_task(upload_task_svc.run_task, task.task_id)
     return {"task_id": task.task_id, "session_id": None, "status": task.status}
 
 

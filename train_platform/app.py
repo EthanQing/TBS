@@ -13,7 +13,7 @@ from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
 from train_platform.db.init_db import init_db
 from train_platform.db.session import log_pool_configuration, session_scope
-from train_platform.services.v3.dataset_upload_service import DatasetUploadService
+from train_platform.domains.datasets.uploads import DatasetUploadService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 

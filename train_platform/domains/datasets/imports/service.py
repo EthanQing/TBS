@@ -12,24 +12,22 @@ from train_platform.domains.datasets.storage.roots import (
     load_user_import_roots,
     save_user_import_roots,
 )
-from train_platform.schemas.v3.dataset_imports import (
-    DatasetImportEntriesOut,
-    DatasetImportEntryOut,
-    DatasetImportFsEntriesOut,
-    DatasetImportFsEntryOut,
-    DatasetImportInspectOut,
-    DatasetImportRootCreate,
-    DatasetImportRootDeleteOut,
-    DatasetImportRootOut,
-)
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 from train_platform.utils.image_exts import IMAGE_EXTS
 
 
 class DatasetImportService:
+    """Own import-root policy and inspection of filesystem sources.
+
+    The service deliberately returns plain mappings so transport schemas stay at
+    the API boundary. Dataset creation and upload task lifecycle belong to other
+    domains.
+    """
+
     _DATA_YAML_NAMES = {"data.yaml", "dataset.yaml", "data.yml", "dataset.yml"}
     _SKIP_DIRS = {".git", "__macosx", ".thumbnails", ".versions"}
-    def _root_out(self, *, root_id: str, path: Path, label: str = "", editable: bool = False) -> DatasetImportRootOut:
+
+    def _root_out(self, *, root_id: str, path: Path, label: str = "", editable: bool = False) -> dict[str, Any]:
         exists = path.exists() and path.is_dir()
         readable = False
         if exists:
@@ -41,22 +39,23 @@ class DatasetImportService:
             except Exception:
                 readable = False
         display_label = label.strip() if label else f"{root_id}: {path}"
-        return DatasetImportRootOut(
-            root_id=root_id,
-            path=str(path),
-            label=display_label,
-            exists=bool(exists),
-            readable=bool(readable),
-            editable=bool(editable),
-        )
+        return {
+            "root_id": root_id,
+            "path": str(path),
+            "label": display_label,
+            "exists": bool(exists),
+            "readable": bool(readable),
+            "editable": bool(editable),
+        }
 
-    def roots(self) -> list[DatasetImportRootOut]:
-        out: list[DatasetImportRootOut] = []
+    def roots(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
         for idx, root in enumerate(settings.dataset_import_roots):
             root_id = "default" if idx == 0 else f"root_{idx}"
             out.append(self._root_out(root_id=root_id, path=root, editable=False))
-        static_paths = {str(Path(item.path).resolve(strict=False)).lower() for item in out}
-        seen_ids = {item.root_id for item in out}
+
+        static_paths = {str(Path(item["path"]).resolve(strict=False)).lower() for item in out}
+        seen_ids = {str(item["root_id"]) for item in out}
         for item in load_user_import_roots():
             raw_id = str(item.get("root_id") or "").strip()
             root_id = raw_id if raw_id and raw_id not in seen_ids else f"user_{uuid.uuid4().hex[:10]}"
@@ -64,8 +63,7 @@ class DatasetImportService:
                 root = Path(str(item.get("path") or "")).expanduser().resolve(strict=False)
             except Exception:
                 continue
-            key = str(root).lower()
-            if key in static_paths:
+            if str(root).lower() in static_paths:
                 continue
             seen_ids.add(root_id)
             out.append(self._root_out(root_id=root_id, path=root, label=str(item.get("label") or ""), editable=True))
@@ -74,8 +72,8 @@ class DatasetImportService:
     def allowed_roots(self) -> tuple[Path, ...]:
         return allowed_import_roots()
 
-    def add_root(self, payload: DatasetImportRootCreate) -> DatasetImportRootOut:
-        raw_path = str(payload.path or "").strip()
+    def add_root(self, path: str, label: str | None = None) -> dict[str, Any]:
+        raw_path = str(path or "").strip()
         if not raw_path:
             raise ValidationError("Directory path is required")
         try:
@@ -92,16 +90,16 @@ class DatasetImportService:
             raise ValidationError("Directory is not readable") from exc
 
         for existing in self.roots():
-            if Path(existing.path).resolve(strict=False) == root:
+            if Path(existing["path"]).resolve(strict=False) == root:
                 return existing
 
         roots = load_user_import_roots()
         root_id = f"user_{uuid.uuid4().hex[:10]}"
-        roots.append({"root_id": root_id, "path": str(root), "label": str(payload.label or "").strip()})
+        roots.append({"root_id": root_id, "path": str(root), "label": str(label or "").strip()})
         save_user_import_roots(roots)
-        return self._root_out(root_id=root_id, path=root, label=str(payload.label or ""), editable=True)
+        return self._root_out(root_id=root_id, path=root, label=str(label or ""), editable=True)
 
-    def delete_root(self, root_id: str) -> DatasetImportRootDeleteOut:
+    def delete_root(self, root_id: str) -> dict[str, Any]:
         wanted = str(root_id or "").strip()
         if not wanted.startswith("user_"):
             raise ValidationError("Only user-added import roots can be removed")
@@ -110,10 +108,10 @@ class DatasetImportService:
         if len(kept) == len(roots):
             raise NotFoundError("Dataset import root not found")
         save_user_import_roots(kept)
-        return DatasetImportRootDeleteOut(root_id=wanted, deleted=True)
+        return {"root_id": wanted, "deleted": True}
 
-    def _filesystem_start_entries(self) -> DatasetImportFsEntriesOut:
-        entries: list[DatasetImportFsEntryOut] = []
+    def _filesystem_start_entries(self) -> dict[str, Any]:
+        entries: list[dict[str, Any]] = []
         candidates: list[Path] = []
         if os.name == "nt":
             for letter in string.ascii_uppercase:
@@ -140,17 +138,10 @@ class DatasetImportService:
                 pass
             except Exception:
                 readable = False
-            entries.append(
-                DatasetImportFsEntryOut(
-                    name=str(path),
-                    path=str(path),
-                    is_dir=True,
-                    readable=readable,
-                )
-            )
-        return DatasetImportFsEntriesOut(path="", parent_path=None, entries=entries)
+            entries.append({"name": str(path), "path": str(path), "is_dir": True, "readable": readable})
+        return {"path": "", "parent_path": None, "entries": entries}
 
-    def browse_filesystem(self, path: str | None = None) -> DatasetImportFsEntriesOut:
+    def browse_filesystem(self, path: str | None = None) -> dict[str, Any]:
         raw = str(path or "").strip()
         if not raw:
             return self._filesystem_start_entries()
@@ -160,15 +151,13 @@ class DatasetImportService:
             raise ValidationError("Invalid directory path") from exc
         if not current.exists() or not current.is_dir():
             raise NotFoundError("Directory not found")
-        entries: list[DatasetImportFsEntryOut] = []
+        entries: list[dict[str, Any]] = []
         try:
             children = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
         except Exception as exc:
             raise ValidationError("Directory is not readable") from exc
         for child in children:
-            if not child.is_dir():
-                continue
-            if child.name.startswith("."):
+            if not child.is_dir() or child.name.startswith("."):
                 continue
             readable = True
             try:
@@ -178,29 +167,28 @@ class DatasetImportService:
             except Exception:
                 readable = False
             entries.append(
-                DatasetImportFsEntryOut(
-                    name=child.name,
-                    path=str(child.resolve(strict=False)),
-                    is_dir=True,
-                    readable=readable,
-                )
+                {
+                    "name": child.name,
+                    "path": str(child.resolve(strict=False)),
+                    "is_dir": True,
+                    "readable": readable,
+                }
             )
         parent_path = None
         parent = current.parent.resolve(strict=False)
         if parent != current:
             parent_path = str(parent)
-        return DatasetImportFsEntriesOut(path=str(current), parent_path=parent_path, entries=entries)
+        return {"path": str(current), "parent_path": parent_path, "entries": entries}
 
-    def _root_by_id(self, root_id: str | None) -> tuple[str, Path, DatasetImportRootOut]:
-        roots = self.roots()
+    def _root_by_id(self, root_id: str | None) -> tuple[str, Path, dict[str, Any]]:
         wanted = str(root_id or "default").strip() or "default"
-        for item in roots:
-            if item.root_id == wanted:
-                return item.root_id, Path(item.path).resolve(strict=False), item
+        for item in self.roots():
+            if item["root_id"] == wanted:
+                return str(item["root_id"]), Path(str(item["path"])).resolve(strict=False), item
         raise NotFoundError("Dataset import root not found")
 
-    def resolve_path(self, root_id: str | None, rel_path: str | None) -> tuple[str, Path, Path, DatasetImportRootOut]:
-        root_key, root, root_out = self._root_by_id(root_id)
+    def resolve_import_path(self, root_id: str | None, rel_path: str | None) -> Path:
+        _root_key, root, _root_out = self._root_by_id(root_id)
         if not root.exists() or not root.is_dir():
             raise NotFoundError("Dataset import root is not available")
         raw = str(rel_path or "").strip().replace("\\", "/").strip("/")
@@ -212,7 +200,7 @@ class DatasetImportService:
             resolved.relative_to(root.resolve(strict=False))
         except Exception as exc:
             raise ValidationError("Import path must be inside an allowed import root") from exc
-        return root_key, root, resolved, root_out
+        return resolved
 
     def _quick_counts(self, path: Path, *, max_items: int = 3000) -> dict[str, Any]:
         image_count = 0
@@ -272,62 +260,78 @@ class DatasetImportService:
             return "images"
         return "unknown"
 
-    def list_entries(self, *, root_id: str = "default", path: str = "") -> DatasetImportEntriesOut:
-        root_key, root, current, root_out = self.resolve_path(root_id, path)
+    def list_entries(self, *, root_id: str = "default", path: str = "") -> dict[str, Any]:
+        _root_key, root, root_out = self._root_by_id(root_id)
+        current = self.resolve_import_path(root_id, path)
         if not current.exists() or not current.is_dir():
             raise NotFoundError("Import directory not found")
-        entries: list[DatasetImportEntryOut] = []
+        entries: list[dict[str, Any]] = []
         for child in sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
-            if child.name.startswith("."):
-                continue
-            if not child.is_dir():
+            if child.name.startswith(".") or not child.is_dir():
                 continue
             try:
                 rel = child.resolve(strict=False).relative_to(root).as_posix()
             except Exception:
                 continue
             counts = self._quick_counts(child, max_items=1_000_000)
-            is_candidate = counts["image_count"] > 0 and (counts["json_count"] > 0 or counts["label_count"] > 0 or counts["has_data_yaml"])
+            is_candidate = counts["image_count"] > 0 and (
+                counts["json_count"] > 0 or counts["label_count"] > 0 or counts["has_data_yaml"]
+            )
             entries.append(
-                DatasetImportEntryOut(
-                    name=child.name,
-                    path=rel,
-                    is_dir=True,
-                    is_dataset_candidate=bool(is_candidate),
-                    image_count=int(counts["image_count"]),
-                    json_count=int(counts["json_count"]),
-                    label_count=int(counts["label_count"]),
-                    has_data_yaml=bool(counts["has_data_yaml"]),
-                )
+                {
+                    "name": child.name,
+                    "path": rel,
+                    "is_dir": True,
+                    "is_dataset_candidate": bool(is_candidate),
+                    "image_count": int(counts["image_count"]),
+                    "json_count": int(counts["json_count"]),
+                    "label_count": int(counts["label_count"]),
+                    "has_data_yaml": bool(counts["has_data_yaml"]),
+                }
             )
         current_rel = current.relative_to(root).as_posix() if current != root else ""
         parent_path = None
         if current != root:
             parent = current.parent.resolve(strict=False)
             parent_path = parent.relative_to(root).as_posix() if parent != root else ""
-        return DatasetImportEntriesOut(root=root_out, path=current_rel, parent_path=parent_path, entries=entries)
+        return {"root": root_out, "path": current_rel, "parent_path": parent_path, "entries": entries}
 
-    def inspect(self, *, root_id: str = "default", path: str = "") -> DatasetImportInspectOut:
-        root_key, root, current, _root_out = self.resolve_path(root_id, path)
+    def inspect(self, *, root_id: str = "default", path: str = "") -> dict[str, Any]:
+        root_key, root, _root_out = self._root_by_id(root_id)
+        current = self.resolve_import_path(root_id, path)
         counts = self._quick_counts(current, max_items=1_000_000)
         warnings: list[str] = []
         if counts.get("truncated"):
             warnings.append("目录较大，检查结果为快速扫描统计")
         if counts.get("image_count", 0) <= 0:
             warnings.append("未发现图片文件")
-        if counts.get("image_count", 0) > 0 and counts.get("json_count", 0) <= 0 and counts.get("label_count", 0) <= 0 and not counts.get("has_data_yaml"):
+        if (
+            counts.get("image_count", 0) > 0
+            and counts.get("json_count", 0) <= 0
+            and counts.get("label_count", 0) <= 0
+            and not counts.get("has_data_yaml")
+        ):
             warnings.append("未发现 JSON 或 YOLO 标注")
         rel = current.relative_to(root).as_posix() if current != root else ""
-        return DatasetImportInspectOut(
-            root_id=root_key,
-            path=rel,
-            resolved_path=str(current),
-            exists=current.exists(),
-            is_dir=current.is_dir(),
-            format=self._format_from_counts(counts),
-            image_count=int(counts["image_count"]),
-            json_count=int(counts["json_count"]),
-            label_count=int(counts["label_count"]),
-            has_data_yaml=bool(counts["has_data_yaml"]),
-            warnings=warnings,
-        )
+        return {
+            "root_id": root_key,
+            "path": rel,
+            "resolved_path": str(current),
+            "exists": current.exists(),
+            "is_dir": current.is_dir(),
+            "format": self._format_from_counts(counts),
+            "image_count": int(counts["image_count"]),
+            "json_count": int(counts["json_count"]),
+            "label_count": int(counts["label_count"]),
+            "has_data_yaml": bool(counts["has_data_yaml"]),
+            "warnings": warnings,
+        }
+
+
+def resolve_import_path(root_id: str | None, rel_path: str | None) -> Path:
+    """Resolve a root-relative import path using the configured root policy."""
+
+    return DatasetImportService().resolve_import_path(root_id, rel_path)
+
+
+__all__ = ["DatasetImportService", "resolve_import_path"]

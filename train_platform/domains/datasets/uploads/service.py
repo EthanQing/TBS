@@ -1,0 +1,373 @@
+from __future__ import annotations
+
+import logging
+import math
+import shutil
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, BinaryIO
+
+from sqlalchemy.orm import Session
+
+from train_platform.core.config import settings
+from train_platform.domains.datasets.illegal.service import IllegalDatasetService
+from train_platform.domains.datasets.imports import resolve_import_path
+from train_platform.domains.datasets.standard import StandardDatasetService
+from train_platform.models.v3.dataset_upload import DatasetUploadSession, DatasetUploadTask
+from train_platform.platform.filesystem import remove_tree
+from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
+
+
+logger = logging.getLogger("train_platform.dataset_upload")
+
+_SESSION_LOCKS: dict[str, threading.RLock] = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class DatasetUploadService:
+    """Own chunk sessions and creation of DB-backed import tasks."""
+
+    def _session_lock(self, session_id: str) -> threading.RLock:
+        with _SESSION_LOCKS_GUARD:
+            lock = _SESSION_LOCKS.get(str(session_id))
+            if lock is None:
+                lock = threading.RLock()
+                _SESSION_LOCKS[str(session_id)] = lock
+            return lock
+
+    def _validate_kind(self, dataset_kind: str) -> str:
+        kind = str(dataset_kind or "").strip().lower()
+        if kind not in {"standard", "illegal"}:
+            raise ValidationError("dataset_kind must be standard or illegal")
+        return kind
+
+    def _validate_mode(self, dataset_kind: str, mode: str | None) -> str:
+        normalized = str(mode or "upload").strip().lower()
+        if normalized not in {"upload", "append"}:
+            raise ValidationError("mode must be upload or append")
+        if dataset_kind == "standard" and normalized != "upload":
+            raise ValidationError("Standard dataset only supports upload mode")
+        return normalized
+
+    def _ensure_dataset_exists(self, db: Session, dataset_kind: str, dataset_id: int) -> None:
+        if dataset_kind == "standard":
+            StandardDatasetService().get_dataset(db, int(dataset_id))
+        else:
+            IllegalDatasetService().get_dataset(db, int(dataset_id))
+
+    def _session_root(self, session_id: str) -> Path:
+        return settings.upload_sessions_dir / str(session_id)
+
+    def _parts_root(self, session_id: str) -> Path:
+        return self._session_root(session_id) / "parts"
+
+    def _part_path(self, session_id: str, part_no: int) -> Path:
+        return self._parts_root(session_id) / f"{int(part_no)}.part"
+
+    def _session_out_uploaded_parts(self, row: DatasetUploadSession) -> list[int]:
+        return sorted(int(x) for x in (row.uploaded_parts or []))
+
+    def _refresh_uploaded_parts(self, row: DatasetUploadSession) -> list[int]:
+        parts_dir = self._parts_root(row.session_id)
+        if not parts_dir.exists():
+            return self._session_out_uploaded_parts(row)
+        uploaded: list[int] = []
+        for path in parts_dir.glob("*.part"):
+            try:
+                part_no = int(path.stem)
+            except Exception:
+                continue
+            if 1 <= part_no <= int(row.total_parts):
+                uploaded.append(part_no)
+        row.uploaded_parts = sorted(set(uploaded))
+        return list(row.uploaded_parts or [])
+
+    def create_session(
+        self,
+        db: Session,
+        dataset_kind: str,
+        dataset_id: int,
+        *,
+        filename: str,
+        total_size: int,
+        chunk_size: int | None = None,
+        mode: str = "upload",
+        created_by: str | None = None,
+    ) -> DatasetUploadSession:
+        kind = self._validate_kind(dataset_kind)
+        mode = self._validate_mode(kind, mode)
+        self._ensure_dataset_exists(db, kind, int(dataset_id))
+        total_size = int(total_size)
+        if total_size <= 0:
+            raise ValidationError("total_size must be greater than 0")
+        effective_chunk_size = int(chunk_size or settings.upload_chunk_size_mb * 1024 * 1024)
+        if effective_chunk_size <= 0:
+            raise ValidationError("chunk_size must be greater than 0")
+        session_id = str(uuid.uuid4())
+        total_parts = int(math.ceil(total_size / effective_chunk_size))
+        row = DatasetUploadSession(
+            session_id=session_id,
+            dataset_kind=kind,
+            dataset_id=int(dataset_id),
+            mode=mode,
+            filename=Path(str(filename or "dataset.zip")).name,
+            total_size=total_size,
+            chunk_size=effective_chunk_size,
+            total_parts=total_parts,
+            uploaded_parts=[],
+            status="uploading",
+            created_by=created_by,
+            expires_at=_utcnow() + timedelta(hours=int(settings.upload_session_ttl_hours)),
+        )
+        db.add(row)
+        self._parts_root(session_id).mkdir(parents=True, exist_ok=True)
+        db.commit()
+        db.refresh(row)
+        logger.info("Created dataset upload session session_id=%s kind=%s dataset_id=%s", session_id, kind, dataset_id)
+        return row
+
+    def get_session(self, db: Session, dataset_kind: str, dataset_id: int, session_id: str) -> DatasetUploadSession:
+        kind = self._validate_kind(dataset_kind)
+        row = (
+            db.query(DatasetUploadSession)
+            .filter(
+                DatasetUploadSession.session_id == str(session_id),
+                DatasetUploadSession.dataset_kind == kind,
+                DatasetUploadSession.dataset_id == int(dataset_id),
+            )
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Upload session not found")
+        self._refresh_uploaded_parts(row)
+        db.commit()
+        db.refresh(row)
+        return row
+
+    def save_part(
+        self,
+        db: Session,
+        dataset_kind: str,
+        dataset_id: int,
+        session_id: str,
+        part_no: int,
+        upload: BinaryIO,
+    ) -> dict[str, Any]:
+        row = self.get_session(db, dataset_kind, dataset_id, session_id)
+        if row.status not in {"uploading", "failed"}:
+            raise ConflictError("Upload session is not accepting parts")
+        part_no = int(part_no)
+        if part_no < 1 or part_no > int(row.total_parts):
+            raise ValidationError("part_no is outside session range")
+        with self._session_lock(row.session_id):
+            parts_dir = self._parts_root(row.session_id)
+            parts_dir.mkdir(parents=True, exist_ok=True)
+            target = self._part_path(row.session_id, part_no)
+            tmp = target.with_suffix(".part.tmp")
+            size = 0
+            try:
+                try:
+                    upload.seek(0)
+                except (AttributeError, OSError):
+                    pass
+                with tmp.open("wb") as f:
+                    while True:
+                        chunk = upload.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        f.write(chunk)
+                expected = (
+                    int(row.chunk_size)
+                    if part_no < int(row.total_parts)
+                    else int(row.total_size) - int(row.chunk_size) * (int(row.total_parts) - 1)
+                )
+                if size != expected:
+                    raise ValidationError(f"Chunk size mismatch: expected {expected}, got {size}")
+                tmp.replace(target)
+            finally:
+                tmp.unlink(missing_ok=True)
+                try:
+                    upload.seek(0)
+                except (AttributeError, OSError):
+                    pass
+            row.status = "uploading"
+            uploaded_parts = self._refresh_uploaded_parts(row)
+            db.commit()
+            return {
+                "session_id": row.session_id,
+                "part_no": part_no,
+                "size": int(size),
+                "uploaded_parts": uploaded_parts,
+                "status": row.status,
+            }
+
+    def cancel_session(self, db: Session, dataset_kind: str, dataset_id: int, session_id: str) -> DatasetUploadSession:
+        row = self.get_session(db, dataset_kind, dataset_id, session_id)
+        with self._session_lock(row.session_id):
+            row.status = "cancelled"
+            remove_tree(self._session_root(row.session_id), ignore_errors=True)
+            db.commit()
+            db.refresh(row)
+            return row
+
+    def complete_session(
+        self,
+        db: Session,
+        dataset_kind: str,
+        dataset_id: int,
+        session_id: str,
+        *,
+        message: str | None = None,
+    ) -> DatasetUploadTask:
+        row = self.get_session(db, dataset_kind, dataset_id, session_id)
+        if row.status not in {"uploading", "failed"}:
+            raise ConflictError("Upload session cannot be completed")
+        with self._session_lock(row.session_id):
+            row.status = "completing"
+            db.commit()
+            uploaded_parts = self._refresh_uploaded_parts(row)
+            missing = [idx for idx in range(1, int(row.total_parts) + 1) if idx not in set(uploaded_parts)]
+            if missing:
+                row.status = "failed"
+                row.error_message = f"Missing parts: {missing[:20]}"
+                db.commit()
+                raise ValidationError(row.error_message)
+            archive_path = self._session_root(row.session_id) / "archive.zip"
+            tmp_archive = archive_path.with_suffix(".zip.tmp")
+            try:
+                with tmp_archive.open("wb") as out:
+                    for idx in range(1, int(row.total_parts) + 1):
+                        with self._part_path(row.session_id, idx).open("rb") as part:
+                            shutil.copyfileobj(part, out, length=1024 * 1024)
+                actual_size = int(tmp_archive.stat().st_size)
+                if actual_size != int(row.total_size):
+                    raise ValidationError(f"Merged ZIP size mismatch: expected {row.total_size}, got {actual_size}")
+                tmp_archive.replace(archive_path)
+            except Exception as exc:
+                tmp_archive.unlink(missing_ok=True)
+                row.status = "failed"
+                row.error_message = str(exc)
+                db.commit()
+                raise
+            task = self._create_task(
+                db,
+                dataset_kind=row.dataset_kind,
+                dataset_id=int(row.dataset_id),
+                mode=row.mode,
+                source_path=archive_path,
+                source_type="zip",
+                session_id=row.session_id,
+                created_by=row.created_by,
+                message=message,
+            )
+            row.status = "completed"
+            row.error_message = None
+            db.commit()
+            db.refresh(task)
+            logger.info("Completed upload session session_id=%s task_id=%s", row.session_id, task.task_id)
+            return task
+
+    def _create_task(
+        self,
+        db: Session,
+        *,
+        dataset_kind: str,
+        dataset_id: int,
+        mode: str,
+        source_path: Path,
+        source_type: str,
+        session_id: str | None = None,
+        created_by: str | None = None,
+        message: str | None = None,
+    ) -> DatasetUploadTask:
+        task = DatasetUploadTask(
+            task_id=str(uuid.uuid4()),
+            dataset_kind=dataset_kind,
+            dataset_id=int(dataset_id),
+            session_id=session_id,
+            mode=mode,
+            source_path=str(Path(source_path).resolve(strict=False)),
+            source_type=source_type,
+            status="queued",
+            stage="queued",
+            progress=0,
+            processed_count=0,
+            total_count=0,
+            created_by=created_by,
+            message=message,
+        )
+        db.add(task)
+        db.flush()
+        return task
+
+    def create_import_task(
+        self,
+        db: Session,
+        dataset_kind: str,
+        dataset_id: int,
+        *,
+        root_id: str = "default",
+        rel_path: str,
+        mode: str = "upload",
+        storage_strategy: str = "copy",
+        created_by: str | None = None,
+        message: str | None = None,
+    ) -> DatasetUploadTask:
+        kind = self._validate_kind(dataset_kind)
+        mode = self._validate_mode(kind, mode)
+        self._ensure_dataset_exists(db, kind, int(dataset_id))
+        strategy = str(storage_strategy or "copy").strip().lower()
+        if strategy not in {"copy", "link"}:
+            raise ValidationError("storage_strategy must be copy or link")
+        source = resolve_import_path(root_id, rel_path)
+        if not source.exists():
+            raise NotFoundError("Import path not found")
+        source_type = "dir" if source.is_dir() else "zip"
+        if source_type == "zip" and source.suffix.lower() != ".zip":
+            raise ValidationError("Import file must be a ZIP archive or a directory")
+        if strategy == "link":
+            if source_type != "dir":
+                raise ValidationError("Linked import only supports directories")
+            source_type = "dir_link"
+        task = self._create_task(
+            db,
+            dataset_kind=kind,
+            dataset_id=int(dataset_id),
+            mode=mode,
+            source_path=source,
+            source_type=source_type,
+            created_by=created_by,
+            message=message,
+        )
+        db.commit()
+        db.refresh(task)
+        logger.info("Created import task task_id=%s path=%s", task.task_id, source)
+        return task
+
+    def cleanup_expired_sessions(self, db: Session) -> int:
+        now = _utcnow()
+        rows = (
+            db.query(DatasetUploadSession)
+            .filter(
+                DatasetUploadSession.expires_at < now,
+                DatasetUploadSession.status.in_(("uploading", "failed", "cancelled")),
+            )
+            .all()
+        )
+        count = 0
+        for row in rows:
+            remove_tree(self._session_root(row.session_id), ignore_errors=True)
+            row.status = "expired" if row.status != "cancelled" else row.status
+            count += 1
+        db.commit()
+        return count
+
+
+__all__ = ["DatasetUploadService"]
