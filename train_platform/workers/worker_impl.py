@@ -156,7 +156,13 @@ class DbQueueWorker:
 
             now = _utcnow()
             if self._last_heartbeat_at is None or (now - self._last_heartbeat_at).total_seconds() >= self.heartbeat_interval:
-                if touch_heartbeat(db, run_id, execution_owner=self.worker_id, heartbeat_at=now):
+                if touch_heartbeat(
+                    db,
+                    run_id,
+                    execution_owner=self.worker_id,
+                    expected_pid=int(self._running.proc.pid),
+                    heartbeat_at=now,
+                ):
                     self._last_heartbeat_at = now
 
             cancel_requested = bool(run.cancel_requested_at is not None or run.delete_requested_at is not None)
@@ -171,6 +177,7 @@ class DbQueueWorker:
                 db,
                 run_id,
                 exit_code=int(rc),
+                expected_pid=int(self._running.proc.pid),
                 error_message=f"Training subprocess exited with code {rc}" if rc != 0 else None,
             )
             should_cleanup = True
@@ -306,6 +313,7 @@ class DbQueueWorker:
                 db,
                 str(run.run_id),
                 exit_code=1,
+                expected_pid=int(run.pid) if run.pid is not None else None,
                 error_message="Worker heartbeat lost; marking as failed",
             )
             if result.changed:

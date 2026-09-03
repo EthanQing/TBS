@@ -18,7 +18,13 @@ def _merge_metrics(existing: Mapping | None, incoming: Mapping | None) -> dict:
     return merged
 
 
-def upsert_epoch_metrics(run_id: str, epoch: int, metrics: Mapping) -> None:
+def upsert_epoch_metrics(
+    run_id: str,
+    epoch: int,
+    metrics: Mapping,
+    *,
+    expected_pid: int | None = None,
+) -> None:
     """Persist epoch metrics and progress without reviving a terminal run."""
 
     db = SessionLocal()
@@ -35,6 +41,8 @@ def upsert_epoch_metrics(run_id: str, epoch: int, metrics: Mapping) -> None:
             run = db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id)).first()
         if not run or run.status != TrainingRunStatus.RUNNING:
             return
+        if expected_pid is not None and (run.pid is None or int(run.pid) != int(expected_pid)):
+            return
 
         row = (
             db.query(TrainingRunEpochMetric)
@@ -50,7 +58,7 @@ def upsert_epoch_metrics(run_id: str, epoch: int, metrics: Mapping) -> None:
         else:
             db.add(TrainingRunEpochMetric(run_id=str(run_id), epoch=int(epoch), metrics=payload))
 
-        touch_heartbeat(db, str(run_id), commit=False)
+        touch_heartbeat(db, str(run_id), expected_pid=expected_pid, commit=False)
         run.current_epoch = int(epoch)
         if run.total_epochs and int(run.total_epochs) > 0:
             run.progress = int(min(100, max(0, 100 * float(epoch + 1) / float(run.total_epochs))))

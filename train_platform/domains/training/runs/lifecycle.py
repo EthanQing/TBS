@@ -148,6 +148,7 @@ def touch_heartbeat(
     run_id: str,
     *,
     execution_owner: str | None = None,
+    expected_pid: int | None = None,
     heartbeat_at: datetime | None = None,
     commit: bool = True,
 ) -> bool:
@@ -155,6 +156,8 @@ def touch_heartbeat(
     if run.status != TrainingRunStatus.RUNNING:
         return False
     if execution_owner is not None and str(run.worker_id or "") != str(execution_owner):
+        return False
+    if expected_pid is not None and (run.pid is None or int(run.pid) != int(expected_pid)):
         return False
     run.heartbeat_at = heartbeat_at or _utcnow()
     if commit:
@@ -217,12 +220,15 @@ def finalize_execution(
     run_id: str,
     *,
     exit_code: int,
+    expected_pid: int | None = None,
     error_message: str | None = None,
 ) -> FinalizeResult:
     """Finalize one execution exactly once using the authoritative DB row."""
 
     run = _load_run(db, run_id, for_update=True)
     if run.status in _TERMINAL_STATUSES:
+        return FinalizeResult(str(run.run_id), False, run.status, run)
+    if expected_pid is not None and (run.pid is None or int(run.pid) != int(expected_pid)):
         return FinalizeResult(str(run.run_id), False, run.status, run)
     if run.status != TrainingRunStatus.RUNNING:
         return FinalizeResult(str(run.run_id), False, run.status, run)

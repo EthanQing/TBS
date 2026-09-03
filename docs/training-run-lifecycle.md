@@ -52,6 +52,14 @@ Terminal rows are idempotent no-ops, so the subprocess and queue worker may both
 observe completion without duplicating events or artifact indexing. Heartbeat
 only updates liveness for an active execution and never revives a terminal run.
 
+Because one run can be resumed into multiple executions, active mutations are
+also bound to the current `TrainingRun.pid`. The training subprocess supplies
+its own process ID, the supervising worker supplies the spawned process ID, and
+stale reconciliation supplies the PID observed on the stale row. A heartbeat,
+progress callback, or finalization request whose expected PID no longer matches
+the authoritative row is a no-op. This prevents a callback from an older
+execution from changing a resumed execution of the same run.
+
 Stale queued claims are released back to `QUEUED`. A stale `RUNNING` row is
 finalized as `FAILED` through the same lifecycle owner. Stdout, weights, MLflow,
 and result files are not used to infer business state. Normal get/list queries

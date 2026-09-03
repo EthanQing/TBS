@@ -40,13 +40,13 @@ def _cancel_requested(run_id: str) -> bool:
         db.close()
 
 
-def _heartbeat_tick(run_id: str) -> None:
+def _heartbeat_tick(run_id: str, *, expected_pid: int) -> None:
     db = SessionLocal()
     try:
         run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
         if not run:
             return
-        if touch_heartbeat(db, run_id):
+        if touch_heartbeat(db, run_id, expected_pid=expected_pid):
             AlarmService.try_evaluate_training_rules(db, run_ids=[str(run_id)])
     except Exception:
         db.rollback()
@@ -54,9 +54,15 @@ def _heartbeat_tick(run_id: str) -> None:
         db.close()
 
 
-def _heartbeat_loop(run_id: str, stop_event: threading.Event, *, interval_sec: float = 5.0) -> None:
+def _heartbeat_loop(
+    run_id: str,
+    stop_event: threading.Event,
+    *,
+    expected_pid: int,
+    interval_sec: float = 5.0,
+) -> None:
     while not stop_event.wait(max(1.0, float(interval_sec))):
-        _heartbeat_tick(run_id)
+        _heartbeat_tick(run_id, expected_pid=expected_pid)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)
     run_id = str(args.run_id)
+    execution_pid = os.getpid()
 
     db = SessionLocal()
     mlflow_logger = None
@@ -128,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         mlflow_logger = init_mlflow_logger(run, dataset_path=str(dataset_path), run_dir=str(run_dir))
 
         def upsert_epoch_metrics(epoch: int, metrics: Dict[str, float]) -> None:
-            persist_epoch_metrics(run_id, epoch, metrics)
+            persist_epoch_metrics(run_id, epoch, metrics, expected_pid=execution_pid)
             if mlflow_logger:
                 mlflow_logger.log_metrics(metrics, step=int(epoch))
 
@@ -146,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_thread = threading.Thread(
             target=_heartbeat_loop,
             args=(run_id, heartbeat_stop),
-            kwargs={"interval_sec": 5.0},
+            kwargs={"expected_pid": execution_pid, "interval_sec": 5.0},
             daemon=True,
         )
         heartbeat_thread.start()
@@ -211,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                     lifecycle_db,
                     run_id,
                     exit_code=exit_code,
+                    expected_pid=execution_pid,
                     error_message=error_message,
                 )
                 if result.changed:
