@@ -186,6 +186,31 @@ class ModelWorkerClient:
             timeout=self._timeout("INFERENCE_WORKER_TIMEOUT", 120.0),
         )
 
+    def export_ultralytics_onnx(
+        self,
+        *,
+        src_pt: str | Path,
+        out_onnx: str | Path,
+        dynamic: bool,
+        opset: int | None,
+        imgsz: int | None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "src_pt": str(src_pt),
+            "out_onnx": str(out_onnx),
+            "dynamic": bool(dynamic),
+            "opset": int(opset) if opset is not None else None,
+            "imgsz": int(imgsz) if imgsz is not None else None,
+        }
+        data = self._post_json(
+            self._endpoint("ultralytics-yolo", "/internal/training-runs/export-onnx"),
+            payload,
+            timeout=self._timeout("INFERENCE_WORKER_TIMEOUT", 1200.0),
+        )
+        status = str(data.get("status") or "").strip().lower()
+        if status not in {"ok", "started"}:
+            raise ModelWorkerError(str(data.get("error") or f"Model worker returned status={status or 'unknown'}"))
+
     @staticmethod
     def _normalize_engine(engine: str) -> str:
         return str(engine or "").strip().lower() or "ultralytics-yolo"

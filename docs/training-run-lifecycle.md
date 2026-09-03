@@ -68,3 +68,26 @@ perform no repair, commits, artifact indexing, or alarm evaluation.
 Monitoring remains an integration seam. API and worker entrypoints may invoke
 the legacy Alarm service after lifecycle operations; the Training domain does
 not depend on `services/v3`.
+
+## Read, report, benchmark, and export capabilities
+
+Training Run application capabilities outside lifecycle also live in the runs
+domain:
+
+- `queries.py` owns event, epoch-metric, and artifact reads.
+- `metadata.py` owns run metadata updates and project-card review state.
+- `logs.py` owns validated stdout/stderr tail reads.
+- `reports.py` owns report construction, result/artifact enrichment, framework
+  comparison, and the shared metric alias and fallback semantics used by both
+  reports and comparisons.
+- `benchmarks.py` owns inference-latency measurement, YOLO model statistics,
+  FLOPs enrichment, and cached benchmark result updates.
+- `exports.py` owns training weight selection, safe export paths, ONNX export
+  orchestration, export artifact indexing, download resolution, and optional
+  report ZIP packaging.
+
+ONNX export communicates through the existing
+`platform.runtime.ModelWorkerClient`; API routes do not call inference worker
+HTTP endpoints directly. Report DOCX rendering and MLflow query fallback remain
+external seams. The Training domain does not depend on Alarm/Monitoring, and
+none of these capabilities changes Training Run lifecycle semantics.

@@ -1,27 +1,37 @@
 from __future__ import annotations
 
 import asyncio
-from io import BytesIO
-import os
 from pathlib import Path
 from urllib.parse import quote
-from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import APIRouter, Body, Depends, Query, HTTPException
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
-import requests
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
 from train_platform.core.config import settings
 from train_platform.db.session import SessionLocal
-from train_platform.domains.training.runs import TrainingRunService as TrainingRunDomainService
+from train_platform.domains.training.runs import (
+    FrameworkCompareConflict,
+    TrainingRunBenchmarkService,
+    TrainingRunService as TrainingRunDomainService,
+    compare_runs,
+    download_export,
+    export_training_run as domain_export_training_run,
+    get_meta,
+    list_artifacts,
+    list_epoch_metrics,
+    list_events,
+    mark_project_card_reviewed,
+    tail_logs,
+    update_meta,
+)
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
-from train_platform.models.v3.training_run import TrainingRun, TrainingRunArtifact, TrainingRunEpochMetric, TrainingRunEvent
-from train_platform.schemas.v3.common import DeleteResponse, Page, PageMeta
+from train_platform.models.v3.training_run import TrainingRun, TrainingRunEpochMetric, TrainingRunEvent
+from train_platform.schemas.v3.common import Page, PageMeta
 from train_platform.schemas.v3.training_runs import (
     TrainingRunArtifactOut,
     TrainingRunBenchmarkInferenceRequest,
@@ -43,13 +53,11 @@ from train_platform.schemas.v3.training_runs import (
     TrainingRunReviewRequest,
     TrainingRunUpdate,
 )
-from train_platform.services.v3.training_run_service import FrameworkCompareConflict, TrainingRunService
 from train_platform.services.v3.alarm_service import AlarmService
 from train_platform.utils.exceptions import NotFoundError, ValidationError
 from train_platform.utils.training_augmentations import get_training_augmentation_options
 from train_platform.utils.training_loss_weights import get_training_loss_weight_options
 from train_platform.utils.mlflow_utils import fetch_mlflow_epoch_metrics
-from train_platform.utils.training_report_docx import build_training_report_docx, build_training_report_filename
 
 
 router = APIRouter(prefix="/training-runs", tags=["training-runs"])
@@ -60,77 +68,11 @@ def _evaluate_run_alarm(db: Session, run_id: str) -> None:
     AlarmService.try_evaluate_training_rules(db, run_ids=[str(run_id)])
 
 
-def _export_onnx_via_worker(
-    src_pt: Path,
-    out_onnx: Path,
-    *,
-    dynamic: bool,
-    opset: int | None,
-    imgsz: int | None,
-) -> None:
-    worker_url = os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
-    timeout = float(os.getenv("INFERENCE_WORKER_TIMEOUT", "1200"))
-    headers = {}
-    token = str(settings.internal_api_token or "").strip()
-    if token:
-        headers["X-Internal-Token"] = token
-    payload = {
-        "src_pt": str(src_pt),
-        "out_onnx": str(out_onnx),
-        "dynamic": bool(dynamic),
-        "opset": int(opset) if opset is not None else None,
-        "imgsz": int(imgsz) if imgsz is not None else None,
-    }
-
-    try:
-        resp = requests.post(
-            f"{worker_url}/internal/training-runs/export-onnx",
-            json=payload,
-            timeout=timeout,
-            headers=headers,
-        )
-    except Exception as e:
-        raise ValidationError(f"Failed to reach inference worker: {e}") from e
-
-    if resp.status_code != 200:
-        raise ValidationError(f"Inference worker error {resp.status_code}: {resp.text}")
-
-    try:
-        data = resp.json()
-    except Exception as e:
-        raise ValidationError(f"Inference worker returned non-JSON response: {e}") from e
-
-    err = data.get("error")
-    if err:
-        raise ValidationError(err)
-
-
 def _training_export_download_url(run_id: str, fmt: str, weights: str, include_report: bool = False) -> str:
     url = f"/api/v3/training-runs/{run_id}/export/download?format={fmt}&weights={weights}"
     if include_report:
         url += "&include_report=1"
     return url
-
-
-def _build_export_with_report_zip(
-    *,
-    run: TrainingRun,
-    export_path: Path,
-    fmt: str,
-    weights: str,
-    db: Session,
-) -> tuple[bytes, str]:
-    report = TrainingRunService().build_report(db, str(run.run_id))
-    report_filename = build_training_report_filename(report)
-    report_content = build_training_report_docx(report)
-
-    archive_buffer = BytesIO()
-    with ZipFile(archive_buffer, "w", compression=ZIP_DEFLATED) as archive:
-        archive.write(export_path, arcname=export_path.name)
-        archive.writestr(report_filename, report_content)
-
-    filename = f"{run.run_id}_{weights}_{fmt}_with_report.zip"
-    return archive_buffer.getvalue(), filename
 
 
 @router.get("", response_model=Page[TrainingRunOut])
@@ -261,7 +203,7 @@ def review_training_run(
     payload: TrainingRunReviewRequest | None = None,
     db: Session = Depends(get_db),
 ):
-    return TrainingRunService().mark_project_card_reviewed(db, run_id, source=payload.source if payload else None)
+    return mark_project_card_reviewed(db, run_id, source=payload.source if payload else None)
 
 
 @router.delete("/{run_id}", response_model=TrainingRunOut)
@@ -277,7 +219,7 @@ def delete_training_run(
 
 @router.get("/{run_id}/events", response_model=list[TrainingRunEventOut])
 def list_training_run_events(run_id: str, limit: int = Query(200, ge=1, le=5000), db: Session = Depends(get_db)):
-    return TrainingRunService().list_events(db, run_id, limit=limit)
+    return list_events(db, run_id, limit=limit)
 
 
 @router.get("/{run_id}/metrics/epochs", response_model=list[TrainingRunEpochMetricOut])
@@ -295,113 +237,37 @@ def list_training_run_epoch_metrics(
         # auto: fallback to DB when MLflow has no usable points yet
         if rows:
             return rows
-    return TrainingRunService().list_epoch_metrics(db, run_id, limit=limit)
+    return list_epoch_metrics(db, run_id, limit=limit)
 
 
 @router.get("/{run_id}/artifacts", response_model=list[TrainingRunArtifactOut])
 def list_training_run_artifacts(run_id: str, db: Session = Depends(get_db)):
-    return TrainingRunService().list_artifacts(db, run_id)
+    return list_artifacts(db, run_id)
 
 
 @router.post("/{run_id}/export", response_model=TrainingRunExportOut)
 def export_training_run(run_id: str, payload: TrainingRunExportRequest, db: Session = Depends(get_db)):
-    """
-    Export a training run to a deployable format.
-
-    Currently supported:
-    - pt: raw weights download (best/last)
-    - onnx: Ultralytics export (YOLOv8 -> ONNX)
-    """
-    run = run_svc.get_run(db, run_id)
-
-    fmt = str(payload.format or "pt").strip().lower()
-    weights = str(payload.weights or "best").strip().lower()
-    if fmt not in ("pt", "onnx"):
-        raise ValidationError("Unsupported export format")
-    if weights not in ("best", "last"):
-        raise ValidationError("weights must be 'best' or 'last'")
-
-    weights_dir = (settings.training_dir / str(run.run_id) / "weights").resolve(strict=False)
-    src_weights = (weights_dir / ("best.pt" if weights == "best" else "last.pt")).resolve(strict=False)
-
-    if settings.training_dir.resolve() not in src_weights.parents:
-        raise ValidationError("Unsafe weights path")
-    if not src_weights.exists():
-        raise ValidationError("Weights not found")
-
-    if fmt == "pt":
-        url = _training_export_download_url(str(run.run_id), "pt", weights, include_report=bool(payload.include_report))
-        return TrainingRunExportOut(run_id=str(run.run_id), format=fmt, weights=weights, download_url=url, artifact=None)
-
-    # fmt == onnx
-    if not src_weights.exists():
-        raise ValidationError("ONNX export is only supported for .pt weights (Ultralytics).")
-
-    out_name = "best.onnx" if weights == "best" else "last.onnx"
-    out_onnx = (weights_dir / out_name).resolve(strict=False)
-    if settings.training_dir.resolve() not in out_onnx.parents:
-        raise ValidationError("Unsafe output path")
-
-    if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
-        _export_onnx_via_worker(
-            src_weights,
-            out_onnx,
-            dynamic=bool(payload.dynamic),
-            opset=payload.opset,
-            imgsz=payload.imgsz,
-        )
-
-        if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
-            newest: Path | None = None
-            run_root = (settings.training_dir / str(run.run_id)).resolve(strict=False)
-            try:
-                # Prefer weights/*.onnx, fallback to any *.onnx under the run folder.
-                candidates = list(weights_dir.glob("*.onnx"))
-                if not candidates:
-                    candidates = list(run_root.rglob("*.onnx"))
-                for cand in candidates:
-                    if newest is None or cand.stat().st_mtime > newest.stat().st_mtime:
-                        newest = cand
-            except Exception:
-                newest = None
-
-            if newest and newest.exists() and newest != out_onnx and newest.stat().st_size > 0:
-                try:
-                    import shutil
-
-                    shutil.copy2(newest, out_onnx)
-                except Exception:
-                    pass
-
-        if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
-            raise ValidationError("ONNX export failed: non-empty output file not found")
-
-    # Upsert an artifact row so UI can list/download it later.
-    rel = out_onnx.relative_to(settings.training_dir).as_posix()
-    db.query(TrainingRunArtifact).filter(
-        TrainingRunArtifact.run_id == str(run.run_id),
-        TrainingRunArtifact.kind == "export",
-        TrainingRunArtifact.name == out_name,
-    ).delete()
-
-    size_bytes = None
-    try:
-        size_bytes = int(out_onnx.stat().st_size)
-    except Exception:
-        size_bytes = None
-
-    art = TrainingRunArtifact(run_id=str(run.run_id), kind="export", name=out_name, path=rel, size_bytes=size_bytes)
-    db.add(art)
-    db.commit()
-    db.refresh(art)
-
-    url = _training_export_download_url(str(run.run_id), "onnx", weights, include_report=bool(payload.include_report))
+    exported = domain_export_training_run(
+        db,
+        run_id,
+        format=payload.format,
+        weights=payload.weights,
+        dynamic=bool(payload.dynamic),
+        opset=payload.opset,
+        imgsz=payload.imgsz,
+    )
+    url = _training_export_download_url(
+        str(exported.run_id),
+        exported.format,
+        exported.weights,
+        include_report=bool(payload.include_report),
+    )
     return TrainingRunExportOut(
-        run_id=str(run.run_id),
-        format=fmt,
-        weights=weights,
+        run_id=exported.run_id,
+        format=exported.format,
+        weights=exported.weights,
         download_url=url,
-        artifact=TrainingRunArtifactOut.model_validate(art),
+        artifact=TrainingRunArtifactOut.model_validate(exported.artifact) if exported.artifact else None,
     )
 
 
@@ -413,34 +279,18 @@ def download_training_run_export(
     include_report: bool = Query(False, description="package model export with DOCX training report"),
     db: Session = Depends(get_db),
 ):
-    run = run_svc.get_run(db, run_id)
-
-    fmt = str(format or "pt").strip().lower()
-    weights_key = str(weights or "best").strip().lower()
-    if fmt not in ("pt", "onnx"):
-        raise ValidationError("Unsupported export format")
-    if weights_key not in ("best", "last"):
-        raise ValidationError("weights must be 'best' or 'last'")
-
-    weights_dir = (settings.training_dir / str(run.run_id) / "weights").resolve(strict=False)
-    ext = "onnx" if fmt == "onnx" else "pt"
-    out_path = (weights_dir / f"{weights_key}.{ext}").resolve(strict=False)
-    if settings.training_dir.resolve() not in out_path.parents:
-        raise ValidationError("Unsafe export path")
-    if not out_path.exists() or not out_path.is_file():
-        raise NotFoundError(f"Export file not found: {out_path.name}")
-
-    if include_report:
-        content, filename = _build_export_with_report_zip(
-            run=run,
-            export_path=out_path,
-            fmt=fmt,
-            weights=weights_key,
-            db=db,
-        )
+    download = download_export(
+        db,
+        run_id,
+        format=format,
+        weights=weights,
+        include_report=bool(include_report),
+    )
+    if download.content is not None:
+        filename = str(download.filename or "training_export.zip")
         quoted = quote(filename)
         return Response(
-            content=content,
+            content=download.content,
             media_type="application/zip",
             headers={
                 "Content-Disposition": f"attachment; filename={filename}; filename*=UTF-8''{quoted}",
@@ -448,8 +298,8 @@ def download_training_run_export(
         )
 
     return FileResponse(
-        path=str(out_path),
-        filename=out_path.name,
+        path=str(download.path),
+        filename=download.path.name if download.path else None,
         media_type="application/octet-stream",
     )
 
@@ -457,7 +307,7 @@ def download_training_run_export(
 @router.post("/compare", response_model=TrainingRunCompareResponse)
 def compare_training_runs(payload: TrainingRunCompareRequest, db: Session = Depends(get_db)):
     try:
-        return TrainingRunService().compare_runs(db, payload.run_ids)
+        return compare_runs(db, payload.run_ids)
     except FrameworkCompareConflict as e:
         raise HTTPException(
             status_code=409,
@@ -473,7 +323,7 @@ def benchmark_training_runs_inference_time(
     payload: TrainingRunBenchmarkInferenceRequest,
     db: Session = Depends(get_db),
 ):
-    return TrainingRunService().benchmark_inference_times(
+    return TrainingRunBenchmarkService().benchmark_inference_times(
         db,
         run_ids=payload.run_ids,
         force=bool(payload.force),
@@ -482,12 +332,12 @@ def benchmark_training_runs_inference_time(
 
 @router.get("/{run_id}/meta", response_model=TrainingRunMetaOut)
 def get_training_run_meta(run_id: str, db: Session = Depends(get_db)):
-    return TrainingRunService().get_meta(db, run_id)
+    return get_meta(db, run_id)
 
 
 @router.patch("/{run_id}/meta", response_model=TrainingRunMetaOut)
 def update_training_run_meta(run_id: str, payload: TrainingRunMetaUpdate, db: Session = Depends(get_db)):
-    return TrainingRunService().update_meta(db, run_id, patch=payload.model_dump(exclude_unset=True))
+    return update_meta(db, run_id, patch=payload.model_dump(exclude_unset=True))
 
 
 @router.get("/{run_id}/logs/tail", response_model=TrainingRunLogTailOut)
@@ -498,7 +348,7 @@ def tail_training_run_logs(
     db: Session = Depends(get_db),
 ):
     which_norm = str(which or "").strip().lower()
-    text = TrainingRunService().tail_logs(db, run_id, which=which_norm, lines=lines)
+    text = tail_logs(db, run_id, which=which_norm, lines=lines)
     return TrainingRunLogTailOut(run_id=str(run_id), which=which_norm, lines=int(lines), text=text)
 
 
@@ -581,12 +431,11 @@ async def stream_training_run_logs(websocket: WebSocket, run_id: str):
                 return
 
             if tail_lines > 0:
-                svc = TrainingRunService()
                 if want_stdout:
-                    text = svc.tail_logs(db, str(run_id), which="stdout", lines=int(tail_lines))
+                    text = tail_logs(db, str(run_id), which="stdout", lines=int(tail_lines))
                     await _send_lines("stdout", "tail", (text or "").splitlines())
                 if want_stderr:
-                    text = svc.tail_logs(db, str(run_id), which="stderr", lines=int(tail_lines))
+                    text = tail_logs(db, str(run_id), which="stderr", lines=int(tail_lines))
                     await _send_lines("stderr", "tail", (text or "").splitlines())
 
         # Start streaming from the end (tail already sent).
