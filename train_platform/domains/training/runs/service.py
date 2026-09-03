@@ -5,16 +5,15 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
 from train_platform.domains.datasets.storage.paths import resolve_legacy_dataset_path
+from train_platform.domains.model_assets.versions.deletion import delete_model_versions_with_dependents
+from train_platform.domains.training.frameworks import get_plugin
 from train_platform.models.v3.architecture import ModelArchitecture
-from train_platform.models.v3.deployment import Deployment
 from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
-from train_platform.models.v3.inference import InferenceRun
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.project import Project
 from train_platform.models.v3.standard_dataset import StandardDataset
@@ -25,7 +24,6 @@ from train_platform.models.v3.training_run import (
 )
 from train_platform.platform.filesystem import remove_tree
 from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
-from train_platform.domains.training.frameworks import get_plugin
 from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 from train_platform.utils.path_utils import resolve_training_path
@@ -270,20 +268,7 @@ class TrainingRunService:
             detail = f"{len(model_versions)} model version(s)"
             raise ConflictError(f"Cannot delete training run; {detail} still reference it")
         if model_versions and force:
-            mv_ids = [int(model_version.model_version_id) for model_version in model_versions]
-            dep_ids: list[int] = []
-            if mv_ids:
-                deployments = db.query(Deployment).filter(Deployment.model_version_id.in_(mv_ids)).all()
-                dep_ids = [int(deployment.deployment_id) for deployment in deployments]
-                inf_filters = [InferenceRun.model_version_id.in_(mv_ids)]
-                if dep_ids:
-                    inf_filters.append(InferenceRun.deployment_id.in_(dep_ids))
-                for inference in db.query(InferenceRun).filter(or_(*inf_filters)).all():
-                    db.delete(inference)
-                for deployment in deployments:
-                    db.delete(deployment)
-            for model_version in model_versions:
-                db.delete(model_version)
+            delete_model_versions_with_dependents(db, model_versions)
         run = self.request_delete(db, str(run.run_id))
         if run.status != TrainingRunStatus.RUNNING:
             remove_tree(settings.training_dir / str(run.run_id), ignore_errors=True)
