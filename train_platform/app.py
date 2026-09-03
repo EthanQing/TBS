@@ -14,6 +14,7 @@ from train_platform.core.license import assert_valid_license
 from train_platform.db.init_db import init_db
 from train_platform.db.session import log_pool_configuration, session_scope
 from train_platform.domains.datasets.uploads import DatasetUploadService
+from train_platform.domains.deployment.runs.service import DeploymentRunService
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -38,6 +39,16 @@ async def lifespan(app: FastAPI):
                 logger.info("Cleaned %s expired dataset upload sessions on startup.", cleaned)
     except Exception as e:
         logger.warning("Failed to clean expired dataset upload sessions on startup: %s", e)
+    try:
+        recovery = DeploymentRunService().recover_orphaned_runs()
+        logger.info(
+            "Deployment run startup recovery complete: failed=%s rescheduled=%s.",
+            recovery["failed"],
+            recovery["rescheduled"],
+        )
+    except Exception:
+        logger.exception("Deployment run startup recovery failed")
+        raise
     yield
 
 

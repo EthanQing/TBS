@@ -4,9 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.models.v3.deployment import Deployment, DeploymentLog
 from train_platform.models.v3.enums import DeploymentStatus
-from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.schemas.v3.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v3.deployments import (
     DeploymentCreate,
@@ -21,13 +19,14 @@ from train_platform.schemas.v3.deployments import (
     DeploymentRollbackOut,
     DeploymentUpdate,
 )
-from train_platform.services.v3.deployment_service import DeploymentService
-from train_platform.services.v3.deployment_runtime_service import DeploymentRuntimeService
+from train_platform.domains.deployment.runs.service import DeploymentRunService
+from train_platform.domains.deployment.service import DeploymentService
 from train_platform.utils.exceptions import ValidationError
 
 
 router = APIRouter(prefix="/deployments", tags=["deployments"])
-_runtime_svc = DeploymentRuntimeService()
+_runtime_svc = DeploymentRunService()
+_svc = DeploymentService()
 
 
 @router.get("", response_model=Page[DeploymentOut])
@@ -51,19 +50,14 @@ def list_deployments(
         except Exception:
             raise ValidationError("Invalid status")
 
-    q = db.query(Deployment)
-    if project_id is not None:
-        q = q.join(ModelVersion, ModelVersion.model_version_id == Deployment.model_version_id)
-        q = q.filter(ModelVersion.project_id == int(project_id))
-    if model_version_id is not None:
-        q = q.filter(Deployment.model_version_id == int(model_version_id))
-    if st is not None:
-        q = q.filter(Deployment.status == st)
-    if is_active is not None:
-        q = q.filter(Deployment.is_active == bool(is_active))
-    total = q.count()
-
-    items = DeploymentService().list_deployments(
+    total = _svc.count_deployments(
+        db,
+        project_id=project_id,
+        model_version_id=model_version_id,
+        status=st,
+        is_active=is_active,
+    )
+    items = _svc.list_deployments(
         db,
         project_id=project_id,
         model_version_id=model_version_id,
@@ -77,7 +71,7 @@ def list_deployments(
 
 @router.post("", response_model=DeploymentOut, status_code=201)
 def create_deployment(payload: DeploymentCreate, db: Session = Depends(get_db)):
-    return DeploymentService().create_deployment(db, obj=payload.model_dump())
+    return _svc.create_deployment(db, obj=payload.model_dump())
 
 
 @router.post("/{deployment_id}/execute", response_model=DeploymentExecuteOut)
@@ -91,17 +85,17 @@ def execute_deployment(
 
 @router.get("/{deployment_id}", response_model=DeploymentOut)
 def get_deployment(deployment_id: int, db: Session = Depends(get_db)):
-    return DeploymentService().get_deployment(db, deployment_id)
+    return _svc.get_deployment(db, deployment_id)
 
 
 @router.patch("/{deployment_id}", response_model=DeploymentOut)
 def update_deployment(deployment_id: int, payload: DeploymentUpdate, db: Session = Depends(get_db)):
-    return DeploymentService().update_deployment(db, deployment_id, patch=payload.model_dump(exclude_unset=True))
+    return _svc.update_deployment(db, deployment_id, patch=payload.model_dump(exclude_unset=True))
 
 
 @router.delete("/{deployment_id}", response_model=DeleteResponse)
 def delete_deployment(deployment_id: int, db: Session = Depends(get_db)):
-    DeploymentService().delete_deployment(db, deployment_id)
+    _svc.delete_deployment(db, deployment_id)
     return DeleteResponse(ok=True, message="Deployment deleted")
 
 
@@ -111,30 +105,22 @@ def list_deployment_logs(
     limit: int = Query(200, ge=1, le=5000),
     db: Session = Depends(get_db),
 ):
-    # Query directly; service returns deployment with logs too, but list is common.
-    DeploymentService().get_deployment(db, deployment_id)
-    return (
-        db.query(DeploymentLog)
-        .filter(DeploymentLog.deployment_id == int(deployment_id))
-        .order_by(DeploymentLog.created_at.desc())
-        .limit(int(limit))
-        .all()
-    )
+    return _svc.get_logs(db, deployment_id, limit=int(limit))
 
 
 @router.post("/{deployment_id}/logs", response_model=DeploymentLogOut, status_code=201)
 def add_deployment_log(deployment_id: int, payload: DeploymentLogCreate, db: Session = Depends(get_db)):
-    return DeploymentService().add_log(db, deployment_id, level=payload.level, message=payload.message, data=payload.data)
+    return _svc.add_log(db, deployment_id, level=payload.level, message=payload.message, data=payload.data)
 
 
 @router.get("/{deployment_id}/rollback/candidates", response_model=DeploymentRollbackCandidatesOut)
 def get_deployment_rollback_candidates(deployment_id: int, db: Session = Depends(get_db)):
-    return DeploymentService().get_rollback_candidates(db, deployment_id)
+    return _svc.get_rollback_candidates(db, deployment_id)
 
 
 @router.post("/{deployment_id}/rollback", response_model=DeploymentRollbackOut)
 def rollback_deployment(deployment_id: int, payload: DeploymentRollbackCreate, db: Session = Depends(get_db)):
-    return DeploymentService().rollback_deployment(
+    return _svc.rollback_deployment(
         db,
         deployment_id,
         target_model_version_id=payload.target_model_version_id,
@@ -149,4 +135,4 @@ def list_deployment_rollback_history(
     limit: int = Query(200, ge=1, le=5000),
     db: Session = Depends(get_db),
 ):
-    return DeploymentService().list_rollback_history(db, deployment_id, limit=int(limit))
+    return _svc.list_rollback_history(db, deployment_id, limit=int(limit))
