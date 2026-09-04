@@ -38,12 +38,6 @@ class InferenceResponse(BaseModel):
     inference_time_ms: Optional[float] = None
 
 
-class ModelConversionRequest(BaseModel):
-    job_id: str = Field(..., min_length=1)
-    opset: Optional[int] = None
-    dynamic: bool = True
-
-
 class ExportOnnxRequest(BaseModel):
     src_pt: str = Field(..., min_length=1)
     out_onnx: str = Field(..., min_length=1)
@@ -512,38 +506,6 @@ def run_video_frame_sampling(
         frame_interval=int(req.frame_interval),
         infer_image=_infer_image,
     )
-
-
-@app.post("/internal/model-conversions/pt-to-onnx", response_model=WorkerStatusResponse)
-def start_model_conversion(
-    req: ModelConversionRequest,
-    _: None = Depends(_verify_internal_auth),
-) -> WorkerStatusResponse:
-    from train_platform.domains.model_assets.conversion.jobs import input_path, read_job
-
-    try:
-        read_job(req.job_id)
-        model_input = input_path(req.job_id)
-    except Exception as exc:
-        return WorkerStatusResponse(status="error", error=str(exc))
-
-    if not model_input.exists() or not model_input.is_file():
-        return WorkerStatusResponse(
-            status="error",
-            error=f"Job artifact input.pt is not visible to inference worker: {model_input}",
-        )
-
-    from train_platform.domains.model_assets.conversion.runner import record_failure, run_job
-
-    def _runner() -> None:
-        try:
-            run_job(req.job_id, opset=req.opset, dynamic=req.dynamic)
-        except Exception as exc:
-            record_failure(req.job_id, exc)
-
-    t = threading.Thread(target=_runner, daemon=True)
-    t.start()
-    return WorkerStatusResponse(status="started")
 
 
 @app.post("/internal/training-runs/export-onnx", response_model=WorkerStatusResponse)

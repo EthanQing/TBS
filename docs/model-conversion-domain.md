@@ -3,7 +3,8 @@
 `train_platform/domains/model_assets/conversion` owns asynchronous PT/PTH to
 ONNX conversion. The HTTP API only adapts the uploaded stream and constructs
 the download response. The YOLO worker only polls, claims, invokes the runner,
-and releases its claim.
+and releases its claim. It is the sole conversion execution entrypoint; the
+inference sidecar does not expose a route that can bypass the worker claim.
 
 ## Job persistence and execution
 
