@@ -26,12 +26,7 @@ def delete_model_versions_with_dependents(db: Session, model_versions: Iterable[
     if not model_version_ids:
         return
 
-    # Find affected deployments initially and collect affected project IDs
-    initial_deployments = (
-        db.query(Deployment)
-        .filter(Deployment.model_version_id.in_(model_version_ids))
-        .all()
-    )
+    # Collect affected project IDs
     affected_project_ids = {
         int(v.project_id)
         for v in versions

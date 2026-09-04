@@ -19,13 +19,17 @@ from .events import add_event
 from .service import StandardDatasetService
 
 
-def _resolve_uploaded_yolo_root(source_root: Path) -> Path | None:
+def resolve_uploaded_yolo_root(source_root: Path) -> Path | None:
     root = Path(source_root)
     if (root / "images").exists() and (root / "labels").exists():
         return root
     if any((root / name).exists() for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml")):
         return root
     return yolo.find_yolo_export_root(root)
+
+
+_resolve_uploaded_yolo_root = resolve_uploaded_yolo_root
+
 
 
 def image_count(db: Session, dataset: StandardDataset) -> int:

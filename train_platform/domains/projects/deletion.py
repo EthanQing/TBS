@@ -6,15 +6,25 @@ from train_platform.core.config import settings
 from train_platform.domains.model_assets.versions.deletion import delete_model_versions_with_dependents
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.model_registry import ModelVersion
+from train_platform.models.v3.project import Project
 from train_platform.models.v3.training_run import TrainingRun
 from train_platform.platform.filesystem import remove_tree
-from train_platform.utils.exceptions import ConflictError
+from train_platform.utils.exceptions import ConflictError, NotFoundError
 
 from .service import ProjectService
 
 
 def delete_project(db: Session, project_id: int, *, force: bool = False) -> None:
-    project = ProjectService().get_project(db, int(project_id))
+    project = (
+        db.query(Project)
+        .filter(Project.project_id == int(project_id))
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if not project:
+        raise NotFoundError("Project not found")
+
     runs = db.query(TrainingRun).filter(TrainingRun.project_id == int(project.project_id)).all()
     model_versions = db.query(ModelVersion).filter(ModelVersion.project_id == int(project.project_id)).all()
 
@@ -22,8 +32,11 @@ def delete_project(db: Session, project_id: int, *, force: bool = False) -> None
         ProjectService.validate_delete(runs=runs, model_versions=model_versions)
 
     if force:
-        running_runs = [run for run in runs if run.status == TrainingRunStatus.RUNNING]
-        if running_runs:
+        active_runs = [
+            run for run in runs
+            if run.status in (TrainingRunStatus.QUEUED, TrainingRunStatus.RUNNING)
+        ]
+        if active_runs:
             raise ConflictError("Cannot force delete project; active training runs must finish or cancel before deletion")
 
     run_dirs = [settings.training_dir / str(run.run_id) for run in runs]

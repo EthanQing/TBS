@@ -8,12 +8,14 @@ from typing import Any, Dict, List
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
-from train_platform.domains.model_assets.runtime import resolve_architecture_config_path
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun, TrainingRunResult
 from train_platform.platform.runtime import ModelWorkerClient
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
-from train_platform.platform.filesystem.locations import resolve_training_path
+from train_platform.platform.filesystem.locations import (
+    resolve_paddledet_config_path,
+    resolve_training_path,
+)
 
 from .artifacts import index_completion_artifacts
 from .service import TrainingRunService
@@ -100,7 +102,8 @@ class TrainingRunBenchmarkService:
         engine = str(getattr(arch, "engine", "") or "ultralytics-yolo").strip().lower()
         config_path = None
         if engine == "paddle-det":
-            config_path = resolve_architecture_config_path(arch)
+            params = arch.default_params if isinstance(getattr(arch, "default_params", None), dict) else {}
+            config_path = resolve_paddledet_config_path(params.get("config_path"))
             if not config_path:
                 raise ValidationError("Paddle model missing valid config_path")
 

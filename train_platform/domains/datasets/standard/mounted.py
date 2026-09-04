@@ -279,9 +279,9 @@ def import_mounted_source_tree(
     if existing_files > 0:
         raise ConflictError("Standard dataset content is immutable after upload")
     source = validate_mounted_source_root(Path(source_root))
-    from .content import _resolve_uploaded_yolo_root
+    from .content import resolve_uploaded_yolo_root
 
-    detected_yolo_root = _resolve_uploaded_yolo_root(source)
+    detected_yolo_root = resolve_uploaded_yolo_root(source)
     yolo_root = detected_yolo_root or source
     staging_parent = settings.dataset_staging_dir / "standard"
     staging_parent.mkdir(parents=True, exist_ok=True)
