@@ -12,10 +12,8 @@ from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun, TrainingRunResult
 from train_platform.platform.runtime import ModelWorkerClient
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
-from train_platform.platform.filesystem.locations import (
-    resolve_paddledet_config_path,
-    resolve_training_path,
-)
+from train_platform.platform.filesystem.locations import resolve_training_path
+from train_platform.platform.runtime.paddledetection import resolve_paddledet_config_path
 
 from .artifacts import index_completion_artifacts
 from .service import TrainingRunService

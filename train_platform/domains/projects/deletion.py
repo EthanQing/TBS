@@ -25,7 +25,13 @@ def delete_project(db: Session, project_id: int, *, force: bool = False) -> None
     if not project:
         raise NotFoundError("Project not found")
 
-    runs = db.query(TrainingRun).filter(TrainingRun.project_id == int(project.project_id)).all()
+    runs = (
+        db.query(TrainingRun)
+        .filter(TrainingRun.project_id == int(project.project_id))
+        .populate_existing()
+        .with_for_update()
+        .all()
+    )
     model_versions = db.query(ModelVersion).filter(ModelVersion.project_id == int(project.project_id)).all()
 
     if not force:

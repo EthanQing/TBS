@@ -304,7 +304,7 @@ def restore_download_patches(patches: dict[tuple[Any, str], Any]) -> None:
         setattr(module, function_name, original)
 
 
-from train_platform.platform.filesystem.locations import (
+from train_platform.platform.runtime.paddledetection import (
     PADDLE_DET_REQUIRED_CONFIG,
     is_paddledet_repo,
     paddledet_missing_message,

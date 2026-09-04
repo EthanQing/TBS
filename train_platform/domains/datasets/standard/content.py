@@ -28,10 +28,6 @@ def resolve_uploaded_yolo_root(source_root: Path) -> Path | None:
     return yolo.find_yolo_export_root(root)
 
 
-_resolve_uploaded_yolo_root = resolve_uploaded_yolo_root
-
-
-
 def image_count(db: Session, dataset: StandardDataset) -> int:
     return int(
         db.query(StandardDatasetImage)
@@ -107,7 +103,7 @@ def _install_yolo_tree(
     root = StandardDatasetService().dataset_root(dataset)
     materialized: Path | None = None
     try:
-        yolo_root = _resolve_uploaded_yolo_root(Path(source_root))
+        yolo_root = resolve_uploaded_yolo_root(Path(source_root))
         if yolo_root is None:
             raise ValidationError("Standard dataset upload only supports YOLO format")
         staging_parent = settings.dataset_staging_dir / "standard"
