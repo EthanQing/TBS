@@ -13,7 +13,7 @@ from train_platform.domains.datasets.storage.roots import (
     save_user_import_roots,
 )
 from train_platform.utils.exceptions import NotFoundError, ValidationError
-from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.domains.datasets.images import IMAGE_EXTS
 
 
 class DatasetImportService:

@@ -8,7 +8,7 @@ from urllib.parse import quote
 from train_platform.api.deps import get_db
 from train_platform.domains.training.runs import build_report
 from train_platform.schemas.v3.training_reports import TrainingRunReportOut
-from train_platform.utils.training_report_docx import (
+from train_platform.domains.training.runs.report_docx import (
     DOCX_MEDIA_TYPE,
     build_training_report_docx,
     build_training_report_filename,

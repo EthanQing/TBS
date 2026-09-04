@@ -17,15 +17,15 @@ from pathlib import Path
 from typing import Any, Dict
 
 from train_platform.core.config import settings
-from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
+from train_platform.domains.datasets.yolo import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ValidationError
-from train_platform.utils.paddledet_paths import (
+from train_platform.domains.training.frameworks.paddle_det.runtime import (
     ensure_paddledet_repo_on_syspath,
     paddledet_missing_message,
     resolve_paddledet_config_path,
 )
-from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
-from train_platform.utils.training_params import extract_selected_gpu_ids, normalize_device_spec
+from train_platform.platform.filesystem.locations import resolve_pretrain_path, resolve_temp_path
+from train_platform.domains.training.parameters import extract_selected_gpu_ids, normalize_device_spec
 
 from ..contract import TrainingCallbacks, TrainingExecutionSpec
 from .config import (

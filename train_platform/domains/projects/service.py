@@ -5,8 +5,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from train_platform.models.v3.project import Project
-from train_platform.repositories.v3.project_repo import ProjectRepository
-from train_platform.repositories.v3.standard_dataset_repo import StandardDatasetRepository
+from train_platform.models.v3.standard_dataset import StandardDataset
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 from .baselines import preserve_baselines
@@ -14,10 +13,6 @@ from .baselines import preserve_baselines
 
 class ProjectService:
     """Owns Project aggregate lifecycle operations."""
-
-    def __init__(self) -> None:
-        self.projects = ProjectRepository()
-        self.datasets = StandardDatasetRepository()
 
     def list_projects(
         self,
@@ -40,7 +35,7 @@ class ProjectService:
         return query
 
     def get_project(self, db: Session, project_id: int) -> Project:
-        row = self.projects.get(db, int(project_id))
+        row = db.query(Project).filter(Project.project_id == int(project_id)).first()
         if not row:
             raise NotFoundError("Project not found")
         return row
@@ -60,11 +55,11 @@ class ProjectService:
         name = str(obj.get("name") or "").strip()
         if not name:
             raise ValidationError("name is required")
-        if self.projects.get_by_name(db, name):
+        if db.query(Project).filter(Project.name == name).first():
             raise ConflictError(f"Project '{name}' already exists")
 
         standard_dataset_id = int(obj["standard_dataset_id"])
-        dataset = self.datasets.get(db, standard_dataset_id)
+        dataset = db.query(StandardDataset).filter(StandardDataset.standard_dataset_id == standard_dataset_id).first()
         if not dataset:
             raise NotFoundError("Standard dataset not found")
         dataset_type = getattr(getattr(dataset, "dataset_type", None), "value", getattr(dataset, "dataset_type", None))
@@ -72,18 +67,18 @@ class ProjectService:
         if str(dataset_type or "") != str(task_type or ""):
             raise ValidationError("Project task_type must match standard dataset dataset_type")
 
-        row = self.projects.create(
-            db,
-            obj_in={
-                "name": name,
-                "description": obj.get("description"),
-                "standard_dataset_id": standard_dataset_id,
-                "task_type": obj["task_type"],
-                "created_by": obj.get("created_by"),
-                "tags": preserve_baselines(None, obj.get("tags")),
-                "is_active": True,
-            },
+        row = Project(
+            name=name,
+            description=obj.get("description"),
+            standard_dataset_id=standard_dataset_id,
+            task_type=obj["task_type"],
+            created_by=obj.get("created_by"),
+            tags=preserve_baselines(None, obj.get("tags")),
+            is_active=True,
         )
+        db.add(row)
+        db.flush()
+        db.refresh(row)
         db.commit()
         db.refresh(row)
         return row
@@ -94,7 +89,7 @@ class ProjectService:
             new_name = str(patch["name"]).strip()
             if not new_name:
                 raise ValidationError("name cannot be empty")
-            exists = self.projects.get_by_name(db, new_name)
+            exists = db.query(Project).filter(Project.name == new_name).first()
             if exists and int(exists.project_id) != int(row.project_id):
                 raise ConflictError(f"Project '{new_name}' already exists")
             row.name = new_name

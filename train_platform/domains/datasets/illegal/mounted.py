@@ -15,7 +15,7 @@ from train_platform.domains.datasets.labelme import (
 )
 from train_platform.domains.datasets.storage.mounted import mounted_file_entry, validate_mounted_source_root
 from train_platform.utils.exceptions import NotFoundError, ValidationError
-from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.domains.datasets.images import IMAGE_EXTS
 
 
 def _utcnow_iso() -> str:

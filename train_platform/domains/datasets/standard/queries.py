@@ -18,7 +18,7 @@ from train_platform.domains.datasets.storage.mounted import resolve_dataset_file
 from train_platform.domains.datasets.storage.paths import ensure_dataset_relative_path
 from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetImage
 from train_platform.platform import filesystem as _filesystem
-from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.domains.datasets.images import IMAGE_EXTS
 
 
 _JSON_CACHE_LOCK = threading.Lock()

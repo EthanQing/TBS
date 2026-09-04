@@ -12,7 +12,7 @@ from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.training_run import TrainingRun
 from train_platform.schemas.v3.inference_jobs import InferenceModelCandidate
-from train_platform.utils.path_utils import resolve_training_path
+from train_platform.platform.filesystem.locations import resolve_training_path
 
 
 class ModelCandidateService:

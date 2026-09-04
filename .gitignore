@@ -33,6 +33,8 @@ train_platform/domains/datasets/**/*.pyc
 training_runs/
 temp/
 runs/
+!train_platform/domains/training/runs/
+!train_platform/domains/training/runs/report_docx.py
 PaddleDetection/
 imports/
 *.log

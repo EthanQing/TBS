@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.domains.datasets.images import IMAGE_EXTS
 
 
 _DATASET_INTERNAL_FILE_NAMES = {".dataset_stats.json", ".dataset_view_index.json"}

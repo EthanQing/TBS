@@ -11,7 +11,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from train_platform.core.config import settings
 from train_platform.platform.filesystem.paths import safe_relative_path
 from train_platform.utils.exceptions import NotFoundError, ValidationError
-from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.domains.datasets.images import IMAGE_EXTS
 
 
 def _thumbnail_base(

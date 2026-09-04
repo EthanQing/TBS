@@ -55,8 +55,10 @@ from train_platform.schemas.v3.training_runs import (
     TrainingRunUpdate,
 )
 from train_platform.utils.exceptions import NotFoundError, ValidationError
-from train_platform.utils.training_augmentations import get_training_augmentation_options
-from train_platform.utils.training_loss_weights import get_training_loss_weight_options
+from train_platform.domains.training.parameters import (
+    get_training_augmentation_options,
+    get_training_loss_weight_options,
+)
 from train_platform.domains.training.integrations.mlflow import fetch_mlflow_epoch_metrics
 
 
@@ -97,20 +99,7 @@ def list_training_runs(
         except Exception:
             raise ValidationError("Invalid status")
 
-    q = db.query(TrainingRun)
-    if not include_hidden:
-        q = q.filter(TrainingRun.hidden == False)  # noqa: E712
-    if project_id is not None:
-        q = q.filter(TrainingRun.project_id == int(project_id))
-    if standard_dataset_id is not None:
-        q = q.filter(TrainingRun.standard_dataset_id == int(standard_dataset_id))
-    if architecture_id is not None:
-        q = q.filter(TrainingRun.architecture_id == int(architecture_id))
-    if st is not None:
-        q = q.filter(TrainingRun.status == st)
-    total = q.count()
-
-    items = run_svc.list_runs(
+    items, total = run_svc.list_runs_page(
         db,
         project_id=project_id,
         standard_dataset_id=standard_dataset_id,

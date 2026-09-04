@@ -40,13 +40,11 @@ from train_platform.models.v3.illegal_dataset import (
     IllegalDatasetVersion,
 )
 from train_platform.platform.filesystem import atomic_write_json, extract_archive, remove_tree, safe_relative_path
-from train_platform.repositories.v3.illegal_dataset_version_repo import IllegalDatasetVersionRepository
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
 _VERSION_CREATE_LOCKS: dict[int, threading.RLock] = {}
 _VERSION_CREATE_LOCKS_GUARD = threading.Lock()
-_version_repo = IllegalDatasetVersionRepository()
 
 
 def dataset_lock(illegal_dataset_id: int) -> threading.RLock:
@@ -89,6 +87,15 @@ def active_version(db: Session, dataset: IllegalDataset) -> IllegalDatasetVersio
     return db.query(IllegalDatasetVersion).filter(
         IllegalDatasetVersion.version_id == int(dataset.active_version_id)
     ).first()
+
+
+def _latest_version(db: Session, illegal_dataset_id: int) -> IllegalDatasetVersion | None:
+    return (
+        db.query(IllegalDatasetVersion)
+        .filter(IllegalDatasetVersion.illegal_dataset_id == int(illegal_dataset_id))
+        .order_by(IllegalDatasetVersion.version.desc())
+        .first()
+    )
 
 
 def selected_version(
@@ -428,7 +435,7 @@ def import_source_tree(
         if progress_callback:
             progress_callback(75, "validating")
         dataset = lock_dataset_for_version_create(db, dataset)
-        parent = active_version(db, dataset) if append else _version_repo.get_latest(db, int(dataset.illegal_dataset_id))
+        parent = active_version(db, dataset) if append else _latest_version(db, int(dataset.illegal_dataset_id))
         inherited = version_files_for_inheritance(parent) if append and parent else {}
         _create_version_from_tree(
             db,
@@ -473,7 +480,7 @@ def create_from_mounted_source(
     with dataset_lock(int(dataset.illegal_dataset_id)):
         progress(60, "linking", {"detail_message": "Preparing mounted import"})
         dataset = lock_dataset_for_version_create(db, dataset)
-        latest = _version_repo.get_latest(db, int(dataset.illegal_dataset_id))
+        latest = _latest_version(db, int(dataset.illegal_dataset_id))
         version_no = next_version_no(db, dataset)
         parent_version_id = int(latest.version_id) if latest and append else None
         mounted = build_illegal_mounted_manifest(
@@ -596,8 +603,38 @@ def activate(db: Session, dataset: IllegalDataset, version_id: int) -> IllegalDa
         return dataset
 
 
+def _versions_query(db: Session, illegal_dataset_id: int):
+    return (
+        db.query(IllegalDatasetVersion)
+        .filter(IllegalDatasetVersion.illegal_dataset_id == int(illegal_dataset_id))
+        .order_by(IllegalDatasetVersion.version.desc())
+    )
+
+
 def list_versions(db: Session, illegal_dataset_id: int, *, skip: int = 0, limit: int = 100) -> list[IllegalDatasetVersion]:
-    return _version_repo.list_by_dataset(db, int(illegal_dataset_id), skip=skip, limit=limit)
+    return (
+        _versions_query(db, illegal_dataset_id)
+        .offset(max(0, int(skip)))
+        .limit(max(0, int(limit)))
+        .all()
+    )
+
+
+def list_versions_page(
+    db: Session,
+    illegal_dataset_id: int,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+) -> tuple[list[IllegalDatasetVersion], int]:
+    query = _versions_query(db, illegal_dataset_id)
+    total = int(query.count())
+    return (
+        query.offset(max(0, int(skip)))
+        .limit(max(0, int(limit)))
+        .all(),
+        total,
+    )
 
 
 def upload_images(

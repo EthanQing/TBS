@@ -111,7 +111,7 @@ def _build_extensions() -> list[Extension]:
             continue
 
         # Glob patterns are matched against POSIX-style relative paths, e.g.:
-        #   CYTHON_INCLUDE_GLOBS=train_platform/services/*.py,train_platform/services/**/*.py
+        #   CYTHON_INCLUDE_GLOBS=train_platform/domains/*.py,train_platform/platform/**/*.py
         rel_posix = py.relative_to(ROOT).as_posix()
         if include_globs and not any(Path(rel_posix).match(pat) for pat in include_globs):
             continue

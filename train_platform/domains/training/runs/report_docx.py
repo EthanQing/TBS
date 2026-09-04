@@ -398,3 +398,5 @@ def build_training_report_docx(report: dict[str, Any]) -> bytes:
         zf.writestr("word/styles.xml", _styles_xml())
         zf.writestr("word/document.xml", _document_xml(report))
     return buf.getvalue()
+
+

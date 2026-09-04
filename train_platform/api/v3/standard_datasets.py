@@ -7,7 +7,6 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetEvent
 from train_platform.schemas.v3.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v3.standard_datasets import (
     DatasetFileOut,
@@ -33,7 +32,7 @@ from train_platform.schemas.v3.dataset_uploads import (
 )
 from train_platform.domains.datasets.uploads import DatasetUploadService, DatasetUploadTaskService
 from train_platform.domains.datasets.standard import StandardDatasetService
-from train_platform.domains.datasets.standard.events import list_events
+from train_platform.domains.datasets.standard.events import list_events_page
 from train_platform.domains.datasets.standard.queries import (
     get_file_path,
     get_image_annotations,
@@ -69,11 +68,7 @@ def list_standard_datasets(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    q = db.query(StandardDataset)
-    if format:
-        q = q.filter(StandardDataset.format == str(format))
-    total = q.count()
-    items = svc.list_datasets(
+    items, total = svc.list_datasets_page(
         db,
         skip=skip,
         limit=page_size,
@@ -222,9 +217,8 @@ def list_standard_dataset_events(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    total = db.query(StandardDatasetEvent).filter(StandardDatasetEvent.standard_dataset_id == int(standard_dataset_id)).count()
     svc.get_dataset(db, standard_dataset_id)
-    items = list_events(db, standard_dataset_id, skip=skip, limit=page_size)
+    items, total = list_events_page(db, standard_dataset_id, skip=skip, limit=page_size)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 

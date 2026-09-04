@@ -9,8 +9,8 @@ from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.training_run import TrainingRun
 from train_platform.utils.exceptions import NotFoundError, ValidationError
-from train_platform.utils.paddledet_paths import resolve_paddledet_config_path
-from train_platform.utils.path_utils import resolve_training_path
+from train_platform.domains.training.frameworks.paddle_det.runtime import resolve_paddledet_config_path
+from train_platform.platform.filesystem.locations import resolve_training_path
 
 
 @dataclass(frozen=True)

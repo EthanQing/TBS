@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run_meta import TrainingRunMeta
-from train_platform.repositories.v3.training_run_meta_repo import TrainingRunMetaRepository
 from train_platform.utils.exceptions import ValidationError
 
 from .service import TrainingRunService
@@ -19,7 +18,7 @@ def _get_run(db: Session, run_id: str):
 
 def get_meta(db: Session, run_id: str) -> TrainingRunMeta:
     _get_run(db, run_id)
-    meta = TrainingRunMetaRepository().get_by_run_id(db, run_id)
+    meta = db.query(TrainingRunMeta).filter(TrainingRunMeta.run_id == str(run_id)).first()
     if meta:
         return meta
 
@@ -32,7 +31,7 @@ def get_meta(db: Session, run_id: str) -> TrainingRunMeta:
 
 def update_meta(db: Session, run_id: str, *, patch: dict[str, Any]) -> TrainingRunMeta:
     _get_run(db, run_id)
-    meta = TrainingRunMetaRepository().get_by_run_id(db, run_id)
+    meta = db.query(TrainingRunMeta).filter(TrainingRunMeta.run_id == str(run_id)).first()
     if not meta:
         meta = TrainingRunMeta(run_id=str(run_id))
         db.add(meta)
@@ -59,8 +58,7 @@ def mark_project_card_reviewed(db: Session, run_id: str, *, source: str | None =
     if bool(getattr(run, "hidden", False)) or run.status != TrainingRunStatus.COMPLETED:
         raise ValidationError("Only visible completed training runs can be marked as reviewed")
 
-    repo = TrainingRunMetaRepository()
-    meta = repo.get_by_run_id(db, run_id)
+    meta = db.query(TrainingRunMeta).filter(TrainingRunMeta.run_id == str(run_id)).first()
     if not meta:
         meta = TrainingRunMeta(run_id=str(run_id))
         db.add(meta)

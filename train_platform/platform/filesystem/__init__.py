@@ -2,6 +2,7 @@
 
 from .archives import extract_archive, extract_tar, extract_zip
 from .atomic import atomic_write_json, atomic_write_text
+from .locations import resolve_pretrain_path, resolve_temp_path, resolve_training_path
 from .operations import clear_directory, copy_tree, merge_tree, remove_path, remove_tree
 from .paths import ensure_under, safe_relative_path
 
@@ -14,6 +15,9 @@ __all__ = [
     "extract_archive",
     "extract_tar",
     "extract_zip",
+    "resolve_pretrain_path",
+    "resolve_temp_path",
+    "resolve_training_path",
     "merge_tree",
     "remove_tree",
     "remove_path",

@@ -17,7 +17,7 @@ from train_platform.domains.datasets.illegal.publishing.images import (
 from train_platform.domains.datasets.illegal.publishing.slicing import SliceInfo
 from train_platform.domains.datasets.labelme import bbox_to_yolo
 from train_platform.utils.exceptions import ValidationError
-from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.domains.datasets.images import IMAGE_EXTS
 
 
 @dataclass(frozen=True)

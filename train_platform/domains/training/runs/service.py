@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
@@ -23,13 +23,14 @@ from train_platform.models.v3.training_run import (
     TrainingRunParameters,
 )
 from train_platform.platform.filesystem import remove_tree
-from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
-from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
+from train_platform.domains.datasets.yolo import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
-from train_platform.utils.path_utils import resolve_training_path
-from train_platform.utils.training_augmentations import normalize_training_augmentation
-from train_platform.utils.training_loss_weights import normalize_training_loss_weights
-from train_platform.utils.training_params import validate_training_params_for_engine
+from train_platform.platform.filesystem.locations import resolve_training_path
+from train_platform.domains.training.parameters import (
+    normalize_training_augmentation,
+    normalize_training_loss_weights,
+    validate_training_params_for_engine,
+)
 
 from .lifecycle import (
     queue_run as lifecycle_queue_run,
@@ -42,16 +43,25 @@ from .lifecycle import (
 class TrainingRunService:
     """Training run aggregate operations and lifecycle orchestration."""
 
-    def __init__(self) -> None:
-        self.runs = TrainingRunRepository()
+    @staticmethod
+    def _run_query(db: Session):
+        return (
+            db.query(TrainingRun)
+            .options(joinedload(TrainingRun.parameters))
+            .options(joinedload(TrainingRun.result))
+            .options(joinedload(TrainingRun.meta))
+            .options(joinedload(TrainingRun.project))
+            .options(joinedload(TrainingRun.standard_dataset))
+            .options(joinedload(TrainingRun.architecture))
+        )
 
     def get_run(self, db: Session, run_id: str) -> TrainingRun:
-        run = self.runs.get(db, str(run_id))
+        run = self._run_query(db).filter(TrainingRun.run_id == str(run_id)).first()
         if not run:
             raise NotFoundError("Training run not found")
         return run
 
-    def list_runs(
+    def list_runs_page(
         self,
         db: Session,
         *,
@@ -62,17 +72,26 @@ class TrainingRunService:
         skip: int = 0,
         limit: int = 100,
         include_hidden: bool = False,
-    ) -> list[TrainingRun]:
-        return self.runs.list(
-            db,
-            project_id=project_id,
-            status=status,
-            standard_dataset_id=standard_dataset_id,
-            architecture_id=architecture_id,
-            skip=skip,
-            limit=limit,
-            include_hidden=include_hidden,
+    ) -> tuple[list[TrainingRun], int]:
+        query = self._run_query(db)
+        if not include_hidden:
+            query = query.filter(TrainingRun.hidden == False)  # noqa: E712
+        if project_id is not None:
+            query = query.filter(TrainingRun.project_id == int(project_id))
+        if architecture_id is not None:
+            query = query.filter(TrainingRun.architecture_id == int(architecture_id))
+        if status is not None:
+            query = query.filter(TrainingRun.status == status)
+        if standard_dataset_id is not None:
+            query = query.filter(TrainingRun.standard_dataset_id == int(standard_dataset_id))
+        total = int(query.count())
+        items = (
+            query.order_by(TrainingRun.created_at.desc())
+            .offset(max(0, int(skip)))
+            .limit(max(0, int(limit)))
+            .all()
         )
+        return items, total
 
     def create_run(self, db: Session, *, obj: dict[str, Any]) -> TrainingRun:
         assert_valid_license()

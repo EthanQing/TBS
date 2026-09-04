@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from train_platform.utils.exceptions import ValidationError
-from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.domains.datasets.images import IMAGE_EXTS
 
 
 _SKIP_DIRS = {".git", "__macosx", ".thumbnails", ".versions"}

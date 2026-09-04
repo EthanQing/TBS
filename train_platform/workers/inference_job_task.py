@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 from train_platform.core.config import settings
 from train_platform.platform.jobs import JobStatus, JobStore, is_running_status
 from train_platform.utils.exceptions import ValidationError
-from train_platform.utils.path_utils import resolve_temp_path
+from train_platform.platform.filesystem.locations import resolve_temp_path
 
 InferenceFn = Callable[[Path], Dict[str, Any]]
 

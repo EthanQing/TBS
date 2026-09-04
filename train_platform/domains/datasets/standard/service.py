@@ -9,7 +9,6 @@ from train_platform.domains.datasets.storage.paths import resolve_storage_token
 from train_platform.models.v3.project import Project
 from train_platform.models.v3.standard_dataset import StandardDataset
 from train_platform.models.v3.training_run import TrainingRun
-from train_platform.repositories.v3.standard_dataset_repo import StandardDatasetRepository
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 from .events import add_event, list_events
@@ -18,14 +17,11 @@ from .events import add_event, list_events
 class StandardDatasetService:
     """Owns the StandardDataset aggregate lifecycle and metadata."""
 
-    def __init__(self) -> None:
-        self.repo = StandardDatasetRepository()
-
     def dataset_root(self, dataset: StandardDataset) -> Path:
         return resolve_storage_token(dataset.storage_path)
 
     def _ensure_name_available(self, db: Session, name: str, *, exclude_id: int | None = None) -> None:
-        row = self.repo.get_by_name(db, str(name).strip())
+        row = db.query(StandardDataset).filter(StandardDataset.name == str(name).strip()).first()
         if row and (exclude_id is None or int(row.standard_dataset_id) != int(exclude_id)):
             raise ConflictError(f"Standard dataset '{name}' already exists")
 
@@ -57,12 +53,12 @@ class StandardDatasetService:
         return row
 
     def get_dataset(self, db: Session, standard_dataset_id: int) -> StandardDataset:
-        row = self.repo.get(db, int(standard_dataset_id))
+        row = db.query(StandardDataset).filter(StandardDataset.standard_dataset_id == int(standard_dataset_id)).first()
         if not row:
             raise NotFoundError("Standard dataset not found")
         return row
 
-    def list_datasets(
+    def list_datasets_page(
         self,
         db: Session,
         *,
@@ -70,17 +66,19 @@ class StandardDatasetService:
         limit: int = 100,
         format: str | None = None,
         include_statistics: bool = True,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], int]:
         from .queries import dataset_with_statistics
 
         query = db.query(StandardDataset)
         if format:
             query = query.filter(StandardDataset.format == str(format))
+        total = int(query.count())
         rows = query.order_by(StandardDataset.updated_at.desc()).offset(skip).limit(limit).all()
-        return [
+        items = [
             dataset_with_statistics(db, row, include_statistics=bool(include_statistics))
             for row in rows
         ]
+        return items, total
 
     def update_dataset(self, db: Session, standard_dataset_id: int, *, patch: dict[str, Any]) -> StandardDataset:
         row = self.get_dataset(db, standard_dataset_id)

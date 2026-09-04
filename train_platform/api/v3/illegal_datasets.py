@@ -6,7 +6,6 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, Uplo
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.models.v3.illegal_dataset import IllegalDataset, IllegalDatasetEvent, IllegalDatasetVersion
 from train_platform.schemas.v3.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v3.illegal_datasets import (
     DatasetImageUploadOut,
@@ -64,11 +63,7 @@ def list_illegal_datasets(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    q = db.query(IllegalDataset)
-    if format:
-        q = q.filter(IllegalDataset.format == str(format))
-    total = q.count()
-    items = svc.list_datasets(
+    items, total = svc.list_datasets_page(
         db,
         skip=skip,
         limit=page_size,
@@ -207,9 +202,8 @@ def list_illegal_dataset_versions(illegal_dataset_id: int, page: int = 1, page_s
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    total = db.query(IllegalDatasetVersion).filter(IllegalDatasetVersion.illegal_dataset_id == int(illegal_dataset_id)).count()
     svc.get_dataset(db, illegal_dataset_id)
-    items = versions.list_versions(db, illegal_dataset_id, skip=skip, limit=page_size)
+    items, total = versions.list_versions_page(db, illegal_dataset_id, skip=skip, limit=page_size)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
@@ -228,8 +222,7 @@ def list_illegal_dataset_events(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    total = db.query(IllegalDatasetEvent).filter(IllegalDatasetEvent.illegal_dataset_id == int(illegal_dataset_id)).count()
-    items = svc.list_events(db, illegal_dataset_id, skip=skip, limit=page_size)
+    items, total = svc.list_events_page(db, illegal_dataset_id, skip=skip, limit=page_size)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 

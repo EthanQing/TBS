@@ -6,8 +6,11 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from train_platform.models.v3.deployment import Deployment
+from train_platform.models.v3.deployment_run import DeploymentRun
+from train_platform.models.v3.enums import DeploymentRunStatus
 from train_platform.models.v3.inference import InferenceRun
 from train_platform.models.v3.model_registry import ModelVersion
+from train_platform.utils.exceptions import ConflictError
 
 
 def delete_model_versions_with_dependents(db: Session, model_versions: Iterable[ModelVersion]) -> None:
@@ -17,6 +20,20 @@ def delete_model_versions_with_dependents(db: Session, model_versions: Iterable[
     model_version_ids = [int(version.model_version_id) for version in versions]
     if not model_version_ids:
         return
+
+    active_run = (
+        db.query(DeploymentRun)
+        .filter(
+            DeploymentRun.model_version_id.in_(model_version_ids),
+            DeploymentRun.status.in_((DeploymentRunStatus.QUEUED, DeploymentRunStatus.RUNNING)),
+        )
+        .first()
+    )
+    if active_run is not None:
+        raise ConflictError(
+            "Cannot delete model versions while an active deployment run exists; "
+            "finish or cancel the deployment run first"
+        )
 
     deployments = (
         db.query(Deployment)

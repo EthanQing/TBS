@@ -7,15 +7,11 @@ from sqlalchemy.orm import Session
 from train_platform.models.v3.enums import ModelStage, TrainingRunStatus
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.training_run import TrainingRun
-from train_platform.repositories.v3.model_version_repo import ModelVersionRepository
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
 class ModelVersionService:
-    def __init__(self) -> None:
-        self.repo = ModelVersionRepository()
-
-    def list_model_versions(
+    def list_model_versions_page(
         self,
         db: Session,
         *,
@@ -24,11 +20,25 @@ class ModelVersionService:
         stage: Optional[ModelStage] = None,
         skip: int = 0,
         limit: int = 100,
-    ) -> list[ModelVersion]:
-        return self.repo.list(db, project_id=project_id, run_id=run_id, stage=stage, skip=skip, limit=limit)
+    ) -> tuple[list[ModelVersion], int]:
+        query = db.query(ModelVersion)
+        if project_id is not None:
+            query = query.filter(ModelVersion.project_id == int(project_id))
+        if run_id:
+            query = query.filter(ModelVersion.run_id == str(run_id))
+        if stage is not None:
+            query = query.filter(ModelVersion.stage == stage)
+        total = int(query.count())
+        items = (
+            query.order_by(ModelVersion.updated_at.desc())
+            .offset(max(0, int(skip)))
+            .limit(max(0, int(limit)))
+            .all()
+        )
+        return items, total
 
     def get_model_version(self, db: Session, model_version_id: int) -> ModelVersion:
-        model_version = self.repo.get(db, int(model_version_id))
+        model_version = db.query(ModelVersion).filter(ModelVersion.model_version_id == int(model_version_id)).first()
         if not model_version:
             raise NotFoundError("Model version not found")
         return model_version
@@ -97,7 +107,11 @@ class ModelVersionService:
         if not version:
             raise ValidationError("version is required")
 
-        exists = self.repo.get_by_project_and_version(db, int(run.project_id), version)
+        exists = (
+            db.query(ModelVersion)
+            .filter(ModelVersion.project_id == int(run.project_id), ModelVersion.version == version)
+            .first()
+        )
         if exists:
             raise ConflictError(f"Model version '{version}' already exists in this project")
 
@@ -136,7 +150,11 @@ class ModelVersionService:
             new_version = str(patch["version"]).strip()
             if not new_version:
                 raise ValidationError("version cannot be empty")
-            exists = self.repo.get_by_project_and_version(db, int(row.project_id), new_version)
+            exists = (
+                db.query(ModelVersion)
+                .filter(ModelVersion.project_id == int(row.project_id), ModelVersion.version == new_version)
+                .first()
+            )
             if exists and int(exists.model_version_id) != int(row.model_version_id):
                 raise ConflictError(f"Model version '{new_version}' already exists in this project")
             row.version = new_version

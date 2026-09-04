@@ -27,7 +27,7 @@ from train_platform.models.v3.enums import DatasetSplit
 from train_platform.models.v3.standard_dataset import StandardDataset
 from train_platform.platform.filesystem import clear_directory, remove_path, remove_tree
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
-from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.domains.datasets.images import IMAGE_EXTS
 
 from .service import StandardDatasetService
 

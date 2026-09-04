@@ -11,7 +11,7 @@ import requests
 
 from train_platform.core.config import settings
 from train_platform.utils.exceptions import NotFoundError, ValidationError
-from train_platform.utils.path_utils import resolve_temp_path
+from train_platform.platform.filesystem.locations import resolve_temp_path
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}

@@ -21,7 +21,7 @@ from train_platform.domains.monitoring.alarms.training import evaluate_training_
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun
-from train_platform.utils.training_params import parse_visible_host_gpu_ids, worker_can_run_device
+from train_platform.domains.training.parameters import parse_visible_host_gpu_ids, worker_can_run_device
 
 
 def _utcnow() -> datetime:

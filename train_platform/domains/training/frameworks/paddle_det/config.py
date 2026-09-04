@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
-from train_platform.utils.training_params import normalize_lr_scheduler
+from train_platform.domains.training.parameters import normalize_lr_scheduler
 
 
 def _safe_int(value: Any) -> int | None:

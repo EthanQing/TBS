@@ -5,7 +5,6 @@ from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
 from train_platform.models.v3.enums import ModelStage
-from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.schemas.v3.common import Page, PageMeta
 from train_platform.schemas.v3.model_versions import ModelVersionCreate, ModelVersionOut, ModelVersionUpdate
 from train_platform.domains.model_assets.versions.service import ModelVersionService
@@ -35,16 +34,14 @@ def list_model_versions(
         except Exception:
             raise ValidationError("Invalid stage")
 
-    q = db.query(ModelVersion)
-    if project_id is not None:
-        q = q.filter(ModelVersion.project_id == int(project_id))
-    if run_id:
-        q = q.filter(ModelVersion.run_id == str(run_id))
-    if st is not None:
-        q = q.filter(ModelVersion.stage == st)
-    total = q.count()
-
-    items = ModelVersionService().list_model_versions(db, project_id=project_id, run_id=run_id, stage=st, skip=skip, limit=page_size)
+    items, total = ModelVersionService().list_model_versions_page(
+        db,
+        project_id=project_id,
+        run_id=run_id,
+        stage=st,
+        skip=skip,
+        limit=page_size,
+    )
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 

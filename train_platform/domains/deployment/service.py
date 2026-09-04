@@ -3,8 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from train_platform.core.license import assert_valid_license
 from train_platform.domains.deployment import activation
@@ -17,17 +16,13 @@ from train_platform.domains.deployment.logs import (
 from train_platform.models.v3.deployment import Deployment, DeploymentLog
 from train_platform.models.v3.enums import DeploymentStatus, LogLevel, ModelStage
 from train_platform.models.v3.model_registry import ModelVersion
-from train_platform.repositories.v3.deployment_repo import DeploymentRepository
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
 class DeploymentService:
     """Application operations for the Deployment aggregate."""
 
-    def __init__(self) -> None:
-        self.repo = DeploymentRepository()
-
-    def list_deployments(
+    def _deployment_query(
         self,
         db: Session,
         *,
@@ -35,29 +30,8 @@ class DeploymentService:
         model_version_id: Optional[int] = None,
         status: Optional[DeploymentStatus] = None,
         is_active: Optional[bool] = None,
-        skip: int = 0,
-        limit: int = 100,
-    ) -> list[Deployment]:
-        return self.repo.list(
-            db,
-            project_id=project_id,
-            model_version_id=model_version_id,
-            status=status,
-            is_active=is_active,
-            skip=skip,
-            limit=limit,
-        )
-
-    def count_deployments(
-        self,
-        db: Session,
-        *,
-        project_id: Optional[int] = None,
-        model_version_id: Optional[int] = None,
-        status: Optional[DeploymentStatus] = None,
-        is_active: Optional[bool] = None,
-    ) -> int:
-        query = db.query(func.count(Deployment.deployment_id))
+    ):
+        query = db.query(Deployment)
         if project_id is not None:
             query = query.join(ModelVersion, ModelVersion.model_version_id == Deployment.model_version_id)
             query = query.filter(ModelVersion.project_id == int(project_id))
@@ -67,10 +41,43 @@ class DeploymentService:
             query = query.filter(Deployment.status == status)
         if is_active is not None:
             query = query.filter(Deployment.is_active == bool(is_active))
-        return int(query.scalar() or 0)
+        return query
+
+    def list_deployments_page(
+        self,
+        db: Session,
+        *,
+        project_id: Optional[int] = None,
+        model_version_id: Optional[int] = None,
+        status: Optional[DeploymentStatus] = None,
+        is_active: Optional[bool] = None,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> tuple[list[Deployment], int]:
+        query = self._deployment_query(
+            db,
+            project_id=project_id,
+            model_version_id=model_version_id,
+            status=status,
+            is_active=is_active,
+        )
+        total = int(query.count())
+        items = (
+            query
+            .order_by(Deployment.updated_at.desc())
+            .offset(max(0, int(skip)))
+            .limit(max(0, int(limit)))
+            .all()
+        )
+        return items, total
 
     def get_deployment(self, db: Session, deployment_id: int) -> Deployment:
-        row = self.repo.get(db, int(deployment_id))
+        row = (
+            db.query(Deployment)
+            .options(joinedload(Deployment.logs))
+            .filter(Deployment.deployment_id == int(deployment_id))
+            .first()
+        )
         if not row:
             raise NotFoundError("Deployment not found")
         return row
@@ -91,18 +98,18 @@ class DeploymentService:
         name = str(obj.get("name") or "").strip()
         if not name:
             raise ValidationError("name is required")
-        row = self.repo.create(
-            db,
-            obj_in={
-                "model_version_id": model_version_id,
-                "name": name,
-                "platform": obj["platform"],
-                "status": DeploymentStatus.PENDING,
-                "config": obj.get("config"),
-                "health_check_url": obj.get("health_check_url"),
-                "is_active": False,
-            },
+        row = Deployment(
+            model_version_id=model_version_id,
+            name=name,
+            platform=obj["platform"],
+            status=DeploymentStatus.PENDING,
+            config=obj.get("config"),
+            health_check_url=obj.get("health_check_url"),
+            is_active=False,
         )
+        db.add(row)
+        db.flush()
+        db.refresh(row)
         append_deployment_log(
             db,
             int(row.deployment_id),

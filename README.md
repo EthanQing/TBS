@@ -6,7 +6,7 @@ TBS Backend is a training platform backend built with **FastAPI**, **SQLAlchemy*
 
 ## Features
 
-- Dataset management, mounted imports, publishing, and augmentation
+- Dataset management, mounted imports, publishing, storage, preprocessing, and image indexing
 - Cancellable illegal dataset publish jobs for long-running LabelMe/JSON conversion
 - Project and model version management
 - Training run orchestration
@@ -35,11 +35,11 @@ TBS Backend is a training platform backend built with **FastAPI**, **SQLAlchemy*
 ```text
 train_platform/
   api/v3/          API routers
+  domains/         domain capabilities and business rules
+  platform/        shared platform infrastructure
   core/            configuration and shared infrastructure
   db/              database initialization and migrations
   schemas/v3/      Pydantic schemas
-  services/v3/     application services
-  training/        training plugins and runtime logic
   workers/         worker entrypoints
 
 docs/              supplementary documentation
@@ -363,23 +363,21 @@ The project includes a pluggable training framework system for:
 - retrieving plugin configuration schemas
 - validating and normalizing framework-specific training configuration
 
-See `docs/11_辅助接口.md`.
+See the current documentation list below.
 
 ## Documentation
 
-- `docs/00_概述.md`
-- `docs/01_项目管理.md`
-- `docs/02_数据集管理.md`
-- `docs/03_训练任务.md`
-- `docs/04_模型版本.md`
-- `docs/05_模型部署.md`
-- `docs/06_推理服务.md`
-- `docs/07_在线服务.md`
-- `docs/08_数据集转换与增强.md`
-- `docs/09_模型转换.md`
-- `docs/10_系统监控与告警.md`
-- `docs/11_辅助接口.md`
-- `docs/12_合格模型.md`
+- `docs/dataset-storage-boundary.md`
+- `docs/dataset-upload-import-domains.md`
+- `docs/deployment-domain.md`
+- `docs/illegal-dataset-domain.md`
+- `docs/inference-runtime-architecture.md`
+- `docs/model-conversion-domain.md`
+- `docs/monitoring-domain.md`
+- `docs/project-domain.md`
+- `docs/standard-dataset-domain.md`
+- `docs/static-audit-2026-09-02.md`
+- `docs/training-run-lifecycle.md`
 
 ## Development Notes
 

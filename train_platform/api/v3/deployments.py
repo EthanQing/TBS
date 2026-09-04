@@ -50,14 +50,7 @@ def list_deployments(
         except Exception:
             raise ValidationError("Invalid status")
 
-    total = _svc.count_deployments(
-        db,
-        project_id=project_id,
-        model_version_id=model_version_id,
-        status=st,
-        is_active=is_active,
-    )
-    items = _svc.list_deployments(
+    items, total = _svc.list_deployments_page(
         db,
         project_id=project_id,
         model_version_id=model_version_id,

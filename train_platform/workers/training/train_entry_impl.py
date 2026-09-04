@@ -8,6 +8,8 @@ import traceback
 from pathlib import Path
 from typing import Dict
 
+from sqlalchemy.orm import joinedload
+
 from train_platform.core.config import settings
 from train_platform.domains.datasets.storage.paths import resolve_legacy_dataset_path
 from train_platform.core.license import assert_valid_license
@@ -23,14 +25,13 @@ from train_platform.domains.training.frameworks import (
     TrainerPlugin,
     get_trainer,
 )
-from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
 from train_platform.models.v3.training_run import TrainingRun
 from train_platform.domains.training.integrations.mlflow import (
     get_mlflow_binding,
     initialize_mlflow_logger,
     set_mlflow_binding,
 )
-from train_platform.utils.training_params import build_device_runtime, parse_visible_host_gpu_ids
+from train_platform.domains.training.parameters import build_device_runtime, parse_visible_host_gpu_ids
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
 
@@ -206,7 +207,17 @@ def main(argv: list[str] | None = None) -> int:
     heartbeat_thread: threading.Thread | None = None
     vdl_bridge: VisualDLScalarBridge | None = None
     try:
-        run = TrainingRunRepository().get(db, run_id)
+        run = (
+            db.query(TrainingRun)
+            .options(joinedload(TrainingRun.parameters))
+            .options(joinedload(TrainingRun.result))
+            .options(joinedload(TrainingRun.meta))
+            .options(joinedload(TrainingRun.project))
+            .options(joinedload(TrainingRun.standard_dataset))
+            .options(joinedload(TrainingRun.architecture))
+            .filter(TrainingRun.run_id == str(run_id))
+            .first()
+        )
         if not run or not run.parameters or not run.standard_dataset or not run.architecture:
             print(f"[train_entry] run not found or missing relations: {run_id}", file=sys.stderr, flush=True)
             exit_code = 2

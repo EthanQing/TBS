@@ -147,7 +147,7 @@ def download_export(
         return ExportDownload(path=path)
 
     report = build_report(db, str(run.run_id))
-    from train_platform.utils.training_report_docx import build_training_report_docx, build_training_report_filename
+    from train_platform.domains.training.runs.report_docx import build_training_report_docx, build_training_report_filename
 
     report_filename = build_training_report_filename(report)
     report_content = build_training_report_docx(report)

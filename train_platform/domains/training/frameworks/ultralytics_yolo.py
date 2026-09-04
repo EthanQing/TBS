@@ -13,11 +13,16 @@ import yaml
 from train_platform.core.config import settings
 from train_platform.platform.runtime.ultralytics import apply_torch_safe_load_patches
 from .contract import TrainingCallbacks, TrainingExecutionSpec
-from train_platform.utils.dataset_yaml_utils import find_yolo_dataset_yaml
-from train_platform.utils.path_utils import resolve_pretrain_path, resolve_temp_path
-from train_platform.utils.training_augmentations import ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY
-from train_platform.utils.training_loss_weights import ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY
-from train_platform.utils.training_params import AUTO_BATCH_SIZE, extract_selected_gpu_ids, normalize_device_spec, normalize_lr_scheduler
+from train_platform.domains.datasets.yolo import find_yolo_dataset_yaml
+from train_platform.platform.filesystem.locations import resolve_pretrain_path, resolve_temp_path
+from train_platform.domains.training.parameters import (
+    AUTO_BATCH_SIZE,
+    ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY,
+    ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY,
+    extract_selected_gpu_ids,
+    normalize_device_spec,
+    normalize_lr_scheduler,
+)
 
 logger = logging.getLogger("train_platform.domains.training.frameworks.ultralytics")
 

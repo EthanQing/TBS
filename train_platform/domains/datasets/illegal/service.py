@@ -12,7 +12,6 @@ from train_platform.models.v3.illegal_dataset import (
     IllegalDataset,
     IllegalDatasetEvent,
 )
-from train_platform.repositories.v3.illegal_dataset_repo import IllegalDatasetRepository
 from train_platform.platform.filesystem import remove_tree
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
@@ -20,16 +19,13 @@ from train_platform.utils.exceptions import ConflictError, NotFoundError, Valida
 class IllegalDatasetService:
     """CRUD and aggregate-level views for Illegal Dataset."""
 
-    def __init__(self) -> None:
-        self.repo = IllegalDatasetRepository()
-
     def _next_dataset_id(self, db: Session) -> int:
         current_max = db.query(func.max(IllegalDataset.illegal_dataset_id)).scalar()
         start = int(settings.illegal_dataset_id_start)
         return start if current_max is None else max(start, int(current_max) + 1)
 
     def _ensure_name_available(self, db: Session, name: str, *, exclude_id: int | None = None) -> None:
-        row = self.repo.get_by_name(db, str(name).strip())
+        row = db.query(IllegalDataset).filter(IllegalDataset.name == str(name).strip()).first()
         if row and (exclude_id is None or int(row.illegal_dataset_id) != int(exclude_id)):
             raise ConflictError(f"Illegal dataset '{name}' already exists")
 
@@ -61,7 +57,7 @@ class IllegalDatasetService:
             "preview_image_url": None,
         }
 
-    def list_datasets(
+    def list_datasets_page(
         self,
         db: Session,
         *,
@@ -69,15 +65,17 @@ class IllegalDatasetService:
         limit: int = 100,
         format: str | None = None,
         include_statistics: bool = True,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], int]:
         query = db.query(IllegalDataset)
         if format:
             query = query.filter(IllegalDataset.format == str(format))
+        total = int(query.count())
         rows = query.order_by(IllegalDataset.updated_at.desc()).offset(skip).limit(limit).all()
-        return [
+        items = [
             self._dataset_with_statistics(db, row, include_statistics=bool(include_statistics))
             for row in rows
         ]
+        return items, total
 
     def create_dataset(self, db: Session, *, obj: dict[str, Any]) -> IllegalDataset:
         name = str(obj.get("name") or "").strip()
@@ -105,7 +103,7 @@ class IllegalDatasetService:
         return dataset
 
     def get_dataset(self, db: Session, illegal_dataset_id: int) -> IllegalDataset:
-        dataset = self.repo.get(db, int(illegal_dataset_id))
+        dataset = db.query(IllegalDataset).filter(IllegalDataset.illegal_dataset_id == int(illegal_dataset_id)).first()
         if not dataset:
             raise NotFoundError("Illegal dataset not found")
         return dataset
@@ -145,16 +143,41 @@ class IllegalDatasetService:
         self.get_dataset(db, illegal_dataset_id)
         return versions.list_versions(db, int(illegal_dataset_id), skip=skip, limit=limit)
 
-    def list_events(self, db: Session, illegal_dataset_id: int, *, skip: int = 0, limit: int = 100):
-        self.get_dataset(db, illegal_dataset_id)
+    @staticmethod
+    def _events_query(db: Session, illegal_dataset_id: int):
         return (
             db.query(IllegalDatasetEvent)
             .filter(IllegalDatasetEvent.illegal_dataset_id == int(illegal_dataset_id))
             .order_by(IllegalDatasetEvent.created_at.desc(), IllegalDatasetEvent.event_id.desc())
-            .offset(skip)
-            .limit(limit)
+        )
+
+    def list_events(self, db: Session, illegal_dataset_id: int, *, skip: int = 0, limit: int = 100):
+        self.get_dataset(db, illegal_dataset_id)
+        return (
+            self._events_query(db, illegal_dataset_id)
+            .offset(max(0, int(skip)))
+            .limit(max(0, int(limit)))
             .all()
         )
+
+    def list_events_page(
+        self,
+        db: Session,
+        illegal_dataset_id: int,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> tuple[list[IllegalDatasetEvent], int]:
+        self.get_dataset(db, illegal_dataset_id)
+        query = self._events_query(db, illegal_dataset_id)
+        total = int(query.count())
+        items = (
+            query
+            .offset(max(0, int(skip)))
+            .limit(max(0, int(limit)))
+            .all()
+        )
+        return items, total
 
     def get_detail(
         self,

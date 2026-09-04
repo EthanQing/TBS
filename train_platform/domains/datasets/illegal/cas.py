@@ -16,7 +16,7 @@ from train_platform.domains.datasets.storage.mounted import validate_mounted_sou
 from train_platform.domains.datasets.storage.paths import resolve_storage_token
 from train_platform.platform.filesystem import atomic_write_json, ensure_under, remove_tree, safe_relative_path
 from train_platform.utils.exceptions import NotFoundError, ValidationError
-from train_platform.utils.image_exts import IMAGE_EXTS
+from train_platform.domains.datasets.images import IMAGE_EXTS
 
 try:
     from PIL import Image
