@@ -14,8 +14,10 @@ from train_platform.domains.deployment.logs import (
     rollback_log_data,
 )
 from train_platform.models.v3.deployment import Deployment, DeploymentLog
-from train_platform.models.v3.enums import DeploymentStatus, LogLevel, ModelStage
+from train_platform.models.v3.deployment_run import DeploymentRun
+from train_platform.models.v3.enums import DeploymentRunStatus, DeploymentStatus, LogLevel, ModelStage
 from train_platform.models.v3.model_registry import ModelVersion
+from train_platform.models.v3.project import Project
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 
@@ -151,7 +153,43 @@ class DeploymentService:
         return row
 
     def delete_deployment(self, db: Session, deployment_id: int) -> None:
-        row = self.get_deployment(db, deployment_id)
+        deployment = self.get_deployment(db, deployment_id)
+        project_id = self._project_id_of_deployment(db, deployment)
+
+        project = (
+            db.query(Project)
+            .filter(Project.project_id == int(project_id))
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
+        if not project:
+            raise NotFoundError("Project not found")
+
+        row = (
+            db.query(Deployment)
+            .filter(Deployment.deployment_id == int(deployment_id))
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Deployment not found")
+
+        active_run = (
+            db.query(DeploymentRun)
+            .filter(
+                DeploymentRun.deployment_id == int(deployment_id),
+                DeploymentRun.status.in_((DeploymentRunStatus.QUEUED, DeploymentRunStatus.RUNNING)),
+            )
+            .first()
+        )
+        if active_run is not None:
+            raise ConflictError(
+                "Cannot delete deployment while an active deployment run exists; "
+                "finish or cancel the deployment run first"
+            )
+
         db.delete(row)
         db.commit()
 
