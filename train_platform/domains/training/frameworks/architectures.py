@@ -4,6 +4,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from train_platform.models.v3.architecture import ModelArchitecture
+from train_platform.models.v3.custom_model_package import CustomModelPackage
 from train_platform.models.v3.enums import TaskType
 from train_platform.utils.exceptions import ConflictError, ValidationError
 
@@ -25,6 +26,7 @@ def list_architectures(
     family: str | None = None,
     task_type: TaskType | None = None,
     engine: str | None = None,
+    custom_model_package_id: int | None = None,
     q: str | None = None,
     skip: int = 0,
     limit: int = 100,
@@ -37,6 +39,8 @@ def list_architectures(
     if engine:
         normalized_engine = _normalize_and_validate_engine(engine)
         query = query.filter(func.lower(ModelArchitecture.engine) == normalized_engine)
+    if custom_model_package_id is not None:
+        query = query.filter(ModelArchitecture.custom_model_package_id == int(custom_model_package_id))
     if q:
         like = f"%{str(q).strip()}%"
         query = query.filter(ModelArchitecture.variant.ilike(like))
@@ -50,6 +54,7 @@ def create_architecture(
     variant: str,
     task_type: TaskType,
     engine: str | None = "ultralytics-yolo",
+    custom_model_package_id: int | None = None,
     pretrained_path: str | None = None,
     description: str | None = None,
     default_params: dict | None = None,
@@ -60,6 +65,22 @@ def create_architecture(
         raise ValidationError("family and variant are required")
 
     normalized_engine = _normalize_and_validate_engine(engine)
+
+    # Validate custom_model_package_id constraint per engine
+    if normalized_engine == "custom-source":
+        if custom_model_package_id is None:
+            raise ValidationError("custom_model_package_id is required when engine is 'custom-source'")
+        pkg = db.query(CustomModelPackage).filter(CustomModelPackage.package_id == int(custom_model_package_id)).first()
+        if not pkg:
+            raise ValidationError(f"Referenced CustomModelPackage id={custom_model_package_id} does not exist")
+        if pkg.retired_at is not None:
+            raise ValidationError(
+                f"Referenced CustomModelPackage id={custom_model_package_id} is retired and cannot be linked to new architectures"
+            )
+    else:
+        if custom_model_package_id is not None:
+            raise ValidationError(f"custom_model_package_id must be NULL for built-in engine '{normalized_engine}'")
+
     exists = (
         db.query(ModelArchitecture)
         .filter(
@@ -77,6 +98,7 @@ def create_architecture(
         variant=variant,
         task_type=task_type,
         engine=normalized_engine,
+        custom_model_package_id=int(custom_model_package_id) if custom_model_package_id is not None else None,
         pretrained_path=pretrained_path,
         description=description,
         default_params=default_params,
@@ -88,3 +110,4 @@ def create_architecture(
 
 
 __all__ = ["create_architecture", "list_architectures"]
+

@@ -13,6 +13,7 @@ from train_platform.domains.datasets.storage.paths import resolve_legacy_dataset
 from train_platform.domains.model_assets.versions.deletion import delete_model_versions_with_dependents
 from train_platform.domains.training.frameworks import get_plugin
 from train_platform.models.v3.architecture import ModelArchitecture
+from train_platform.models.v3.custom_model_package import CustomModelPackage
 from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.project import Project
@@ -121,6 +122,18 @@ class TrainingRunService:
             plugin = get_plugin(arch_engine)
         except Exception as exc:
             raise ValidationError(f"Architecture engine is not registered: {arch_engine}") from exc
+        # Snapshot custom model provenance if custom-source engine
+        custom_model_package_id = None
+        custom_model_source_sha256 = None
+        if arch_engine == "custom-source":
+            if not arch.custom_model_package_id:
+                raise ValidationError("Architecture with engine 'custom-source' must reference a valid CustomModelPackage")
+            package = db.query(CustomModelPackage).filter(CustomModelPackage.package_id == arch.custom_model_package_id).first()
+            if not package:
+                raise ValidationError(f"Referenced CustomModelPackage id={arch.custom_model_package_id} not found")
+            custom_model_package_id = package.package_id
+            custom_model_source_sha256 = package.source_sha256
+
         if not bool(getattr(plugin, "implemented", True)):
             raise ValidationError(
                 f"Architecture engine '{arch_engine}' is not implemented yet; select another framework plugin"
@@ -212,6 +225,8 @@ class TrainingRunService:
             project_id=project.project_id,
             standard_dataset_id=int(dataset.standard_dataset_id),
             architecture_id=arch.architecture_id,
+            custom_model_package_id=custom_model_package_id,
+            custom_model_source_sha256=custom_model_source_sha256,
             name=name,
             status=TrainingRunStatus.CREATED,
             progress=0,

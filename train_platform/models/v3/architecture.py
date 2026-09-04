@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Enum, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -27,6 +27,14 @@ class ModelArchitecture(Base):
     # Trainer implementation key (used by plugin registry).
     engine: Mapped[str] = mapped_column(String(64), nullable=False, default="ultralytics-yolo")
 
+    # Custom model source package reference (only when engine == "custom-source").
+    custom_model_package_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("custom_model_packages.package_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+
     pretrained_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     default_params: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
@@ -34,6 +42,7 @@ class ModelArchitecture(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     training_runs = relationship("TrainingRun", back_populates="architecture")
+    custom_model_package = relationship("CustomModelPackage", back_populates="architectures")
 
     __table_args__ = (UniqueConstraint("family", "variant", "task_type", name="uq_model_architectures_family_variant_task"),)
 

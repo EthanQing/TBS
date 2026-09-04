@@ -13,6 +13,7 @@ class ArchitectureCreate(BaseModel):
     variant: str = Field(..., min_length=1, max_length=100)
     task_type: TaskType
     engine: str = Field("ultralytics-yolo", min_length=1, max_length=64)
+    custom_model_package_id: Optional[int] = Field(None, description="Custom model source package ID (required if engine is 'custom-source')")
     pretrained_path: Optional[str] = Field(None, max_length=500)
     description: Optional[str] = None
     default_params: Optional[dict] = None
@@ -24,6 +25,7 @@ class ArchitectureOut(BaseModel):
     variant: str
     task_type: TaskType
     engine: str
+    custom_model_package_id: Optional[int] = None
     pretrained_path: Optional[str] = None
     description: Optional[str] = None
     default_params: Optional[dict] = None

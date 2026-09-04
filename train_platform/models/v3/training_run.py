@@ -29,6 +29,19 @@ class TrainingRun(Base):
         index=True,
     )
 
+    # Custom model provenance snapshot (reproducibility snapshot at run creation time).
+    custom_model_package_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("custom_model_packages.package_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    custom_model_source_sha256: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+    )
+
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     status: Mapped[TrainingRunStatus] = mapped_column(
         Enum(TrainingRunStatus, values_callable=lambda x: [e.value for e in x]),
@@ -64,6 +77,7 @@ class TrainingRun(Base):
     project = relationship("Project", back_populates="training_runs")
     standard_dataset = relationship("StandardDataset", back_populates="training_runs")
     architecture = relationship("ModelArchitecture", back_populates="training_runs")
+    custom_model_package = relationship("CustomModelPackage")
     parameters = relationship("TrainingRunParameters", back_populates="training_run", uselist=False, cascade="all, delete-orphan")
     result = relationship("TrainingRunResult", back_populates="training_run", uselist=False, cascade="all, delete-orphan")
     epoch_metrics = relationship("TrainingRunEpochMetric", back_populates="training_run", cascade="all, delete-orphan")

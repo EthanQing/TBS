@@ -4,6 +4,7 @@ from train_platform.models.v3.alarm import AlarmAlert, AlarmRule
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.base import V3Base
 from train_platform.models.v3.chart_config import ChartConfig
+from train_platform.models.v3.custom_model_package import CustomModelPackage
 from train_platform.models.v3.deployment import Deployment, DeploymentLog
 from train_platform.models.v3.deployment_run import DeploymentRun
 from train_platform.models.v3.enums import (
@@ -49,6 +50,7 @@ __all__ = [
     "AlarmRule",
     "AlarmAlert",
     "ModelArchitecture",
+    "CustomModelPackage",
     "ChartConfig",
     "DatasetUploadSession",
     "DatasetUploadTask",
