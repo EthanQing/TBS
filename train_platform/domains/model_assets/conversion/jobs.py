@@ -212,6 +212,10 @@ def enumerate_queued_jobs() -> Iterable[tuple[str, Dict[str, Any]]]:
     for status_path in status_paths:
         job_id = status_path.parent.name
         try:
+            job_id = _validate_job_id(job_id)
+        except ValidationError:
+            continue
+        try:
             data = _store().read_status(job_id)
         except (JobNotFoundError, JobStoreError, OSError, ValueError):
             continue
