@@ -47,38 +47,31 @@ def main(argv: list[str] | None = None) -> int:
         if not module_name or not class_name:
             raise ValueError("Custom training manifest entrypoint is incomplete")
 
-        # Keep stdout exclusively for SDK JSONL events; ordinary user prints
-        # and import-time output belong in the child stderr log.
-        protocol_stdout = sys.stdout
-        sys.stdout = sys.stderr
-        try:
-            sys.path.insert(0, str(source_root))
-            module = importlib.import_module(module_name)
-            trainer_class = getattr(module, class_name)
-            trainer = trainer_class()
-            train = getattr(trainer, "train", None)
-            if not callable(train):
-                raise TypeError(f"Custom trainer '{module_name}.{class_name}' has no callable train(ctx)")
+        sys.path.insert(0, str(source_root))
+        module = importlib.import_module(module_name)
+        trainer_class = getattr(module, class_name)
+        trainer = trainer_class()
+        train = getattr(trainer, "train", None)
+        if not callable(train):
+            raise TypeError(f"Custom trainer '{module_name}.{class_name}' has no callable train(ctx)")
 
-            ctx = TrainingContext(
-                run_id=str(_required(context, "run_id")),
-                dataset_path=Path(_required(context, "dataset_path")),
-                output_dir=Path(_required(context, "output_dir")),
-                epochs=int(_required(context, "epochs")),
-                batch_size=int(_required(context, "batch_size")),
-                image_size=int(_required(context, "image_size")),
-                learning_rate=float(_required(context, "learning_rate")),
-                optimizer=str(_required(context, "optimizer")),
-                workers=int(_required(context, "workers")),
-                device=str(_required(context, "device")),
-                custom_args=dict(context.get("custom_args") or {}),
-                _cancel_marker_path=Path(_required(context, "cancel_marker_path")),
-                _output_stream=protocol_stdout,
-            )
+        ctx = TrainingContext(
+            run_id=str(_required(context, "run_id")),
+            dataset_path=Path(_required(context, "dataset_path")),
+            output_dir=Path(_required(context, "output_dir")),
+            epochs=int(_required(context, "epochs")),
+            batch_size=int(_required(context, "batch_size")),
+            image_size=int(_required(context, "image_size")),
+            learning_rate=float(_required(context, "learning_rate")),
+            optimizer=str(_required(context, "optimizer")),
+            workers=int(_required(context, "workers")),
+            device=str(_required(context, "device")),
+            custom_args=dict(context.get("custom_args") or {}),
+            _cancel_marker_path=Path(_required(context, "cancel_marker_path")),
+            _event_path=Path(_required(context, "event_path")),
+        )
 
-            train(ctx)
-        finally:
-            sys.stdout = protocol_stdout
+        train(ctx)
         return 0
     except BaseException:
         traceback.print_exc(file=sys.stderr)

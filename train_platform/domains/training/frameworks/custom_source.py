@@ -90,6 +90,7 @@ class CustomSourceTrainer:
         output_dir = custom_dir / "output"
         context_path = custom_dir / "custom_training_context.json"
         cancel_marker_path = custom_dir / "custom_training.cancel"
+        event_path = custom_dir / "custom_training.events.jsonl"
 
         custom_dir.mkdir(parents=True, exist_ok=True)
         clear_directory(source_workspace)
@@ -122,6 +123,7 @@ class CustomSourceTrainer:
             "custom_args": _plain_json_value(custom_args),
             "manifest": _plain_json_value(manifest),
             "cancel_marker_path": str(cancel_marker_path.resolve(strict=False)),
+            "event_path": str(event_path.resolve(strict=False)),
         }
 
         exit_code = run_custom_training(

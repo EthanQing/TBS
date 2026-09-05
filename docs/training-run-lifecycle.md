@@ -121,5 +121,31 @@ runtime compatibility patches. Its plugin module retains the readable training
 orchestration and native checkpoint handling. Ultralytics remains a cohesive
 single adapter because its compatibility, argument construction, callbacks,
 and invocation flow are already readable together. Registry membership remains
-a simple static list of the two supported plugins; there is no dynamic discovery
+a simple static list of the three supported plugins; there is no dynamic discovery
 or execution framework.
+
+## Custom-source runtime v1
+
+Custom model manifests currently support only the `pytorch-default` runtime
+profile, so the existing `ultralytics-yolo` PyTorch worker also claims
+`custom-source` runs without changing either engine identity. The worker gives
+custom-source cancellation to the inner runtime first and uses a longer hard
+fallback only if the supervising `train_entry` process does not exit. Existing
+built-in engines retain immediate outer-worker termination.
+
+The custom-source adapter verifies the immutable package from the
+`TrainingRun.custom_model_package_id` and
+`TrainingRun.custom_model_source_sha256` execution snapshot, extracts it into
+the run workspace, and starts the trusted/internal Python entrypoint in a
+separate process group. The child owns no TrainingRun lifecycle or database
+persistence. SDK metric and log events use the private
+`custom_model/custom_training.events.jsonl` channel; ordinary child stdout and
+stderr inherit the normal `train_entry` logs. Cancellation uses a marker file
+for cooperative `ctx.should_cancel()` handling, followed by best-effort child
+process-tree termination after the inner grace period.
+
+Custom model package storage is configured centrally through
+`Settings.custom_models_dir` / `BASE_CUSTOM_MODELS_DIR`, defaulting to
+`TRAIN_PLATFORM_HOME/custom_models`. Because the backend uploads packages and
+the PyTorch worker consumes them, both processes or containers must mount the
+same package filesystem or volume.

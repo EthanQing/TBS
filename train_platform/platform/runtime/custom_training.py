@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import math
-import queue
+import os
+import signal
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -66,39 +66,88 @@ def _validate_event(raw_line: str) -> tuple[str, Any]:
     raise CustomTrainingProtocolError(f"Unknown child control event type: {event_type!r}")
 
 
-def _read_stdout(stream: Any, events: queue.Queue[tuple[str, str | None]]) -> None:
-    try:
-        for line in stream:
-            events.put(("stdout", line))
-    finally:
-        events.put(("stdout_eof", None))
+def _terminate_child_process_tree(
+    process: subprocess.Popen,
+    *,
+    wait_timeout: float = 2.0,
+) -> None:
+    """Best-effort termination for the custom child and its descendants."""
 
-
-def _forward_stderr(stream: Any) -> None:
-    for line in stream:
-        print(line.rstrip("\r\n"), file=sys.stderr, flush=True)
-
-
-def _stop_process(process: subprocess.Popen[str], *, wait_timeout: float = 2.0) -> None:
-    if process.poll() is not None:
+    timeout = max(0.1, float(wait_timeout))
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
         return
+
     try:
-        process.terminate()
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
     except OSError:
-        pass
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
+    deadline = time.monotonic() + timeout
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+
     try:
-        process.wait(timeout=max(0.1, float(wait_timeout)))
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
         return
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    try:
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         pass
-    try:
-        process.kill()
-    except OSError:
-        pass
-    try:
-        process.wait(timeout=max(0.1, float(wait_timeout)))
-    except subprocess.TimeoutExpired:
-        pass
+
+
+def _consume_event_line(
+    raw_line: str,
+    *,
+    on_metrics: MetricsCallback,
+    on_log: LogCallback | None,
+) -> None:
+    if not raw_line.strip():
+        return
+    parsed_kind, payload = _validate_event(raw_line)
+    if parsed_kind == "metrics":
+        epoch, metrics = payload
+        on_metrics(epoch, metrics)
+    elif on_log is not None:
+        on_log(payload)
+    else:
+        print(payload, flush=True)
+
+
+def _drain_event_file(
+    event_file: Any,
+    pending: str,
+    *,
+    on_metrics: MetricsCallback,
+    on_log: LogCallback | None,
+) -> str:
+    pending += event_file.read()
+    complete_lines = pending.splitlines(keepends=True)
+    if complete_lines and not complete_lines[-1].endswith(("\n", "\r")):
+        pending = complete_lines.pop()
+    else:
+        pending = ""
+
+    for raw_line in complete_lines:
+        _consume_event_line(raw_line, on_metrics=on_metrics, on_log=on_log)
+    return pending
 
 
 def run_custom_training(
@@ -119,7 +168,14 @@ def run_custom_training(
 
     context_path = Path(context_path)
     cancel_marker_path = Path(cancel_marker_path)
+    try:
+        event_path = Path(context["event_path"])
+    except (KeyError, TypeError) as exc:
+        raise CustomTrainingRuntimeError("Custom training context is missing 'event_path'") from exc
+
     cancel_marker_path.unlink(missing_ok=True)
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    event_path.write_text("", encoding="utf-8")
     atomic_write_json(context_path, context)
 
     command = [
@@ -132,83 +188,65 @@ def run_custom_training(
     try:
         process = subprocess.Popen(
             command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+            start_new_session=(os.name != "nt"),
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),  # type: ignore[attr-defined]
         )
     except OSError as exc:
         raise CustomTrainingRuntimeError(f"Failed to start custom training subprocess: {exc}") from exc
 
-    assert process.stdout is not None
-    assert process.stderr is not None
-    if process.stdin is not None:
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
-
-    events: queue.Queue[tuple[str, str | None]] = queue.Queue()
-    stdout_thread = threading.Thread(target=_read_stdout, args=(process.stdout, events), daemon=True)
-    stderr_thread = threading.Thread(target=_forward_stderr, args=(process.stderr,), daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-
     cancel_started_at: float | None = None
     cancel_marker_written = False
-    stdout_eof = False
     failure: BaseException | None = None
     grace = max(0.0, float(cancel_grace_seconds))
+    pending_events = ""
 
     try:
-        while not stdout_eof:
-            try:
-                event_kind, raw_line = events.get(timeout=0.1)
-            except queue.Empty:
-                event_kind, raw_line = "", None
-
-            if event_kind == "stdout":
-                if raw_line and raw_line.strip():
-                    try:
-                        parsed_kind, payload = _validate_event(raw_line)
-                        if parsed_kind == "metrics":
-                            epoch, metrics = payload
-                            on_metrics(epoch, metrics)
-                        elif on_log is not None:
-                            on_log(payload)
-                        else:
-                            print(payload, flush=True)
-                    except BaseException as exc:
-                        failure = exc
-                        break
-            elif event_kind == "stdout_eof":
-                stdout_eof = True
-
-            if not cancel_marker_written:
+        with event_path.open("r", encoding="utf-8") as event_file:
+            while process.poll() is None:
                 try:
-                    requested = bool(cancel_requested())
+                    pending_events = _drain_event_file(
+                        event_file,
+                        pending_events,
+                        on_metrics=on_metrics,
+                        on_log=on_log,
+                    )
                 except BaseException as exc:
                     failure = exc
                     break
-                if requested:
-                    atomic_write_text(cancel_marker_path, "cancel\n")
-                    cancel_marker_written = True
-                    cancel_started_at = time.monotonic()
 
-            if cancel_marker_written and process.poll() is None and cancel_started_at is not None:
-                if time.monotonic() - cancel_started_at >= grace:
-                    _stop_process(process, wait_timeout=max(0.1, grace))
+                if not cancel_marker_written:
+                    try:
+                        requested = bool(cancel_requested())
+                    except BaseException as exc:
+                        failure = exc
+                        break
+                    if requested:
+                        atomic_write_text(cancel_marker_path, "cancel\n")
+                        cancel_marker_written = True
+                        cancel_started_at = time.monotonic()
 
+                if cancel_marker_written and cancel_started_at is not None:
+                    if time.monotonic() - cancel_started_at >= grace:
+                        _terminate_child_process_tree(process, wait_timeout=max(0.1, grace))
+                        break
+                time.sleep(0.1)
+
+            if failure is None:
+                try:
+                    pending_events = _drain_event_file(
+                        event_file,
+                        pending_events,
+                        on_metrics=on_metrics,
+                        on_log=on_log,
+                    )
+                except BaseException as exc:
+                    failure = exc
     finally:
-        if failure is not None or process.poll() is None:
-            _stop_process(process)
-        stdout_thread.join(timeout=2.0)
-        stderr_thread.join(timeout=2.0)
+        if failure is not None:
+            _terminate_child_process_tree(process)
 
     if cancel_marker_written:
+        _terminate_child_process_tree(process)
         raise CustomTrainingCancelled("Custom training cancellation requested")
 
     if failure is not None:
@@ -216,7 +254,10 @@ def run_custom_training(
             raise failure
         raise CustomTrainingRuntimeError("Custom training subprocess event handling failed") from failure
 
-    return int(process.returncode or 0)
+    exit_code = int(process.returncode or 0)
+    if exit_code != 0:
+        _terminate_child_process_tree(process)
+    return exit_code
 
 
 __all__ = [

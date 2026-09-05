@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, TextIO
 
+import psutil
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
@@ -22,6 +23,9 @@ from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun
 from train_platform.domains.training.parameters import parse_visible_host_gpu_ids, worker_can_run_device
+
+
+CUSTOM_CANCEL_FALLBACK_SECONDS = 10.0
 
 
 def _utcnow() -> datetime:
@@ -53,6 +57,11 @@ def _terminate_process_tree(proc: subprocess.Popen, *, timeout_sec: int = 20) ->
         return
 
     try:
+        descendants = psutil.Process(proc.pid).children(recursive=True)
+    except Exception:
+        descendants = []
+
+    try:
         if os.name == "nt":
             subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
@@ -60,18 +69,36 @@ def _terminate_process_tree(proc: subprocess.Popen, *, timeout_sec: int = 20) ->
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-            return
-
-        os.killpg(proc.pid, signal.SIGTERM)
-        deadline = time.time() + float(timeout_sec)
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                return
-            time.sleep(0.5)
-        os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+            deadline = time.time() + float(timeout_sec)
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
     except Exception:
         try:
             proc.terminate()
+        except Exception:
+            pass
+
+    if descendants:
+        try:
+            for child in descendants:
+                try:
+                    if child.is_running():
+                        child.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            _, alive = psutil.wait_procs(descendants, timeout=2.0)
+            for child in alive:
+                try:
+                    child.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            psutil.wait_procs(alive, timeout=2.0)
         except Exception:
             pass
 
@@ -95,11 +122,13 @@ def _parse_worker_engines(raw: Optional[str]) -> Optional[set[str]]:
 @dataclass
 class RunningJob:
     run_id: str
+    engine: str
     proc: subprocess.Popen
     stdout_path: Path
     stderr_path: Path
     stdout_f: TextIO
     stderr_f: TextIO
+    cancel_seen_at: Optional[datetime] = None
 
 
 class DbQueueWorker:
@@ -167,7 +196,15 @@ class DbQueueWorker:
 
             cancel_requested = bool(run.cancel_requested_at is not None or run.delete_requested_at is not None)
             if cancel_requested and self._running.proc.poll() is None:
-                _terminate_process_tree(self._running.proc)
+                if self._running.engine == "custom-source":
+                    if self._running.cancel_seen_at is None:
+                        self._running.cancel_seen_at = now
+                    elif (
+                        now - self._running.cancel_seen_at
+                    ).total_seconds() >= CUSTOM_CANCEL_FALLBACK_SECONDS:
+                        _terminate_process_tree(self._running.proc)
+                else:
+                    _terminate_process_tree(self._running.proc)
 
             rc = self._running.proc.poll()
             if rc is None:
@@ -267,6 +304,7 @@ class DbQueueWorker:
 
             self._running = RunningJob(
                 run_id=run.run_id,
+                engine=str(getattr(run.architecture, "engine", "") or "").strip().lower(),
                 proc=proc,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,

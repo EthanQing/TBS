@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import threading
 from pathlib import Path
-from typing import Any, Mapping, TextIO
+from typing import Any, Mapping
 
 
 class TrainingContext:
@@ -24,7 +23,8 @@ class TrainingContext:
         "device",
         "custom_args",
         "_cancel_marker_path",
-        "_output_stream",
+        "_event_path",
+        "_event_stream",
         "_output_lock",
     )
 
@@ -43,7 +43,7 @@ class TrainingContext:
         device: str,
         custom_args: Mapping[str, Any] | None = None,
         _cancel_marker_path: Path | None = None,
-        _output_stream: TextIO | None = None,
+        _event_path: Path | None = None,
     ) -> None:
         self.run_id = str(run_id)
         self.dataset_path = Path(dataset_path)
@@ -57,7 +57,11 @@ class TrainingContext:
         self.device = str(device)
         self.custom_args = dict(custom_args or {})
         self._cancel_marker_path = Path(_cancel_marker_path) if _cancel_marker_path else None
-        self._output_stream = _output_stream or sys.stdout
+        self._event_path = Path(_event_path) if _event_path else None
+        self._event_stream = None
+        if self._event_path is not None:
+            self._event_path.parent.mkdir(parents=True, exist_ok=True)
+            self._event_stream = self._event_path.open("a", encoding="utf-8", buffering=1)
         self._output_lock = threading.Lock()
 
     def report_metrics(self, epoch: int, metrics: Mapping[str, Any]) -> None:
@@ -87,9 +91,11 @@ class TrainingContext:
 
     def _emit(self, event: Mapping[str, Any]) -> None:
         line = json.dumps(dict(event), ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if self._event_stream is None:
+            raise RuntimeError("TrainingContext event channel is not initialized")
         with self._output_lock:
-            self._output_stream.write(line + "\n")
-            self._output_stream.flush()
+            self._event_stream.write(line + "\n")
+            self._event_stream.flush()
 
 
 __all__ = ["TrainingContext"]

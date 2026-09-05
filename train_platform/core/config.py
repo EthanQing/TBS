@@ -100,6 +100,7 @@ class Settings:
     dataset_staging_dir: Path = Path(os.getenv("BASE_DATASET_STAGING_DIR") or (datasets_dir / ".staging")).resolve()
     imports_dir: Path = Path(os.getenv("BASE_IMPORTS_DIR") or (home_dir / "imports")).resolve()
     pretrain_models_dir: Path = Path(os.getenv("BASE_PRETRAIN_MODELS_DIR") or (home_dir / "pretrain_models")).resolve()
+    custom_models_dir: Path = Path(os.getenv("BASE_CUSTOM_MODELS_DIR") or (home_dir / "custom_models")).resolve()
     paddle_det_dir: Path = Path(os.getenv("PADDLE_DET_DIR") or (home_dir / "PaddleDetection")).resolve()
     disable_append_upload: bool = os.getenv("DISABLE_APPEND_UPLOAD", "1") in ("1", "true", "True")
     internal_api_token: str = os.getenv("INTERNAL_API_TOKEN", "")
@@ -169,6 +170,7 @@ class Settings:
         self.training_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.pretrain_models_dir.mkdir(parents=True, exist_ok=True)
+        self.custom_models_dir.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

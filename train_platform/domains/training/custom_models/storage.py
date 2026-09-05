@@ -22,7 +22,7 @@ SHA256_FILENAME = "sha256"
 
 def get_custom_models_base_dir() -> Path:
     """Return the base storage directory for custom model packages."""
-    custom_dir = Path(os.getenv("BASE_CUSTOM_MODELS_DIR") or (settings.home_dir / CUSTOM_MODELS_DIRNAME)).resolve()
+    custom_dir = settings.custom_models_dir
     custom_dir.mkdir(parents=True, exist_ok=True)
     return custom_dir
 

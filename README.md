@@ -220,7 +220,9 @@ to container-local CUDA ids before launching the training process.
 
 The YOLO worker also polls queued model-conversion jobs from
 `temp/model_conversions` and runs PT/PTH -> ONNX conversion locally in the
-worker process.
+worker process. It is also the v1 execution owner for custom model packages
+whose manifest uses `runtime_profile: pytorch-default`; those runs retain the
+`custom-source` engine identity.
 
 Paddle training worker:
 
@@ -305,7 +307,14 @@ local source/development runs and cannot disable a protected release runtime.
 - `BASE_DATASET_STAGING_DIR` (default: `BASE_DATASETS_DIR/.staging`)
 - `BASE_IMPORTS_DIR` (default: `TRAIN_PLATFORM_HOME/imports`)
 - `BASE_PRETRAIN_MODELS_DIR`
+- `BASE_CUSTOM_MODELS_DIR` (default: `TRAIN_PLATFORM_HOME/custom_models`)
 - `PADDLE_DET_DIR`
+
+Custom model packages are uploaded by the backend and consumed by the
+custom-source-capable PyTorch worker. In multi-container deployments,
+`BASE_CUSTOM_MODELS_DIR` must therefore resolve to the same shared filesystem
+or volume in both containers. Creating the directory in an image does not
+provide this shared-storage contract.
 
 ### Large Dataset Uploads
 
