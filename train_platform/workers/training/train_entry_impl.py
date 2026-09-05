@@ -6,7 +6,7 @@ import sys
 import threading
 import traceback
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Mapping
 
 from sqlalchemy.orm import joinedload
 
@@ -20,6 +20,7 @@ from train_platform.domains.training.runs import (
     upsert_epoch_metrics as persist_epoch_metrics,
 )
 from train_platform.domains.training.frameworks import (
+    CustomSourceExecutionSpec,
     TrainingCallbacks,
     TrainingExecutionSpec,
     TrainerPlugin,
@@ -32,6 +33,7 @@ from train_platform.domains.training.integrations.mlflow import (
     set_mlflow_binding,
 )
 from train_platform.domains.training.parameters import build_device_runtime, parse_visible_host_gpu_ids
+from train_platform.platform.runtime.custom_training import CustomTrainingCancelled
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
 
@@ -107,6 +109,27 @@ def _materialize_execution_spec(
         if isinstance(defaults, dict) and defaults.get("config_path"):
             framework_config["config_path"] = defaults["config_path"]
 
+    custom_source = None
+    if engine == "custom-source":
+        package_id = getattr(run, "custom_model_package_id", None)
+        source_sha256 = str(getattr(run, "custom_model_source_sha256", "") or "").strip().lower()
+        package = getattr(run, "custom_model_package", None)
+        if package_id is None or not source_sha256 or package is None:
+            raise ValueError("Custom-source training run is missing its package snapshot")
+        if int(getattr(package, "package_id", -1)) != int(package_id):
+            raise ValueError("Custom-source package relation does not match the run snapshot")
+        package_sha256 = str(getattr(package, "source_sha256", "") or "").strip().lower()
+        if package_sha256 != source_sha256:
+            raise ValueError("Custom-source package checksum does not match the run snapshot")
+        manifest = getattr(package, "manifest_json", None)
+        if not isinstance(manifest, Mapping):
+            raise ValueError("Custom-source package manifest snapshot is invalid")
+        custom_source = CustomSourceExecutionSpec(
+            package_id=int(package_id),
+            source_sha256=source_sha256,
+            manifest=dict(manifest),
+        )
+
     resume_training = _coerce_bool(effective.get("resume_training"), False)
     resume_job_id = effective.get("resume_job_id")
     resume_job_id = str(resume_job_id).strip() if resume_job_id is not None else None
@@ -149,6 +172,7 @@ def _materialize_execution_spec(
         warmup_momentum=_optional_float(effective.get("warmup_momentum")),
         warmup_bias_lr=_optional_float(effective.get("warmup_bias_lr")),
         framework_config=framework_config,
+        custom_source=custom_source,
     )
 
 
@@ -215,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             .options(joinedload(TrainingRun.project))
             .options(joinedload(TrainingRun.standard_dataset))
             .options(joinedload(TrainingRun.architecture))
+            .options(joinedload(TrainingRun.custom_model_package))
             .filter(TrainingRun.run_id == str(run_id))
             .first()
         )
@@ -322,11 +347,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             vdl_bridge.start()
 
+        # Do not hold the setup query transaction while arbitrary user code
+        # runs in the custom child process.
+        db.commit()
+        db.close()
+
         print(f"[train_entry] start run_id={run_id} trainer={getattr(trainer, 'name', type(trainer).__name__)}", flush=True)
         trainer.run(spec, callbacks)
         mlflow_status = "FINISHED"
         print(f"[train_entry] completed run_id={run_id}", flush=True)
         exit_code = 0
+        return exit_code
+    except CustomTrainingCancelled:
+        mlflow_status = "KILLED"
+        error_message = None
+        exit_code = 0
+        print(f"[train_entry] custom training cancellation observed run_id={run_id}", file=sys.stderr, flush=True)
         return exit_code
     except KeyboardInterrupt:
         mlflow_status = "KILLED"

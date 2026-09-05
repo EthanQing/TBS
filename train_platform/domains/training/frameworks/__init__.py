@@ -2,6 +2,7 @@
 
 from .contract import (
     CancelRequestedFn,
+    CustomSourceExecutionSpec,
     TrainingCallbacks,
     TrainingExecutionSpec,
     TrainerPlugin,
@@ -12,6 +13,7 @@ from .architectures import create_architecture, list_architectures
 
 __all__ = [
     "CancelRequestedFn",
+    "CustomSourceExecutionSpec",
     "create_architecture",
     "FrameworkPluginInfo",
     "TrainingCallbacks",

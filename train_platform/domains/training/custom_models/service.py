@@ -9,7 +9,7 @@ from sqlalchemy.sql import func
 from train_platform.core.config import settings
 from train_platform.models.v3.custom_model_package import CustomModelPackage
 from train_platform.platform.filesystem import extract_archive
-from train_platform.utils.exceptions import ConflictError, ValidationError
+from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
 
 from .manifest import (
     MANIFEST_FILENAME,
@@ -17,7 +17,6 @@ from .manifest import (
     validate_archive_tree,
     validate_entrypoint_file,
 )
-from .queries import get_package
 from .storage import (
     compute_file_sha256,
     remove_package_dir,
