@@ -131,6 +131,10 @@ class TrainingRunService:
             package = db.query(CustomModelPackage).filter(CustomModelPackage.package_id == arch.custom_model_package_id).first()
             if not package:
                 raise ValidationError(f"Referenced CustomModelPackage id={arch.custom_model_package_id} not found")
+            if package.retired_at is not None:
+                raise ValidationError(
+                    f"Referenced CustomModelPackage id={arch.custom_model_package_id} is retired and cannot be used for new training runs"
+                )
             custom_model_package_id = package.package_id
             custom_model_source_sha256 = package.source_sha256
 

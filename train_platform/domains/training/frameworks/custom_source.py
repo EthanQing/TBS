@@ -18,8 +18,9 @@ class CustomSourceTrainer:
     implemented: bool = False
 
     def can_handle(self, model_family: str) -> bool:
-        # Custom source models can support arbitrary user architectures
-        return True
+        # custom-source cannot be selected implicitly by model_family;
+        # it must be selected explicitly via engine="custom-source".
+        return False
 
     def get_config_schema(self) -> dict[str, Any]:
         return {
@@ -28,10 +29,6 @@ class CustomSourceTrainer:
                 "custom_args": {
                     "type": "object",
                     "description": "User-defined training configuration arguments passed to custom trainer",
-                },
-                "env_vars": {
-                    "type": "object",
-                    "description": "Custom environment variables for model training environment",
                 },
             },
             "additionalProperties": True,

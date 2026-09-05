@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -94,8 +94,10 @@ def parse_and_validate_manifest(raw_text_or_dict: str | dict[str, Any]) -> Custo
         )
 
     sdk_version = str(raw.get("sdk_version") or "").strip()
-    if not sdk_version:
-        raise ValidationError("Manifest 'sdk_version' is required and cannot be empty")
+    if sdk_version != "1":
+        raise ValidationError(
+            f"Unsupported sdk_version: '{sdk_version}'. Only sdk_version '1' is currently supported in v1."
+        )
 
     entrypoint_raw = raw.get("entrypoint")
     if not isinstance(entrypoint_raw, dict):
@@ -104,16 +106,26 @@ def parse_and_validate_manifest(raw_text_or_dict: str | dict[str, Any]) -> Custo
     entrypoint_module = str(entrypoint_raw.get("module") or "").strip()
     if not entrypoint_module:
         raise ValidationError("Manifest 'entrypoint.module' is required and cannot be empty")
-    if "/" in entrypoint_module or "\\" in entrypoint_module or ".." in entrypoint_module:
-        raise ValidationError("Manifest 'entrypoint.module' must be a valid Python module identifier (no path separators)")
+    parts = entrypoint_module.split(".")
+    for part in parts:
+        if not part.isidentifier():
+            raise ValidationError(
+                f"Manifest 'entrypoint.module' must be a valid dotted Python module identifier, invalid segment: '{part}'"
+            )
 
     entrypoint_class = str(entrypoint_raw.get("class") or "").strip()
     if not entrypoint_class:
         raise ValidationError("Manifest 'entrypoint.class' is required and cannot be empty")
+    if not entrypoint_class.isidentifier():
+        raise ValidationError(
+            f"Manifest 'entrypoint.class' must be a valid Python identifier: '{entrypoint_class}'"
+        )
 
-    runtime_profile = str(raw.get("runtime_profile") or "pytorch-default").strip()
-    if not runtime_profile:
-        runtime_profile = "pytorch-default"
+    runtime_profile = str(raw.get("runtime_profile") or "").strip()
+    if runtime_profile != "pytorch-default":
+        raise ValidationError(
+            f"Unsupported runtime_profile: '{runtime_profile}'. Only 'pytorch-default' is supported in v1."
+        )
 
     return CustomModelManifest(
         schema_version=schema_version,

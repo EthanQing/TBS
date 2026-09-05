@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -52,13 +51,14 @@ async def upload_custom_model_package(
 ):
     """Upload and ingest a custom model source archive.
     
-    Accepts .zip or tar archives containing source code and tbs-model.yaml.
+    Accepts .zip archives containing source code and tbs-model.yaml.
     Must not contain trained weights (*.pt, *.pth, *.onnx, etc.).
     """
     filename = file.filename or ""
-    suffix = "".join(Path(filename).suffixes).lower()
-    if not (suffix.endswith(".zip") or suffix.endswith(".tar.gz") or suffix.endswith(".tgz") or suffix.endswith(".tar")):
-        raise ValidationError(f"Unsupported package archive format: {filename}. Expected .zip or .tar.gz archive.")
+    if not filename.lower().endswith(".zip"):
+        raise ValidationError(
+            f"Unsupported package archive format: '{filename}'. Only .zip archives are supported in v1."
+        )
 
     settings.ensure_dirs()
     temp_upload_dir = settings.temp_dir / "custom_model_uploads"

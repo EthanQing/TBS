@@ -12,7 +12,7 @@ from train_platform.platform.filesystem import (
     atomic_write_text,
     remove_tree,
 )
-from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
+from train_platform.utils.exceptions import ConflictError, NotFoundError
 
 CUSTOM_MODELS_DIRNAME = "custom_models"
 ARCHIVE_FILENAME = "source.zip"
@@ -104,6 +104,11 @@ def remove_staging_dir(staging_dir: Path) -> None:
     remove_tree(staging_dir, ignore_errors=True)
 
 
+def remove_package_dir(package_id: int) -> None:
+    """Remove the package directory if it was created (used for ingestion rollback compensation)."""
+    remove_tree(package_dir_path(package_id), ignore_errors=True)
+
+
 __all__ = [
     "ARCHIVE_FILENAME",
     "CUSTOM_MODELS_DIRNAME",
@@ -115,6 +120,7 @@ __all__ = [
     "package_dir_path",
     "package_manifest_path",
     "package_sha256_path",
+    "remove_package_dir",
     "remove_staging_dir",
     "resolve_package_archive",
     "store_package_archive",

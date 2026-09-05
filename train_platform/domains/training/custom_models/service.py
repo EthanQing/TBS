@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -21,6 +20,7 @@ from .manifest import (
 from .queries import get_package
 from .storage import (
     compute_file_sha256,
+    remove_package_dir,
     remove_staging_dir,
     store_package_archive,
 )
@@ -54,6 +54,9 @@ def ingest_custom_model_package(
 
     staging_dir = settings.temp_dir / f"custom_pkg_staging_{uuid.uuid4().hex}"
     staging_dir.mkdir(parents=True, exist_ok=True)
+
+    pkg_id_to_compensate: int | None = None
+    committed = False
 
     try:
         # Step 2: Safe extraction via platform/filesystem
@@ -104,6 +107,8 @@ def ingest_custom_model_package(
         db.add(pkg)
         db.flush()
 
+        pkg_id_to_compensate = pkg.package_id
+
         # Step 9: Store immutable archive, manifest.json, sha256 to final storage
         final_archive = store_package_archive(
             package_id=pkg.package_id,
@@ -114,9 +119,17 @@ def ingest_custom_model_package(
         pkg.archive_path = str(final_archive)
 
         db.commit()
+        committed = True
+
         db.refresh(pkg)
         return pkg
 
+    except Exception:
+        if not committed:
+            db.rollback()
+            if pkg_id_to_compensate is not None:
+                remove_package_dir(pkg_id_to_compensate)
+        raise
     finally:
         # Step 10: Always clean up staging directory
         remove_staging_dir(staging_dir)
