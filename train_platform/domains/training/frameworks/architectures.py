@@ -70,7 +70,13 @@ def create_architecture(
     if normalized_engine == "custom-source":
         if custom_model_package_id is None:
             raise ValidationError("custom_model_package_id is required when engine is 'custom-source'")
-        pkg = db.query(CustomModelPackage).filter(CustomModelPackage.package_id == int(custom_model_package_id)).first()
+        pkg = (
+            db.query(CustomModelPackage)
+            .populate_existing()
+            .with_for_update()
+            .filter(CustomModelPackage.package_id == int(custom_model_package_id))
+            .first()
+        )
         if not pkg:
             raise ValidationError(f"Referenced CustomModelPackage id={custom_model_package_id} does not exist")
         if pkg.retired_at is not None:

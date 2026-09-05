@@ -122,21 +122,9 @@ class TrainingRunService:
             plugin = get_plugin(arch_engine)
         except Exception as exc:
             raise ValidationError(f"Architecture engine is not registered: {arch_engine}") from exc
-        # Snapshot custom model provenance if custom-source engine
-        custom_model_package_id = None
-        custom_model_source_sha256 = None
-        if arch_engine == "custom-source":
-            if not arch.custom_model_package_id:
-                raise ValidationError("Architecture with engine 'custom-source' must reference a valid CustomModelPackage")
-            package = db.query(CustomModelPackage).filter(CustomModelPackage.package_id == arch.custom_model_package_id).first()
-            if not package:
-                raise ValidationError(f"Referenced CustomModelPackage id={arch.custom_model_package_id} not found")
-            if package.retired_at is not None:
-                raise ValidationError(
-                    f"Referenced CustomModelPackage id={arch.custom_model_package_id} is retired and cannot be used for new training runs"
-                )
-            custom_model_package_id = package.package_id
-            custom_model_source_sha256 = package.source_sha256
+        # Fast check for custom-source engine architecture configuration
+        if arch_engine == "custom-source" and not arch.custom_model_package_id:
+            raise ValidationError("Architecture with engine 'custom-source' must reference a valid CustomModelPackage")
 
         if not bool(getattr(plugin, "implemented", True)):
             raise ValidationError(
@@ -221,6 +209,26 @@ class TrainingRunService:
             raise
         except Exception:
             raise ValidationError("Failed to validate dataset split for training")
+
+        # Acquire lock on CustomModelPackage right before run persistence to minimize lock hold time
+        custom_model_package_id = None
+        custom_model_source_sha256 = None
+        if arch_engine == "custom-source":
+            package = (
+                db.query(CustomModelPackage)
+                .populate_existing()
+                .with_for_update()
+                .filter(CustomModelPackage.package_id == arch.custom_model_package_id)
+                .first()
+            )
+            if not package:
+                raise ValidationError(f"Referenced CustomModelPackage id={arch.custom_model_package_id} not found")
+            if package.retired_at is not None:
+                raise ValidationError(
+                    f"Referenced CustomModelPackage id={arch.custom_model_package_id} is retired and cannot be used for new training runs"
+                )
+            custom_model_package_id = package.package_id
+            custom_model_source_sha256 = package.source_sha256
 
         run_id = str(uuid.uuid4())
         name = str(obj.get("name") or "").strip() or f"{arch.variant}-{run_id[:8]}"

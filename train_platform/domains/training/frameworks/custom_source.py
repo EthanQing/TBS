@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from train_platform.utils.exceptions import ValidationError
+
 from .contract import TrainerPlugin, TrainingCallbacks, TrainingExecutionSpec
 
 
@@ -31,15 +33,29 @@ class CustomSourceTrainer:
                     "description": "User-defined training configuration arguments passed to custom trainer",
                 },
             },
-            "additionalProperties": True,
+            "additionalProperties": False,
         }
 
     def normalize_config(self, raw: dict[str, Any] | None) -> dict[str, Any]:
-        if not raw:
+        if raw is None:
             return {}
         if not isinstance(raw, dict):
-            return {}
-        return dict(raw)
+            raise ValidationError("custom-source framework_config must be an object")
+
+        unknown_keys = set(raw.keys()) - {"custom_args"}
+        if unknown_keys:
+            raise ValidationError(
+                f"Unknown top-level configuration key(s) for custom-source: {sorted(unknown_keys)}. "
+                "Only 'custom_args' is allowed."
+            )
+
+        if "custom_args" in raw:
+            custom_args = raw["custom_args"]
+            if custom_args is not None and not isinstance(custom_args, dict):
+                raise ValidationError("'custom_args' must be a JSON object")
+            return {"custom_args": dict(custom_args or {})}
+
+        return {}
 
     def run(self, spec: TrainingExecutionSpec, callbacks: TrainingCallbacks) -> None:
         raise RuntimeError("custom-source runtime is not implemented yet")

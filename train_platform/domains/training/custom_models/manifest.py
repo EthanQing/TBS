@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import keyword
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,17 +109,17 @@ def parse_and_validate_manifest(raw_text_or_dict: str | dict[str, Any]) -> Custo
         raise ValidationError("Manifest 'entrypoint.module' is required and cannot be empty")
     parts = entrypoint_module.split(".")
     for part in parts:
-        if not part.isidentifier():
+        if not part.isidentifier() or keyword.iskeyword(part):
             raise ValidationError(
-                f"Manifest 'entrypoint.module' must be a valid dotted Python module identifier, invalid segment: '{part}'"
+                f"Manifest 'entrypoint.module' must be a valid dotted Python module identifier (and not a keyword), invalid segment: '{part}'"
             )
 
     entrypoint_class = str(entrypoint_raw.get("class") or "").strip()
     if not entrypoint_class:
         raise ValidationError("Manifest 'entrypoint.class' is required and cannot be empty")
-    if not entrypoint_class.isidentifier():
+    if not entrypoint_class.isidentifier() or keyword.iskeyword(entrypoint_class):
         raise ValidationError(
-            f"Manifest 'entrypoint.class' must be a valid Python identifier: '{entrypoint_class}'"
+            f"Manifest 'entrypoint.class' must be a valid Python identifier (and not a keyword): '{entrypoint_class}'"
         )
 
     runtime_profile = str(raw.get("runtime_profile") or "").strip()

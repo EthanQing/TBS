@@ -141,7 +141,15 @@ def retire_custom_model_package(db: Session, package_id: int) -> CustomModelPack
     Existing architectures / runs still retain their reference to this immutable package.
     Physical archive files are NOT deleted.
     """
-    pkg = get_package(db, package_id)
+    pkg = (
+        db.query(CustomModelPackage)
+        .populate_existing()
+        .with_for_update()
+        .filter(CustomModelPackage.package_id == int(package_id))
+        .first()
+    )
+    if not pkg:
+        raise NotFoundError(f"CustomModelPackage with id {package_id} not found")
     if pkg.retired_at is not None:
         return pkg
 
