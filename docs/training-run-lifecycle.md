@@ -16,8 +16,9 @@ ownership, liveness, progress, and terminal state.
 - `progress.py` persists epoch metrics and updates epoch/progress only while the
   authoritative run remains `RUNNING`.
 - `artifacts.py` owns Training Run artifact/result indexing and metric snapshot
-  derivation. Lifecycle finalization invokes it only for a genuine transition
-  to `COMPLETED`.
+  derivation. It also owns persistence and authoritative path validation for
+  artifacts reported by custom trainers. Lifecycle finalization invokes
+  completion indexing only for a genuine transition to `COMPLETED`.
 
 ## State and intent
 
@@ -143,6 +144,25 @@ persistence. SDK metric and log events use the private
 stderr inherit the normal `train_entry` logs. Cancellation uses a marker file
 for cooperative `ctx.should_cancel()` handling, followed by best-effort child
 process-tree termination after the inner grace period.
+
+`TrainingContext.report_artifact()` reports a semantic role and a path relative
+to `ctx.output_dir` through the same JSONL channel. The parent independently
+resolves every reported file beneath the run-local `custom_model/output`
+directory and rejects absolute paths, parent traversal, missing or non-file
+targets, and symlink escapes before the Training Run domain persists it. The
+child SDK, custom entrypoint, runtime, and framework adapter never own artifact
+ORM rows.
+
+Artifact `kind` remains the broad storage category, while nullable `role`
+records platform meaning. `best_weights` and `last_weights` are singleton roles
+whose latest reports update the current row; other valid roles are stored as
+generic artifacts without result-projection semantics. Reported artifacts
+survive completion indexing, including when a run later fails or is cancelled.
+Built-in filename discovery remains a compatibility adapter: known Ultralytics
+and Paddle best/last checkpoints receive the same semantic roles. Successful
+completion derives `TrainingRunResult.best_weights_path`,
+`last_weights_path`, and model size from role-bearing artifact rows without
+depending on filename extensions.
 
 Custom model package storage is configured centrally through
 `Settings.custom_models_dir` / `BASE_CUSTOM_MODELS_DIR`, defaulting to

@@ -16,6 +16,7 @@ from train_platform.core.license import assert_valid_license
 from train_platform.db.session import SessionLocal
 from train_platform.domains.training.runs import (
     finalize_execution,
+    register_reported_artifact,
     touch_heartbeat,
     upsert_epoch_metrics as persist_epoch_metrics,
 )
@@ -321,9 +322,25 @@ def main(argv: list[str] | None = None) -> int:
             if mlflow_logger:
                 mlflow_logger.log_metrics(metrics, step=int(epoch))
 
+        def report_artifact(report) -> None:
+            artifact_db = SessionLocal()
+            try:
+                register_reported_artifact(
+                    artifact_db,
+                    run_id,
+                    report,
+                    expected_pid=execution_pid,
+                )
+            except Exception:
+                artifact_db.rollback()
+                raise
+            finally:
+                artifact_db.close()
+
         callbacks = TrainingCallbacks(
             cancel_requested=lambda: _cancel_requested(run_id),
             upsert_epoch_metrics=upsert_epoch_metrics,
+            report_artifact=report_artifact,
         )
 
         # Keep heartbeat alive even if plugin callbacks fail to report metrics.

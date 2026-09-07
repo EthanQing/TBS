@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import math
 import threading
-from pathlib import Path
+import re
+from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping
 
 
@@ -88,6 +89,58 @@ class TrainingContext:
 
     def log(self, message: str) -> None:
         self._emit({"type": "log", "message": str(message)})
+
+    def report_artifact(
+        self,
+        role: str,
+        path: str | Path,
+        *,
+        format: str | None = None,
+        meta: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(role, str):
+            raise TypeError("artifact role must be a string")
+        role_value = role
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", role_value):
+            raise ValueError("artifact role must match [a-z][a-z0-9_.-]* and be at most 64 characters")
+
+        path_value = str(path)
+        if not path_value or "\x00" in path_value:
+            raise ValueError("artifact path must be a non-empty relative path")
+        windows_path = PureWindowsPath(path_value)
+        if (
+            Path(path_value).is_absolute()
+            or windows_path.is_absolute()
+            or windows_path.root
+            or windows_path.drive
+            or path_value.startswith(("\\\\", "/"))
+        ):
+            raise ValueError("artifact path must be relative to the training output directory")
+        path_parts = path_value.replace("\\", "/").split("/")
+        if any(part == ".." for part in path_parts):
+            raise ValueError("artifact path must not contain parent traversal")
+        normalized_path = "/".join(part for part in path_parts if part not in ("", "."))
+        if not normalized_path:
+            raise ValueError("artifact path must identify a file below the training output directory")
+        if format is not None and not isinstance(format, str):
+            raise TypeError("artifact format must be a string")
+        if meta is not None and not isinstance(meta, Mapping):
+            raise TypeError("artifact meta must be a mapping")
+
+        event: dict[str, Any] = {
+            "type": "artifact",
+            "role": role_value,
+            "path": normalized_path,
+        }
+        if format is not None:
+            event["format"] = format
+        if meta is not None:
+            event["meta"] = dict(meta)
+        try:
+            json.dumps(event, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("artifact format and meta must be JSON serializable") from exc
+        self._emit(event)
 
     def _emit(self, event: Mapping[str, Any]) -> None:
         line = json.dumps(dict(event), ensure_ascii=False, allow_nan=False, separators=(",", ":"))

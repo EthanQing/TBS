@@ -184,6 +184,7 @@ class TrainingRunArtifactOut(BaseModel):
     artifact_id: int
     run_id: str
     kind: str
+    role: Optional[str] = None
     name: str
     path: str
     size_bytes: Optional[int] = None

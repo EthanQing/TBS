@@ -8,13 +8,17 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from train_platform.platform.filesystem import atomic_write_json, atomic_write_text
+
+if TYPE_CHECKING:
+    from train_platform.domains.training.frameworks.contract import TrainingArtifactReport
 
 
 MetricsCallback = Callable[[int, Mapping[str, float]], None]
 LogCallback = Callable[[str], None]
+ArtifactCallback = Callable[["TrainingArtifactReport"], None]
 
 
 class CustomTrainingRuntimeError(RuntimeError):
@@ -62,6 +66,24 @@ def _validate_event(raw_line: str) -> tuple[str, Any]:
                 raise CustomTrainingProtocolError(f"Metric '{key}' must be finite")
             metrics[key] = number
         return "metrics", (epoch, metrics)
+
+    if event_type == "artifact":
+        from train_platform.domains.training.frameworks.contract import TrainingArtifactReport
+
+        role = event.get("role")
+        path = event.get("path")
+        format_value = event.get("format")
+        meta = event.get("meta")
+        try:
+            report = TrainingArtifactReport(
+                role=role,
+                path=path,
+                format=format_value,
+                meta=meta,
+            )
+        except (TypeError, ValueError) as exc:
+            raise CustomTrainingProtocolError(f"Invalid artifact event: {exc}") from exc
+        return "artifact", report
 
     raise CustomTrainingProtocolError(f"Unknown child control event type: {event_type!r}")
 
@@ -118,6 +140,7 @@ def _consume_event_line(
     *,
     on_metrics: MetricsCallback,
     on_log: LogCallback | None,
+    on_artifact: ArtifactCallback | None,
 ) -> None:
     if not raw_line.strip():
         return
@@ -125,6 +148,9 @@ def _consume_event_line(
     if parsed_kind == "metrics":
         epoch, metrics = payload
         on_metrics(epoch, metrics)
+    elif parsed_kind == "artifact":
+        if on_artifact is not None:
+            on_artifact(payload)
     elif on_log is not None:
         on_log(payload)
     else:
@@ -137,6 +163,7 @@ def _drain_event_file(
     *,
     on_metrics: MetricsCallback,
     on_log: LogCallback | None,
+    on_artifact: ArtifactCallback | None,
 ) -> str:
     pending += event_file.read()
     complete_lines = pending.splitlines(keepends=True)
@@ -146,7 +173,7 @@ def _drain_event_file(
         pending = ""
 
     for raw_line in complete_lines:
-        _consume_event_line(raw_line, on_metrics=on_metrics, on_log=on_log)
+        _consume_event_line(raw_line, on_metrics=on_metrics, on_log=on_log, on_artifact=on_artifact)
     return pending
 
 
@@ -158,6 +185,7 @@ def run_custom_training(
     cancel_requested: Callable[[], bool],
     on_metrics: MetricsCallback,
     on_log: LogCallback | None = None,
+    on_artifact: ArtifactCallback | None = None,
     cancel_grace_seconds: float = 3.0,
 ) -> int:
     """Run one materialized custom trainer and consume its JSONL events.
@@ -209,6 +237,7 @@ def run_custom_training(
                         pending_events,
                         on_metrics=on_metrics,
                         on_log=on_log,
+                        on_artifact=on_artifact,
                     )
                 except BaseException as exc:
                     failure = exc
@@ -238,6 +267,7 @@ def run_custom_training(
                         pending_events,
                         on_metrics=on_metrics,
                         on_log=on_log,
+                        on_artifact=on_artifact,
                     )
                 except BaseException as exc:
                     failure = exc

@@ -165,6 +165,7 @@ class TrainingRunArtifact(Base):
     artifact_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[str] = mapped_column(String(36), ForeignKey("training_runs.run_id", ondelete="CASCADE"), nullable=False, index=True)
     kind: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    role: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     path: Mapped[str] = mapped_column(String(500), nullable=False)
     size_bytes: Mapped[Optional[int]] = mapped_column(BIGINT, nullable=True)

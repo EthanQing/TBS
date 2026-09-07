@@ -133,6 +133,7 @@ class CustomSourceTrainer:
             cancel_requested=callbacks.cancel_requested,
             on_metrics=callbacks.upsert_epoch_metrics,
             on_log=lambda message: print(f"[custom-source] {message}", flush=True),
+            on_artifact=callbacks.report_artifact,
         )
         if exit_code != 0:
             raise RuntimeError(f"Custom training subprocess exited with code {exit_code}")
