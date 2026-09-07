@@ -1,6 +1,6 @@
 """Training run lifecycle, query, reporting, and execution capabilities."""
 
-from .artifacts import compute_epoch_metric_snapshots, index_completion_artifacts
+from .artifacts import compute_epoch_metric_snapshots, index_completion_artifacts, register_reported_artifact
 from .benchmarks import TrainingRunBenchmarkService
 from .exports import ExportDownload, TrainingExport, download_export, export_training_run
 from .lifecycle import (
@@ -36,6 +36,7 @@ __all__ = [
     "finalize_execution",
     "get_meta",
     "index_completion_artifacts",
+    "register_reported_artifact",
     "list_artifacts",
     "list_epoch_metrics",
     "list_events",

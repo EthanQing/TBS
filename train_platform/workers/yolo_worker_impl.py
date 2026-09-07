@@ -108,7 +108,7 @@ def main() -> None:
     # Dedicated entrypoint for Ultralytics YOLO training jobs and YOLO-side utility jobs.
     training_worker = DbQueueWorker(
         worker_id=os.getenv("WORKER_ID") or "worker-yolo",
-        allowed_engines={"ultralytics-yolo"},
+        allowed_engines={"ultralytics-yolo", "custom-source"},
     )
     conversion_worker = ModelConversionQueueWorker(worker_id=training_worker.worker_id)
     engines_text = ",".join(sorted(training_worker.allowed_engines)) if training_worker.allowed_engines else "*"

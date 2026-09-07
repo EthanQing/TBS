@@ -1,0 +1,8 @@
+schema_version: 1
+name: dummy
+version: "1"
+sdk_version: "1"
+entrypoint:
+  module: trainer
+  class: DummyTrainer
+runtime_profile: pytorch-default

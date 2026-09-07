@@ -23,5 +23,3 @@ __all__ = [
     "remove_path",
     "safe_relative_path",
 ]
-
-

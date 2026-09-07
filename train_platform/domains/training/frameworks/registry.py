@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .contract import TrainerPlugin
+from .custom_source import CustomSourceTrainer
 from .paddle_det.plugin import PaddleDetTrainer
 from .ultralytics_yolo import UltralyticsYOLOTrainer
 
@@ -32,6 +33,7 @@ def _bootstrap_plugins() -> None:
         return
     register_plugin(UltralyticsYOLOTrainer())
     register_plugin(PaddleDetTrainer())
+    register_plugin(CustomSourceTrainer())
 
 
 def list_plugins() -> list[FrameworkPluginInfo]:

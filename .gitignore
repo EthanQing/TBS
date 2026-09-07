@@ -26,6 +26,7 @@ env/
 
 # --- 项目数据与临时文件 ---
 datasets/
+/custom_models/
 !train_platform/domains/datasets/
 !train_platform/domains/datasets/**
 train_platform/domains/datasets/**/__pycache__/
