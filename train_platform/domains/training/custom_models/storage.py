@@ -63,7 +63,7 @@ def store_package_archive(
     source_sha256: str,
 ) -> Path:
     """Store the immutable package archive, manifest.json, and sha256.
-    
+
     Raises ConflictError if the package storage directory already has an archive.
     """
     pkg_dir = package_dir_path(package_id)

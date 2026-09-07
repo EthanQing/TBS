@@ -100,4 +100,3 @@ def delete_model_versions_with_dependents(db: Session, model_versions: Iterable[
 
 
 __all__ = ["delete_model_versions_with_dependents"]
-

@@ -31,7 +31,7 @@ def ingest_custom_model_package(
     archive_file_path: Path,
 ) -> CustomModelPackage:
     """Ingest, validate, and store an uploaded custom model package archive.
-    
+
     Pipeline:
       1. Prepare temporary staging directory under settings.temp_dir.
       2. Safe extraction of archive into staging root (reusing platform/filesystem primitives).
@@ -136,7 +136,7 @@ def ingest_custom_model_package(
 
 def retire_custom_model_package(db: Session, package_id: int) -> CustomModelPackage:
     """Retire a CustomModelPackage so it can no longer be used for new architectures or runs.
-    
+
     Existing architectures / runs still retain their reference to this immutable package.
     Physical archive files are NOT deleted.
     """

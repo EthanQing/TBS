@@ -50,7 +50,7 @@ async def upload_custom_model_package(
     db: Session = Depends(get_db),
 ):
     """Upload and ingest a custom model source archive.
-    
+
     Accepts .zip archives containing source code and tbs-model.yaml.
     Must not contain trained weights (*.pt, *.pth, *.onnx, etc.).
     """

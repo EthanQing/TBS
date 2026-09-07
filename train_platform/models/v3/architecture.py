@@ -45,4 +45,3 @@ class ModelArchitecture(Base):
     custom_model_package = relationship("CustomModelPackage", back_populates="architectures")
 
     __table_args__ = (UniqueConstraint("family", "variant", "task_type", name="uq_model_architectures_family_variant_task"),)
-

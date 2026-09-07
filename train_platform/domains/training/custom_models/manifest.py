@@ -143,7 +143,7 @@ def parse_and_validate_manifest(raw_text_or_dict: str | dict[str, Any]) -> Custo
 
 def validate_archive_tree(extracted_root: Path) -> None:
     """Validate extracted archive contents for security and package contract.
-    
+
     1. Rejects prohibited training weight / artifact extensions.
     2. Ensures tbs-model.yaml exists.
     3. Validates that the specified entrypoint module file exists (without importing it).
@@ -173,7 +173,7 @@ def validate_archive_tree(extracted_root: Path) -> None:
 
 def validate_entrypoint_file(extracted_root: Path, entrypoint_module: str) -> None:
     """Verify that the module file corresponding to entrypoint_module exists.
-    
+
     NEVER imports user python code.
     """
     # module like 'trainer' -> trainer.py or trainer/__init__.py
