@@ -26,9 +26,15 @@ env/
 
 # --- 项目数据与临时文件 ---
 datasets/
+!train_platform/domains/datasets/
+!train_platform/domains/datasets/**
+train_platform/domains/datasets/**/__pycache__/
+train_platform/domains/datasets/**/*.pyc
 training_runs/
 temp/
 runs/
+!train_platform/domains/training/runs/
+!train_platform/domains/training/runs/report_docx.py
 PaddleDetection/
 imports/
 *.log

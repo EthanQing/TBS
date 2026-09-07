@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+import os
+import string
+import uuid
+from pathlib import Path
+from typing import Any
+
+from train_platform.core.config import settings
+from train_platform.domains.datasets.storage.roots import (
+    allowed_import_roots,
+    load_user_import_roots,
+    save_user_import_roots,
+)
+from train_platform.utils.exceptions import NotFoundError, ValidationError
+from train_platform.domains.datasets.images import IMAGE_EXTS
+
+
+class DatasetImportService:
+    """Own import-root policy and inspection of filesystem sources.
+
+    The service deliberately returns plain mappings so transport schemas stay at
+    the API boundary. Dataset creation and upload task lifecycle belong to other
+    domains.
+    """
+
+    _DATA_YAML_NAMES = {"data.yaml", "dataset.yaml", "data.yml", "dataset.yml"}
+    _SKIP_DIRS = {".git", "__macosx", ".thumbnails", ".versions"}
+
+    def _root_out(self, *, root_id: str, path: Path, label: str = "", editable: bool = False) -> dict[str, Any]:
+        exists = path.exists() and path.is_dir()
+        readable = False
+        if exists:
+            try:
+                next(path.iterdir(), None)
+                readable = True
+            except StopIteration:
+                readable = True
+            except Exception:
+                readable = False
+        display_label = label.strip() if label else f"{root_id}: {path}"
+        return {
+            "root_id": root_id,
+            "path": str(path),
+            "label": display_label,
+            "exists": bool(exists),
+            "readable": bool(readable),
+            "editable": bool(editable),
+        }
+
+    def roots(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for idx, root in enumerate(settings.dataset_import_roots):
+            root_id = "default" if idx == 0 else f"root_{idx}"
+            out.append(self._root_out(root_id=root_id, path=root, editable=False))
+
+        static_paths = {str(Path(item["path"]).resolve(strict=False)).lower() for item in out}
+        seen_ids = {str(item["root_id"]) for item in out}
+        for item in load_user_import_roots():
+            raw_id = str(item.get("root_id") or "").strip()
+            root_id = raw_id if raw_id and raw_id not in seen_ids else f"user_{uuid.uuid4().hex[:10]}"
+            try:
+                root = Path(str(item.get("path") or "")).expanduser().resolve(strict=False)
+            except Exception:
+                continue
+            if str(root).lower() in static_paths:
+                continue
+            seen_ids.add(root_id)
+            out.append(self._root_out(root_id=root_id, path=root, label=str(item.get("label") or ""), editable=True))
+        return out
+
+    def allowed_roots(self) -> tuple[Path, ...]:
+        return allowed_import_roots()
+
+    def add_root(self, path: str, label: str | None = None) -> dict[str, Any]:
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            raise ValidationError("Directory path is required")
+        try:
+            root = Path(raw_path).expanduser().resolve(strict=False)
+        except Exception as exc:
+            raise ValidationError("Invalid directory path") from exc
+        if not root.exists() or not root.is_dir():
+            raise NotFoundError("Directory not found")
+        try:
+            next(root.iterdir(), None)
+        except StopIteration:
+            pass
+        except Exception as exc:
+            raise ValidationError("Directory is not readable") from exc
+
+        for existing in self.roots():
+            if Path(existing["path"]).resolve(strict=False) == root:
+                return existing
+
+        roots = load_user_import_roots()
+        root_id = f"user_{uuid.uuid4().hex[:10]}"
+        roots.append({"root_id": root_id, "path": str(root), "label": str(label or "").strip()})
+        save_user_import_roots(roots)
+        return self._root_out(root_id=root_id, path=root, label=str(label or ""), editable=True)
+
+    def delete_root(self, root_id: str) -> dict[str, Any]:
+        wanted = str(root_id or "").strip()
+        if not wanted.startswith("user_"):
+            raise ValidationError("Only user-added import roots can be removed")
+        roots = load_user_import_roots()
+        kept = [item for item in roots if str(item.get("root_id") or "").strip() != wanted]
+        if len(kept) == len(roots):
+            raise NotFoundError("Dataset import root not found")
+        save_user_import_roots(kept)
+        return {"root_id": wanted, "deleted": True}
+
+    def _filesystem_start_entries(self) -> dict[str, Any]:
+        entries: list[dict[str, Any]] = []
+        candidates: list[Path] = []
+        if os.name == "nt":
+            for letter in string.ascii_uppercase:
+                drive = Path(f"{letter}:\\")
+                if drive.exists():
+                    candidates.append(drive)
+        else:
+            candidates.extend([Path("/"), Path("/data"), Path("/mnt"), Path("/media"), Path.home()])
+        candidates.extend([settings.home_dir, settings.imports_dir])
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                path = candidate.expanduser().resolve(strict=False)
+            except Exception:
+                continue
+            key = str(path).lower()
+            if key in seen or not path.exists() or not path.is_dir():
+                continue
+            seen.add(key)
+            readable = True
+            try:
+                next(path.iterdir(), None)
+            except StopIteration:
+                pass
+            except Exception:
+                readable = False
+            entries.append({"name": str(path), "path": str(path), "is_dir": True, "readable": readable})
+        return {"path": "", "parent_path": None, "entries": entries}
+
+    def browse_filesystem(self, path: str | None = None) -> dict[str, Any]:
+        raw = str(path or "").strip()
+        if not raw:
+            return self._filesystem_start_entries()
+        try:
+            current = Path(raw).expanduser().resolve(strict=False)
+        except Exception as exc:
+            raise ValidationError("Invalid directory path") from exc
+        if not current.exists() or not current.is_dir():
+            raise NotFoundError("Directory not found")
+        entries: list[dict[str, Any]] = []
+        try:
+            children = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except Exception as exc:
+            raise ValidationError("Directory is not readable") from exc
+        for child in children:
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            readable = True
+            try:
+                next(child.iterdir(), None)
+            except StopIteration:
+                pass
+            except Exception:
+                readable = False
+            entries.append(
+                {
+                    "name": child.name,
+                    "path": str(child.resolve(strict=False)),
+                    "is_dir": True,
+                    "readable": readable,
+                }
+            )
+        parent_path = None
+        parent = current.parent.resolve(strict=False)
+        if parent != current:
+            parent_path = str(parent)
+        return {"path": str(current), "parent_path": parent_path, "entries": entries}
+
+    def _root_by_id(self, root_id: str | None) -> tuple[str, Path, dict[str, Any]]:
+        wanted = str(root_id or "default").strip() or "default"
+        for item in self.roots():
+            if item["root_id"] == wanted:
+                return str(item["root_id"]), Path(str(item["path"])).resolve(strict=False), item
+        raise NotFoundError("Dataset import root not found")
+
+    def resolve_import_path(self, root_id: str | None, rel_path: str | None) -> Path:
+        _root_key, root, _root_out = self._root_by_id(root_id)
+        if not root.exists() or not root.is_dir():
+            raise NotFoundError("Dataset import root is not available")
+        raw = str(rel_path or "").strip().replace("\\", "/").strip("/")
+        rel = Path(raw) if raw else Path("")
+        if rel.is_absolute() or ".." in rel.parts:
+            raise ValidationError("Invalid import path")
+        resolved = (root / rel).resolve(strict=False)
+        try:
+            resolved.relative_to(root.resolve(strict=False))
+        except Exception as exc:
+            raise ValidationError("Import path must be inside an allowed import root") from exc
+        return resolved
+
+    def _quick_counts(self, path: Path, *, max_items: int = 3000) -> dict[str, Any]:
+        image_count = 0
+        json_count = 0
+        label_count = 0
+        has_data_yaml = False
+        scanned = 0
+        if not path.exists() or not path.is_dir():
+            return {
+                "image_count": 0,
+                "json_count": 0,
+                "label_count": 0,
+                "has_data_yaml": False,
+                "truncated": False,
+            }
+        for cur, dirnames, filenames in os.walk(path):
+            cur_path = Path(cur)
+            rel = cur_path.relative_to(path)
+            if rel.parts and rel.parts[0].lower() in self._SKIP_DIRS:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d.lower() not in self._SKIP_DIRS]
+            for name in filenames:
+                scanned += 1
+                lower = name.lower()
+                ext = Path(name).suffix.lower()
+                if lower in self._DATA_YAML_NAMES:
+                    has_data_yaml = True
+                if ext in IMAGE_EXTS:
+                    image_count += 1
+                elif ext == ".json":
+                    json_count += 1
+                elif ext == ".txt" and lower not in {"classes.txt", "train.txt", "val.txt", "test.txt"}:
+                    label_count += 1
+                if scanned >= max_items:
+                    return {
+                        "image_count": image_count,
+                        "json_count": json_count,
+                        "label_count": label_count,
+                        "has_data_yaml": has_data_yaml,
+                        "truncated": True,
+                    }
+        return {
+            "image_count": image_count,
+            "json_count": json_count,
+            "label_count": label_count,
+            "has_data_yaml": has_data_yaml,
+            "truncated": False,
+        }
+
+    def _format_from_counts(self, counts: dict[str, Any]) -> str:
+        if counts.get("image_count", 0) > 0 and (counts.get("label_count", 0) > 0 or counts.get("has_data_yaml")):
+            return "yolo"
+        if counts.get("image_count", 0) > 0 and counts.get("json_count", 0) > 0:
+            return "json"
+        if counts.get("image_count", 0) > 0:
+            return "images"
+        return "unknown"
+
+    def list_entries(self, *, root_id: str = "default", path: str = "") -> dict[str, Any]:
+        _root_key, root, root_out = self._root_by_id(root_id)
+        current = self.resolve_import_path(root_id, path)
+        if not current.exists() or not current.is_dir():
+            raise NotFoundError("Import directory not found")
+        entries: list[dict[str, Any]] = []
+        for child in sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+            if child.name.startswith(".") or not child.is_dir():
+                continue
+            try:
+                rel = child.resolve(strict=False).relative_to(root).as_posix()
+            except Exception:
+                continue
+            counts = self._quick_counts(child, max_items=1_000_000)
+            is_candidate = counts["image_count"] > 0 and (
+                counts["json_count"] > 0 or counts["label_count"] > 0 or counts["has_data_yaml"]
+            )
+            entries.append(
+                {
+                    "name": child.name,
+                    "path": rel,
+                    "is_dir": True,
+                    "is_dataset_candidate": bool(is_candidate),
+                    "image_count": int(counts["image_count"]),
+                    "json_count": int(counts["json_count"]),
+                    "label_count": int(counts["label_count"]),
+                    "has_data_yaml": bool(counts["has_data_yaml"]),
+                }
+            )
+        current_rel = current.relative_to(root).as_posix() if current != root else ""
+        parent_path = None
+        if current != root:
+            parent = current.parent.resolve(strict=False)
+            parent_path = parent.relative_to(root).as_posix() if parent != root else ""
+        return {"root": root_out, "path": current_rel, "parent_path": parent_path, "entries": entries}
+
+    def inspect(self, *, root_id: str = "default", path: str = "") -> dict[str, Any]:
+        root_key, root, _root_out = self._root_by_id(root_id)
+        current = self.resolve_import_path(root_id, path)
+        counts = self._quick_counts(current, max_items=1_000_000)
+        warnings: list[str] = []
+        if counts.get("truncated"):
+            warnings.append("目录较大，检查结果为快速扫描统计")
+        if counts.get("image_count", 0) <= 0:
+            warnings.append("未发现图片文件")
+        if (
+            counts.get("image_count", 0) > 0
+            and counts.get("json_count", 0) <= 0
+            and counts.get("label_count", 0) <= 0
+            and not counts.get("has_data_yaml")
+        ):
+            warnings.append("未发现 JSON 或 YOLO 标注")
+        rel = current.relative_to(root).as_posix() if current != root else ""
+        return {
+            "root_id": root_key,
+            "path": rel,
+            "resolved_path": str(current),
+            "exists": current.exists(),
+            "is_dir": current.is_dir(),
+            "format": self._format_from_counts(counts),
+            "image_count": int(counts["image_count"]),
+            "json_count": int(counts["json_count"]),
+            "label_count": int(counts["label_count"]),
+            "has_data_yaml": bool(counts["has_data_yaml"]),
+            "warnings": warnings,
+        }
+
+
+def resolve_import_path(root_id: str | None, rel_path: str | None) -> Path:
+    """Resolve a root-relative import path using the configured root policy."""
+
+    return DatasetImportService().resolve_import_path(root_id, rel_path)
+
+
+__all__ = ["DatasetImportService", "resolve_import_path"]

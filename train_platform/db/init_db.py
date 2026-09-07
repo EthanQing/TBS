@@ -77,8 +77,8 @@ def _seed_architectures(db: Session) -> None:
 
 def _seed_alarm_rules(db: Session) -> None:
     try:
-        from train_platform.services.v3.alarm_service import AlarmService
+        from train_platform.domains.monitoring.alarms.service import ensure_default_rules
 
-        AlarmService().ensure_default_rules(db)
+        ensure_default_rules(db)
     except Exception as e:
         logger.warning("Failed to seed alarm rules: %s", e)

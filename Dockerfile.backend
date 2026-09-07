@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Build native-protected runtime sources. API/schema/migration code remains
-# readable for framework reflection; services and worker core are Cython extensions.
+# readable for framework reflection; domain/platform and worker core are Cython extensions.
 FROM python:3.10-slim-bookworm AS source-protector
 
 ENV PYTHONUNBUFFERED=1
@@ -22,7 +22,7 @@ COPY setup.py ./setup.py
 COPY train_platform/ ./train_platform/
 COPY native/license_verifier/ ./native/license_verifier/
 
-RUN CYTHON_INCLUDE_GLOBS="train_platform/services/*.py,train_platform/services/**/*.py,train_platform/workers/worker_impl.py,train_platform/workers/yolo_worker_impl.py,train_platform/workers/paddle_worker_impl.py,train_platform/workers/model_conversion_queue.py,train_platform/workers/model_conversion_task.py,train_platform/workers/inference_job_task.py,train_platform/workers/training/train_entry_impl.py,train_platform/workers/training/vdl_bridge.py" \
+RUN CYTHON_INCLUDE_GLOBS="train_platform/domains/*.py,train_platform/domains/**/*.py,train_platform/platform/*.py,train_platform/platform/**/*.py,train_platform/workers/worker_impl.py,train_platform/workers/yolo_worker_impl.py,train_platform/workers/paddle_worker_impl.py,train_platform/workers/model_conversion_queue.py,train_platform/workers/inference_job_task.py,train_platform/workers/training/train_entry_impl.py,train_platform/workers/training/vdl_bridge.py" \
     python setup.py build_ext \
     && mkdir -p /protected-runtime \
     && cp -a build/runtime/. /protected-runtime/ \

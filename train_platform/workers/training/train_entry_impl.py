@@ -4,105 +4,152 @@ import argparse
 import os
 import sys
 import threading
-import time
 import traceback
-from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict
 
+from sqlalchemy.orm import joinedload
+
 from train_platform.core.config import settings
+from train_platform.domains.datasets.storage.paths import resolve_legacy_dataset_path
 from train_platform.core.license import assert_valid_license
 from train_platform.db.session import SessionLocal
-from sqlalchemy.orm import Session
-from train_platform.models.v3.enums import TrainingRunStatus
-from train_platform.models.v3.training_run import TrainingRun, TrainingRunEpochMetric
-from train_platform.repositories.v3.training_run_repo import TrainingRunRepository
-from train_platform.services.v3.alarm_service import AlarmService
-from train_platform.training.plugins.base import TrainContext
-from train_platform.training.registry import get_trainer
-from train_platform.utils.path_utils import resolve_dataset_path
-from train_platform.utils.mlflow_utils import init_mlflow_logger
-from train_platform.utils.training_artifacts import index_completion_artifacts as _index_completion_artifacts
-from train_platform.utils.training_params import build_device_runtime, parse_visible_host_gpu_ids
+from train_platform.domains.training.runs import (
+    finalize_execution,
+    touch_heartbeat,
+    upsert_epoch_metrics as persist_epoch_metrics,
+)
+from train_platform.domains.training.frameworks import (
+    TrainingCallbacks,
+    TrainingExecutionSpec,
+    TrainerPlugin,
+    get_trainer,
+)
+from train_platform.models.v3.training_run import TrainingRun
+from train_platform.domains.training.integrations.mlflow import (
+    get_mlflow_binding,
+    initialize_mlflow_logger,
+    set_mlflow_binding,
+)
+from train_platform.domains.training.parameters import build_device_runtime, parse_visible_host_gpu_ids
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+def _coerce_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "y", "on"):
+            return True
+        if normalized in ("0", "false", "no", "n", "off", ""):
+            return False
+    return bool(value)
 
 
-_HEARTBEAT_LOST_ERROR = "Worker heartbeat lost; marking as failed"
-
-
-def _touch_run_liveness(db: Session, run: TrainingRun) -> None:
-    """
-    Keep the run from being marked stale when the queue worker is restarted/crashed.
-
-    We update `heartbeat_at` from the training subprocess itself (best-effort) and also
-    repair the common false FAILED status caused by worker heartbeat loss while training
-    is still producing progress/metrics.
-    """
-    now = _utcnow()
-    run.heartbeat_at = now
-
-    # If a worker falsely marked the run as FAILED due to heartbeat loss, but we are still
-    # actively training (we're inside the training subprocess), heal it back to RUNNING.
-    if run.status == TrainingRunStatus.FAILED and (str(run.error_message or "").strip() == _HEARTBEAT_LOST_ERROR):
-        run.status = TrainingRunStatus.RUNNING
-        run.finished_at = None
-        run.error_message = None
-
-
-def _finalize_run_status(run_id: str, *, exit_code: int, error_message: str | None = None) -> None:
-    """
-    Best-effort terminal status update from the training subprocess.
-
-    This prevents UI from getting stuck in FAILED (heartbeat lost) while training is still
-    running, and also lets runs become COMPLETED even if the queue worker died.
-    """
-    db = SessionLocal()
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
     try:
-        run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
-        if not run:
-            return
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
-        _touch_run_liveness(db, run)
 
-        # Match the worker's priority: delete > cancel > exit_code.
-        delete_requested = run.delete_requested_at is not None
-        cancel_requested = (run.cancel_requested_at is not None) or delete_requested
+def _materialize_execution_spec(
+    run: TrainingRun,
+    *,
+    dataset_path: Path,
+    run_dir: Path,
+    requested_device: str,
+    runtime_device: str,
+    trainer: TrainerPlugin,
+) -> TrainingExecutionSpec:
+    parameters = run.parameters
+    architecture = run.architecture
+    additional_params = getattr(parameters, "additional_params", None)
+    additional = dict(additional_params) if isinstance(additional_params, dict) else {}
 
-        if delete_requested:
-            run.status = TrainingRunStatus.DELETED
-            run.hidden = True
-            run.error_message = None
-            run.finished_at = run.finished_at or _utcnow()
-        elif cancel_requested:
-            run.status = TrainingRunStatus.CANCELLED
-            run.error_message = None
-            run.finished_at = run.finished_at or _utcnow()
-        elif int(exit_code) == 0:
-            run.status = TrainingRunStatus.COMPLETED
-            run.error_message = None
-            run.finished_at = _utcnow()
-            try:
-                run.progress = max(int(getattr(run, "progress", 0) or 0), 100)
-            except Exception:
-                run.progress = 100
-            try:
-                _index_completion_artifacts(db, run_id)
-            except Exception:
-                pass
-        else:
-            run.status = TrainingRunStatus.FAILED
-            run.finished_at = _utcnow()
-            if error_message:
-                run.error_message = str(error_message)
+    raw_framework_config = additional.get("framework_config")
+    normalized_framework_config = (
+        trainer.normalize_config(raw_framework_config)
+        if isinstance(raw_framework_config, dict)
+        else {}
+    )
+    if not isinstance(normalized_framework_config, dict):
+        normalized_framework_config = {}
 
-        db.commit()
-    except Exception:
-        db.rollback()
-    finally:
-        db.close()
+    # The nested framework config wins over legacy top-level values, matching
+    # the persisted API behavior while exposing one explicit spec source.
+    effective = {key: value for key, value in additional.items() if key != "framework_config"}
+    effective.update(normalized_framework_config)
+    engine = str(getattr(architecture, "engine", "") or "").strip().lower()
+    if engine == "ultralytics-yolo":
+        framework_keys = ("amp", "save_period", "pin_memory")
+    elif engine == "paddle-det":
+        framework_keys = (
+            "config_path",
+            "metrics_source",
+            "eval_during_train",
+            "eval_interval",
+            "snapshot_epoch",
+            "save_period",
+        )
+    else:
+        framework_keys = tuple(normalized_framework_config.keys())
+    framework_config = {key: effective[key] for key in framework_keys if key in effective}
+    if engine == "paddle-det" and not framework_config.get("config_path"):
+        defaults = getattr(architecture, "default_params", None)
+        if isinstance(defaults, dict) and defaults.get("config_path"):
+            framework_config["config_path"] = defaults["config_path"]
+
+    resume_training = _coerce_bool(effective.get("resume_training"), False)
+    resume_job_id = effective.get("resume_job_id")
+    resume_job_id = str(resume_job_id).strip() if resume_job_id is not None else None
+    if not resume_job_id:
+        resume_job_id = None
+    pretrained_model_path = effective.get("pretrained_model_path") or getattr(
+        architecture, "pretrained_path", None
+    )
+
+    return TrainingExecutionSpec(
+        run_id=str(run.run_id),
+        dataset_path=dataset_path,
+        dataset_name=str(getattr(run.standard_dataset, "name", "") or "") or None,
+        run_dir=run_dir,
+        engine=engine,
+        family=str(getattr(architecture, "family", "") or ""),
+        variant=str(getattr(architecture, "variant", "") or ""),
+        epochs=int(getattr(parameters, "epochs", 100) or 100),
+        batch_size=int(getattr(parameters, "batch_size", 16) or 16),
+        image_size=int(getattr(parameters, "image_size", 640) or 640),
+        learning_rate=float(getattr(parameters, "learning_rate", 0.01) or 0.01),
+        lr_scheduler=str(getattr(parameters, "lr_scheduler", "linear") or "linear"),
+        patience=int(getattr(parameters, "patience", 50) or 50),
+        requested_device=requested_device,
+        runtime_device=runtime_device,
+        workers=int(getattr(parameters, "workers", 8) or 8),
+        optimizer=str(getattr(parameters, "optimizer", "AdamW") or "AdamW"),
+        use_pretrained=_coerce_bool(
+            effective.get("use_pretrained"),
+            bool(getattr(parameters, "use_pretrained", True)),
+        ),
+        augmentation=getattr(parameters, "augmentation", None) or {},
+        loss_weights=getattr(parameters, "loss_weights", None) or {},
+        resume_training=resume_training,
+        resume_job_id=resume_job_id,
+        pretrained_model_path=str(pretrained_model_path) if pretrained_model_path else None,
+        momentum=_optional_float(effective.get("momentum")),
+        weight_decay=_optional_float(effective.get("weight_decay")),
+        warmup_epochs=_optional_float(effective.get("warmup_epochs")),
+        warmup_momentum=_optional_float(effective.get("warmup_momentum")),
+        warmup_bias_lr=_optional_float(effective.get("warmup_bias_lr")),
+        framework_config=framework_config,
+    )
 
 
 def _cancel_requested(run_id: str) -> bool:
@@ -111,8 +158,6 @@ def _cancel_requested(run_id: str) -> bool:
         run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
         if not run:
             return False
-        _touch_run_liveness(db, run)
-        db.commit()
         return bool(run.cancel_requested_at is not None or run.delete_requested_at is not None)
     except Exception:
         db.rollback()
@@ -121,64 +166,28 @@ def _cancel_requested(run_id: str) -> bool:
         db.close()
 
 
-def _heartbeat_tick(run_id: str) -> None:
+def _heartbeat_tick(run_id: str, *, expected_pid: int) -> None:
     db = SessionLocal()
     try:
         run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
         if not run:
             return
-        _touch_run_liveness(db, run)
-        db.commit()
-        AlarmService.try_evaluate_training_rules(db, run_ids=[str(run_id)])
+        touch_heartbeat(db, run_id, expected_pid=expected_pid)
     except Exception:
         db.rollback()
     finally:
         db.close()
 
 
-def _heartbeat_loop(run_id: str, stop_event: threading.Event, *, interval_sec: float = 5.0) -> None:
+def _heartbeat_loop(
+    run_id: str,
+    stop_event: threading.Event,
+    *,
+    expected_pid: int,
+    interval_sec: float = 5.0,
+) -> None:
     while not stop_event.wait(max(1.0, float(interval_sec))):
-        _heartbeat_tick(run_id)
-
-
-def _merge_metrics_payload(existing: Dict[str, float] | dict | None, incoming: Dict[str, float] | dict | None) -> Dict[str, float]:
-    merged: Dict[str, float] = {}
-    if isinstance(existing, dict):
-        for k, v in existing.items():
-            merged[str(k)] = v
-    if isinstance(incoming, dict):
-        for k, v in incoming.items():
-            merged[str(k)] = v
-    return merged
-
-
-def _upsert_epoch_metrics(run_id: str, epoch: int, metrics: Dict[str, float]) -> None:
-    db = SessionLocal()
-    try:
-        row = (
-            db.query(TrainingRunEpochMetric)
-            .filter(TrainingRunEpochMetric.run_id == run_id, TrainingRunEpochMetric.epoch == int(epoch))
-            .first()
-        )
-        payload = _merge_metrics_payload({}, metrics)
-        if row:
-            row.metrics = _merge_metrics_payload(row.metrics, payload)
-        else:
-            db.add(TrainingRunEpochMetric(run_id=run_id, epoch=int(epoch), metrics=payload))
-
-        run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
-        if run:
-            _touch_run_liveness(db, run)
-            run.current_epoch = int(epoch)
-            if run.total_epochs and int(run.total_epochs) > 0:
-                # Ultralytics epoch is 0-based; progress is best-effort.
-                pct = int(min(100, max(0, 100 * float(epoch + 1) / float(run.total_epochs))))
-                run.progress = pct
-        db.commit()
-    except Exception:
-        db.rollback()
-    finally:
-        db.close()
+        _heartbeat_tick(run_id, expected_pid=expected_pid)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -187,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)
     run_id = str(args.run_id)
+    execution_pid = os.getpid()
 
     db = SessionLocal()
     mlflow_logger = None
@@ -197,15 +207,25 @@ def main(argv: list[str] | None = None) -> int:
     heartbeat_thread: threading.Thread | None = None
     vdl_bridge: VisualDLScalarBridge | None = None
     try:
-        run = TrainingRunRepository().get(db, run_id)
-        if not run or not run.parameters or not run.project or not run.project.standard_dataset or not run.architecture:
+        run = (
+            db.query(TrainingRun)
+            .options(joinedload(TrainingRun.parameters))
+            .options(joinedload(TrainingRun.result))
+            .options(joinedload(TrainingRun.meta))
+            .options(joinedload(TrainingRun.project))
+            .options(joinedload(TrainingRun.standard_dataset))
+            .options(joinedload(TrainingRun.architecture))
+            .filter(TrainingRun.run_id == str(run_id))
+            .first()
+        )
+        if not run or not run.parameters or not run.standard_dataset or not run.architecture:
             print(f"[train_entry] run not found or missing relations: {run_id}", file=sys.stderr, flush=True)
             exit_code = 2
             error_message = "Run not found or missing relations"
             return exit_code
 
         dataset_path_token = run.standard_dataset.storage_path
-        dataset_path = resolve_dataset_path(dataset_path_token)
+        dataset_path = resolve_legacy_dataset_path(dataset_path_token)
         if not dataset_path.exists():
             print(f"[train_entry] dataset path does not exist: {dataset_path}", file=sys.stderr, flush=True)
             exit_code = 2
@@ -246,19 +266,37 @@ def main(argv: list[str] | None = None) -> int:
             engine=(engine or None),
         )
         run_dir = settings.training_dir / run_id
+        spec = _materialize_execution_spec(
+            run,
+            dataset_path=dataset_path,
+            run_dir=run_dir,
+            requested_device=requested_device,
+            runtime_device=runtime_device,
+            trainer=trainer,
+        )
 
-        mlflow_logger = init_mlflow_logger(run, dataset_path=str(dataset_path), run_dir=str(run_dir))
+        try:
+            existing_binding = get_mlflow_binding(db, run_id)
+            mlflow_logger = initialize_mlflow_logger(
+                run,
+                existing_binding=existing_binding,
+                dataset_path=str(dataset_path),
+                run_dir=str(run_dir),
+            )
+            if mlflow_logger is not None and mlflow_logger.binding_to_persist:
+                set_mlflow_binding(db, run_id, mlflow_logger.binding_to_persist)
+                db.commit()
+        except Exception:
+            # MLflow metadata is optional and must not alter training
+            # lifecycle state when its transaction cannot be persisted.
+            db.rollback()
 
         def upsert_epoch_metrics(epoch: int, metrics: Dict[str, float]) -> None:
-            _upsert_epoch_metrics(run_id, epoch, metrics)
+            persist_epoch_metrics(run_id, epoch, metrics, expected_pid=execution_pid)
             if mlflow_logger:
                 mlflow_logger.log_metrics(metrics, step=int(epoch))
 
-        ctx = TrainContext(
-            job_id=run_id,
-            job=run,
-            dataset_path=dataset_path,
-            run_dir=run_dir,
+        callbacks = TrainingCallbacks(
             cancel_requested=lambda: _cancel_requested(run_id),
             upsert_epoch_metrics=upsert_epoch_metrics,
         )
@@ -268,20 +306,13 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_thread = threading.Thread(
             target=_heartbeat_loop,
             args=(run_id, heartbeat_stop),
-            kwargs={"interval_sec": 5.0},
+            kwargs={"expected_pid": execution_pid, "interval_sec": 5.0},
             daemon=True,
         )
         heartbeat_thread.start()
 
         # Optional phase-2 bridge: enrich Paddle metrics from VisualDL scalars.
-        additional_params = getattr(run.parameters, "additional_params", None) or {}
-        framework_config_raw = additional_params.get("framework_config")
-        plugin_config = trainer.normalize_config(framework_config_raw) if isinstance(framework_config_raw, dict) else {}
-        metrics_source = str(
-            plugin_config.get("metrics_source")
-            or additional_params.get("metrics_source")
-            or "callback"
-        ).strip().lower()
+        metrics_source = str(spec.framework_config.get("metrics_source") or "callback").strip().lower()
         if str(engine or "").strip().lower() == "paddle-det" and metrics_source == "hybrid":
             vdl_bridge = VisualDLScalarBridge(
                 run_id=run_id,
@@ -292,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
             vdl_bridge.start()
 
         print(f"[train_entry] start run_id={run_id} trainer={getattr(trainer, 'name', type(trainer).__name__)}", flush=True)
-        trainer.run(ctx, config=plugin_config)
+        trainer.run(spec, callbacks)
         mlflow_status = "FINISHED"
         print(f"[train_entry] completed run_id={run_id}", flush=True)
         exit_code = 0
@@ -326,9 +357,18 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat_thread.join(timeout=2.0)
         if vdl_bridge is not None:
             vdl_bridge.stop()
-        # Best-effort: ensure DB status does not incorrectly remain FAILED due to worker heartbeat loss.
         try:
-            _finalize_run_status(run_id, exit_code=exit_code, error_message=error_message)
+            lifecycle_db = SessionLocal()
+            try:
+                finalize_execution(
+                    lifecycle_db,
+                    run_id,
+                    exit_code=exit_code,
+                    expected_pid=execution_pid,
+                    error_message=error_message,
+                )
+            finally:
+                lifecycle_db.close()
         except Exception:
             pass
         if mlflow_logger:

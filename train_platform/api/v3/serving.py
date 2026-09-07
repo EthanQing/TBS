@@ -1,25 +1,22 @@
 from __future__ import annotations
 
-import shutil
-import uuid
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.core.config import settings
+from train_platform.domains.deployment.credentials import verify_api_key
+from train_platform.domains.deployment.service import assert_serving_ready, get_serving_deployment
+from train_platform.domains.inference.input import save_uploaded_file
+from train_platform.domains.inference.service import InferenceService
 from train_platform.models.v3.deployment import Deployment
-from train_platform.models.v3.enums import DeploymentStatus
 from train_platform.schemas.v3.deployments import (
     ServingInferResponse,
     ServingJobCreate,
     ServingJobOut,
 )
-from train_platform.services.v3.deployment_runtime_service import verify_api_key
-from train_platform.services.v3.inference_service import InferenceService
-from train_platform.utils.exceptions import NotFoundError, ValidationError
+from train_platform.utils.exceptions import ConflictError, ValidationError
 
 
 router = APIRouter(prefix="/serving", tags=["serving"])
@@ -36,18 +33,11 @@ def _extract_api_key(request: Request) -> str:
     return ""
 
 
-def _require_deployment(db: Session, deployment_id: int) -> Deployment:
-    dep = db.query(Deployment).filter(Deployment.deployment_id == int(deployment_id)).first()
-    if not dep:
-        raise NotFoundError("Deployment not found")
-    return dep
-
-
-def _assert_serving_ready(dep: Deployment) -> None:
-    if not bool(dep.is_active) or dep.status != DeploymentStatus.ACTIVE:
-        raise HTTPException(status_code=409, detail="Deployment is not active")
-    if not str(dep.api_key_hash or "").strip():
-        raise HTTPException(status_code=409, detail="Deployment API key is not configured")
+def _assert_serving_ready(dep) -> None:
+    try:
+        assert_serving_ready(dep)
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _assert_key(dep: Deployment, request: Request) -> None:
@@ -56,20 +46,6 @@ def _assert_key(dep: Deployment, request: Request) -> None:
         raise HTTPException(status_code=401, detail="Missing deployment API key")
     if not verify_api_key(raw, str(dep.api_key_hash or "")):
         raise HTTPException(status_code=401, detail="Invalid deployment API key")
-
-
-def _save_uploaded_file(file: UploadFile) -> str:
-    suffix = Path(file.filename or "").suffix or ".jpg"
-    settings.temp_dir.mkdir(parents=True, exist_ok=True)
-    out_dir = settings.temp_dir / "serving_uploads"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    token = f"serving_uploads/{uuid.uuid4().hex}{suffix}"
-    out_path = (settings.temp_dir / token).resolve(strict=False)
-    if settings.temp_dir.resolve() not in out_path.parents:
-        raise ValidationError("Unsafe upload path")
-    with open(out_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    return token
 
 
 def _normalize_output(raw: dict[str, Any] | None) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]]]:
@@ -88,7 +64,7 @@ def serving_health(
     auth_required: bool = True,
     db: Session = Depends(get_db),
 ):
-    dep = _require_deployment(db, int(deployment_id))
+    dep = get_serving_deployment(db, int(deployment_id))
     _assert_serving_ready(dep)
     if auth_required:
         _assert_key(dep, request)
@@ -107,7 +83,7 @@ async def serving_infer(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    dep = _require_deployment(db, int(deployment_id))
+    dep = get_serving_deployment(db, int(deployment_id))
     _assert_serving_ready(dep)
     _assert_key(dep, request)
 
@@ -147,7 +123,12 @@ async def serving_infer(
             file = up
 
     if file is not None:
-        input_path = _save_uploaded_file(file)
+        input_path = save_uploaded_file(
+            file.filename or "",
+            file.file,
+            subdir="serving_uploads",
+            validate_suffix=False,
+        )
 
     if bool(input_path) == bool(image_url):
         raise ValidationError("Provide exactly one of file or image_url")
@@ -189,7 +170,7 @@ async def serving_infer(
 
 @router.post("/deployments/{deployment_id}/jobs", response_model=ServingJobOut)
 def create_serving_job(deployment_id: int, payload: ServingJobCreate, db: Session = Depends(get_db)):
-    _ = _require_deployment(db, int(deployment_id))
+    _ = get_serving_deployment(db, int(deployment_id))
     return ServingJobOut(
         enabled=False,
         status="not_enabled",

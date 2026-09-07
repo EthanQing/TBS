@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import mimetypes
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.models.v3.standard_dataset import StandardDataset, StandardDatasetEvent
 from train_platform.schemas.v3.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v3.standard_datasets import (
     DatasetFileOut,
@@ -31,13 +30,23 @@ from train_platform.schemas.v3.dataset_uploads import (
     DatasetUploadSessionCreate,
     DatasetUploadSessionOut,
 )
-from train_platform.services.v3.dataset_upload_service import DatasetUploadService
-from train_platform.services.v3.standard_dataset_service import StandardDatasetService
+from train_platform.domains.datasets.uploads import DatasetUploadService, DatasetUploadTaskService
+from train_platform.domains.datasets.standard import StandardDatasetService
+from train_platform.domains.datasets.standard.events import list_events_page
+from train_platform.domains.datasets.standard.queries import (
+    get_file_path,
+    get_image_annotations,
+    get_statistics,
+    get_view,
+    list_files,
+)
+from train_platform.domains.datasets.standard.splits import get_split_result, split_dataset
 
 
 router = APIRouter(prefix="/standard-datasets", tags=["standard-datasets"])
 svc = StandardDatasetService()
 upload_svc = DatasetUploadService()
+upload_task_svc = DatasetUploadTaskService()
 
 
 @router.post("", response_model=StandardDatasetOut, status_code=201)
@@ -59,11 +68,7 @@ def list_standard_datasets(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    q = db.query(StandardDataset)
-    if format:
-        q = q.filter(StandardDataset.format == str(format))
-    total = q.count()
-    items = svc.list_datasets(
+    items, total = svc.list_datasets_page(
         db,
         skip=skip,
         limit=page_size,
@@ -125,7 +130,7 @@ def upload_standard_session_part(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    return upload_svc.save_part(db, "standard", standard_dataset_id, session_id, part_no, file)
+    return upload_svc.save_part(db, "standard", standard_dataset_id, session_id, part_no, file.file)
 
 
 @router.get("/{standard_dataset_id}/upload-sessions/{session_id}", response_model=DatasetUploadSessionOut)
@@ -141,7 +146,7 @@ def complete_standard_upload_session(
     db: Session = Depends(get_db),
 ):
     task = upload_svc.complete_session(db, "standard", standard_dataset_id, session_id)
-    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    background_tasks.add_task(upload_task_svc.run_task, task.task_id)
     return {"task_id": task.task_id, "session_id": session_id, "status": task.status}
 
 
@@ -168,7 +173,7 @@ def import_standard_dataset_from_path(
         created_by=payload.created_by,
         message=payload.message,
     )
-    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    background_tasks.add_task(upload_task_svc.run_task, task.task_id)
     return {"task_id": task.task_id, "session_id": None, "status": task.status}
 
 
@@ -178,7 +183,7 @@ def split_standard_dataset(
     payload: DatasetSplitRequest,
     db: Session = Depends(get_db),
 ):
-    return svc.split_dataset(db, standard_dataset_id, **payload.model_dump())
+    return split_dataset(db, standard_dataset_id, **payload.model_dump())
 
 
 @router.get("/{standard_dataset_id}/split", response_model=DatasetSplitResultOut)
@@ -192,7 +197,7 @@ def get_standard_dataset_split(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    items, summary, total = svc.get_split_result(
+    items, summary, total = get_split_result(
         db,
         standard_dataset_id,
         split=split,
@@ -212,8 +217,8 @@ def list_standard_dataset_events(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    total = db.query(StandardDatasetEvent).filter(StandardDatasetEvent.standard_dataset_id == int(standard_dataset_id)).count()
-    items = svc.list_events(db, standard_dataset_id, skip=skip, limit=page_size)
+    svc.get_dataset(db, standard_dataset_id)
+    items, total = list_events_page(db, standard_dataset_id, skip=skip, limit=page_size)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
@@ -225,7 +230,7 @@ def get_standard_dataset_view(
     page_size: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    return svc.get_view(db, standard_dataset_id, class_id=class_id, page=page, page_size=page_size)
+    return get_view(db, svc.get_dataset(db, standard_dataset_id), class_id=class_id, page=page, page_size=page_size)
 
 
 @router.get("/{standard_dataset_id}/image-annotations", response_model=DatasetImageAnnotationsOut)
@@ -234,12 +239,12 @@ def get_standard_dataset_image_annotations(
     image_path: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    return svc.get_image_annotations(db, standard_dataset_id, image_path=image_path)
+    return get_image_annotations(svc.get_dataset(db, standard_dataset_id), image_path=image_path)
 
 
 @router.get("/{standard_dataset_id}/statistics", response_model=DatasetStatisticsOut)
 def get_standard_dataset_statistics(standard_dataset_id: int, db: Session = Depends(get_db)):
-    return svc.get_statistics(db, standard_dataset_id)
+    return get_statistics(db, svc.get_dataset(db, standard_dataset_id))
 
 
 @router.get("/{standard_dataset_id}/file/{file_path:path}")
@@ -248,7 +253,7 @@ def get_standard_dataset_file(
     file_path: str,
     db: Session = Depends(get_db),
 ):
-    path = svc.get_file_path(db, standard_dataset_id, file_path)
+    path = get_file_path(svc.get_dataset(db, standard_dataset_id), file_path)
     media_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
     return FileResponse(path=str(path), media_type=media_type)
 
@@ -262,5 +267,5 @@ def list_standard_dataset_files(
 ):
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
-    items, total = svc.list_files(db, standard_dataset_id, page=page, page_size=page_size)
+    items, total = list_files(svc.get_dataset(db, standard_dataset_id), page=page, page_size=page_size)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}

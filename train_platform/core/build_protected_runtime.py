@@ -6,11 +6,13 @@ import shutil
 from pathlib import Path
 
 
-DEFAULT_PROTECTED_PATHS = ("train_platform/services",)
+DEFAULT_PROTECTED_PATHS = ("train_platform/domains", "train_platform/platform")
 DEFAULT_PROTECTED_FILES = (
     "train_platform/workers/worker_impl.py",
     "train_platform/workers/yolo_worker_impl.py",
     "train_platform/workers/paddle_worker_impl.py",
+    "train_platform/workers/model_conversion_queue.py",
+    "train_platform/workers/inference_job_task.py",
     "train_platform/workers/training/train_entry_impl.py",
     "train_platform/workers/training/vdl_bridge.py",
 )

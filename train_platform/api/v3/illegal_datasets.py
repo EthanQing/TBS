@@ -6,7 +6,6 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, Uplo
 from sqlalchemy.orm import Session
 
 from train_platform.api.deps import get_db
-from train_platform.models.v3.illegal_dataset import IllegalDataset, IllegalDatasetEvent, IllegalDatasetVersion
 from train_platform.schemas.v3.common import DeleteResponse, Page, PageMeta
 from train_platform.schemas.v3.illegal_datasets import (
     DatasetImageUploadOut,
@@ -32,14 +31,16 @@ from train_platform.schemas.v3.dataset_uploads import (
     DatasetUploadSessionCreate,
     DatasetUploadSessionOut,
 )
-from train_platform.services.v3.dataset_upload_service import DatasetUploadService
-from train_platform.services.v3.illegal_dataset_publish_job_service import IllegalDatasetPublishJobService
-from train_platform.services.v3.illegal_dataset_service import IllegalDatasetService
+from train_platform.domains.datasets.uploads import DatasetUploadService, DatasetUploadTaskService
+from train_platform.domains.datasets.illegal import labels, versions
+from train_platform.domains.datasets.illegal.publishing.jobs import IllegalDatasetPublishJobService
+from train_platform.domains.datasets.illegal.service import IllegalDatasetService
 
 
 router = APIRouter(prefix="/illegal-datasets", tags=["illegal-datasets"])
 svc = IllegalDatasetService()
 upload_svc = DatasetUploadService()
+upload_task_svc = DatasetUploadTaskService()
 publish_job_svc = IllegalDatasetPublishJobService()
 
 
@@ -62,11 +63,7 @@ def list_illegal_datasets(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    q = db.query(IllegalDataset)
-    if format:
-        q = q.filter(IllegalDataset.format == str(format))
-    total = q.count()
-    items = svc.list_datasets(
+    items, total = svc.list_datasets_page(
         db,
         skip=skip,
         limit=page_size,
@@ -133,7 +130,7 @@ def upload_illegal_session_part(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    return upload_svc.save_part(db, "illegal", illegal_dataset_id, session_id, part_no, file)
+    return upload_svc.save_part(db, "illegal", illegal_dataset_id, session_id, part_no, file.file)
 
 
 @router.get("/{illegal_dataset_id}/upload-sessions/{session_id}", response_model=DatasetUploadSessionOut)
@@ -150,7 +147,7 @@ def complete_illegal_upload_session(
     db: Session = Depends(get_db),
 ):
     task = upload_svc.complete_session(db, "illegal", illegal_dataset_id, session_id, message=message)
-    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    background_tasks.add_task(upload_task_svc.run_task, task.task_id)
     return {"task_id": task.task_id, "session_id": session_id, "status": task.status}
 
 
@@ -177,7 +174,7 @@ def import_illegal_dataset_from_path(
         created_by=payload.created_by,
         message=payload.message,
     )
-    background_tasks.add_task(upload_svc.run_task, task.task_id)
+    background_tasks.add_task(upload_task_svc.run_task, task.task_id)
     return {"task_id": task.task_id, "session_id": None, "status": task.status}
 
 
@@ -190,9 +187,9 @@ def upload_illegal_dataset_images(
     created_by: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
-    return svc.upload_images(
+    return versions.upload_images(
         db,
-        illegal_dataset_id,
+        svc.get_dataset(db, illegal_dataset_id),
         files=files,
         relative_dir=relative_dir,
         message=message,
@@ -205,14 +202,14 @@ def list_illegal_dataset_versions(illegal_dataset_id: int, page: int = 1, page_s
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    total = db.query(IllegalDatasetVersion).filter(IllegalDatasetVersion.illegal_dataset_id == int(illegal_dataset_id)).count()
-    items = svc.list_versions(db, illegal_dataset_id, skip=skip, limit=page_size)
+    svc.get_dataset(db, illegal_dataset_id)
+    items, total = versions.list_versions_page(db, illegal_dataset_id, skip=skip, limit=page_size)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
 @router.post("/{illegal_dataset_id}/versions/{version_id}/activate", response_model=IllegalDatasetOut)
 def activate_illegal_dataset_version(illegal_dataset_id: int, version_id: int, db: Session = Depends(get_db)):
-    return svc.activate_version(db, illegal_dataset_id, version_id)
+    return versions.activate(db, svc.get_dataset(db, illegal_dataset_id), version_id)
 
 
 @router.get("/{illegal_dataset_id}/events", response_model=Page[IllegalDatasetEventOut])
@@ -225,19 +222,19 @@ def list_illegal_dataset_events(
     page = max(int(page), 1)
     page_size = min(max(int(page_size), 1), 500)
     skip = (page - 1) * page_size
-    total = db.query(IllegalDatasetEvent).filter(IllegalDatasetEvent.illegal_dataset_id == int(illegal_dataset_id)).count()
-    items = svc.list_events(db, illegal_dataset_id, skip=skip, limit=page_size)
+    items, total = svc.list_events_page(db, illegal_dataset_id, skip=skip, limit=page_size)
     return {"items": items, "meta": PageMeta(page=page, page_size=page_size, total=int(total))}
 
 
 @router.get("/{illegal_dataset_id}/raw-labels", response_model=IllegalDatasetRawLabelsOut)
 def get_illegal_dataset_raw_labels(illegal_dataset_id: int, db: Session = Depends(get_db)):
-    return {"labels": svc.get_raw_labels(db, illegal_dataset_id)}
+    return {"labels": labels.raw_labels(db, svc.get_dataset(db, illegal_dataset_id))}
 
 
 @router.get("/{illegal_dataset_id}/label-mappings", response_model=IllegalDatasetLabelMappingsOut)
 def get_illegal_dataset_label_mappings(illegal_dataset_id: int, db: Session = Depends(get_db)):
-    rows = svc.get_label_mappings(db, illegal_dataset_id)
+    svc.get_dataset(db, illegal_dataset_id)
+    rows = labels.list_mappings(db, illegal_dataset_id)
 
     def _out(row):
         is_delete = (
@@ -262,7 +259,12 @@ def update_illegal_dataset_label_mappings(
     payload: IllegalDatasetLabelMappingsUpdate,
     db: Session = Depends(get_db),
 ):
-    return svc.update_label_mappings(db, illegal_dataset_id, items=[item.model_dump() for item in payload.items])
+    dataset = svc.get_dataset(db, illegal_dataset_id)
+    return labels.update_mappings(
+        db,
+        int(dataset.illegal_dataset_id),
+        items=[item.model_dump() for item in payload.items],
+    )
 
 
 @router.post("/{illegal_dataset_id}/publish-jobs", response_model=IllegalDatasetPublishJobOut, status_code=202)
@@ -310,4 +312,6 @@ def get_illegal_dataset_statistics(
     version_id: int | None = Query(None),
     db: Session = Depends(get_db),
 ):
-    return svc.get_statistics(db, illegal_dataset_id, version_id=version_id)
+    dataset = svc.get_dataset(db, illegal_dataset_id)
+    selected = versions.selected_version(db, dataset, version_id=version_id)
+    return versions.build_statistics(db, dataset, version=selected)

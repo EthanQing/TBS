@@ -15,11 +15,11 @@ from train_platform.schemas.v3.deployments import (
     DeploymentRunRetryOut,
     DeploymentRunWsMessage,
 )
-from train_platform.services.v3.deployment_runtime_service import DeploymentRuntimeService
+from train_platform.domains.deployment.runs.service import DeploymentRunService
 
 
 router = APIRouter(prefix="/deployment-runs", tags=["deployment-runs"])
-_svc = DeploymentRuntimeService()
+_svc = DeploymentRunService()
 
 
 def _parse_cursor(raw: Any) -> int:
