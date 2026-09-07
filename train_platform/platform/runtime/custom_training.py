@@ -8,17 +8,25 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
 
 from train_platform.platform.filesystem import atomic_write_json, atomic_write_text
 
-if TYPE_CHECKING:
-    from train_platform.domains.training.frameworks.contract import TrainingArtifactReport
+
+@dataclass(frozen=True)
+class CustomTrainingArtifactEvent:
+    """Transport payload for one artifact event emitted by a custom trainer."""
+
+    role: str
+    path: str
+    format: str | None = None
+    meta: Mapping[str, Any] | None = None
 
 
 MetricsCallback = Callable[[int, Mapping[str, float]], None]
 LogCallback = Callable[[str], None]
-ArtifactCallback = Callable[["TrainingArtifactReport"], None]
+ArtifactCallback = Callable[[CustomTrainingArtifactEvent], None]
 
 
 class CustomTrainingRuntimeError(RuntimeError):
@@ -68,22 +76,24 @@ def _validate_event(raw_line: str) -> tuple[str, Any]:
         return "metrics", (epoch, metrics)
 
     if event_type == "artifact":
-        from train_platform.domains.training.frameworks.contract import TrainingArtifactReport
-
         role = event.get("role")
         path = event.get("path")
         format_value = event.get("format")
         meta = event.get("meta")
-        try:
-            report = TrainingArtifactReport(
-                role=role,
-                path=path,
-                format=format_value,
-                meta=meta,
-            )
-        except (TypeError, ValueError) as exc:
-            raise CustomTrainingProtocolError(f"Invalid artifact event: {exc}") from exc
-        return "artifact", report
+        if not isinstance(role, str):
+            raise CustomTrainingProtocolError("Artifact event role must be a string")
+        if not isinstance(path, str):
+            raise CustomTrainingProtocolError("Artifact event path must be a string")
+        if format_value is not None and not isinstance(format_value, str):
+            raise CustomTrainingProtocolError("Artifact event format must be a string or null")
+        if meta is not None and not isinstance(meta, dict):
+            raise CustomTrainingProtocolError("Artifact event meta must be a JSON object or null")
+        return "artifact", CustomTrainingArtifactEvent(
+            role=role,
+            path=path,
+            format=format_value,
+            meta=meta,
+        )
 
     raise CustomTrainingProtocolError(f"Unknown child control event type: {event_type!r}")
 
@@ -292,6 +302,7 @@ def run_custom_training(
 
 __all__ = [
     "CustomTrainingCancelled",
+    "CustomTrainingArtifactEvent",
     "CustomTrainingProtocolError",
     "CustomTrainingRuntimeError",
     "run_custom_training",

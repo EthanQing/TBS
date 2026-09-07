@@ -4,7 +4,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from train_platform.platform.filesystem import clear_directory, extract_archive
-from train_platform.platform.runtime.custom_training import run_custom_training
+from train_platform.platform.runtime.custom_training import (
+    CustomTrainingArtifactEvent,
+    run_custom_training,
+)
 from train_platform.utils.exceptions import ValidationError
 
 from train_platform.domains.training.custom_models.storage import (
@@ -12,7 +15,12 @@ from train_platform.domains.training.custom_models.storage import (
     resolve_package_archive,
 )
 
-from .contract import TrainerPlugin, TrainingCallbacks, TrainingExecutionSpec
+from .contract import (
+    TrainerPlugin,
+    TrainingArtifactReport,
+    TrainingCallbacks,
+    TrainingExecutionSpec,
+)
 
 
 def _plain_json_value(value: Any) -> Any:
@@ -126,6 +134,16 @@ class CustomSourceTrainer:
             "event_path": str(event_path.resolve(strict=False)),
         }
 
+        def on_artifact(event: CustomTrainingArtifactEvent) -> None:
+            callbacks.report_artifact(
+                TrainingArtifactReport(
+                    role=event.role,
+                    path=event.path,
+                    format=event.format,
+                    meta=event.meta,
+                )
+            )
+
         exit_code = run_custom_training(
             context,
             context_path=context_path,
@@ -133,7 +151,7 @@ class CustomSourceTrainer:
             cancel_requested=callbacks.cancel_requested,
             on_metrics=callbacks.upsert_epoch_metrics,
             on_log=lambda message: print(f"[custom-source] {message}", flush=True),
-            on_artifact=callbacks.report_artifact,
+            on_artifact=on_artifact,
         )
         if exit_code != 0:
             raise RuntimeError(f"Custom training subprocess exited with code {exit_code}")
