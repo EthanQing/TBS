@@ -35,7 +35,11 @@ User requests and observed execution results are separate:
 
 The worker owns candidate selection, device eligibility, subprocess spawning,
 termination, and exit observation. It delegates all state changes to the
-lifecycle capabilities. The training subprocess owns execution setup, trainer
+lifecycle capabilities. It sets `PYTHONIOENCODING=utf-8` for the training
+subprocess and its descendants so redirected stdout/stderr match the UTF-8
+log files even on Windows. Opening the parent file handles with UTF-8 alone
+does not configure the child Python streams.
+The training subprocess owns execution setup, trainer
 selection, MLflow/VisualDL integration, and invokes the shared heartbeat,
 progress, and finalization capabilities. MLflow is an optional Training-owned
 integration under `domains/training/integrations`: the subprocess explicitly

@@ -44,12 +44,15 @@ def _safe_remove_dir(path: Path) -> None:
 
 def _spawn_training_subprocess(run_id: str, *, stdout_f: TextIO, stderr_f: TextIO) -> subprocess.Popen:
     args = [sys.executable, "-m", "train_platform.workers.training.train_entry", "--run-id", run_id]
+    env = os.environ.copy()
+    # Redirected Python streams choose their own encoding, independent of the log file handles.
+    env["PYTHONIOENCODING"] = "utf-8"
 
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        return subprocess.Popen(args, stdout=stdout_f, stderr=stderr_f, creationflags=creationflags)
+        return subprocess.Popen(args, stdout=stdout_f, stderr=stderr_f, env=env, creationflags=creationflags)
 
-    return subprocess.Popen(args, stdout=stdout_f, stderr=stderr_f, start_new_session=True)
+    return subprocess.Popen(args, stdout=stdout_f, stderr=stderr_f, env=env, start_new_session=True)
 
 
 def _terminate_process_tree(proc: subprocess.Popen, *, timeout_sec: int = 20) -> None:
