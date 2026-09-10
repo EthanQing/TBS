@@ -15,6 +15,20 @@ Model evaluation, deployment smoke tests, and training benchmarks call `ModelWor
 
 ## Failure boundary
 
+`domains/model_assets/runtime.py` owns runtime capability admission. Only
+`ultralytics-yolo` and `paddle-det` are supported. Resolution requires an existing
+ModelVersion, a weights file, its source TrainingRun, and its Architecture with
+an explicitly supported engine. Missing or unsupported engines raise
+`ConflictError` (HTTP 409); Paddle still requires a valid config file.
+`custom-source` remains a training foundation and may have registered
+ModelVersions, but `runtime_profile=pytorch-default` grants no runtime capability.
+
+Inference and evaluation candidates exclude missing or unsupported engines.
+Training benchmarks validate the engine before using cached runtime measurements
+or dispatching work; best-effort YOLO statistics only run for explicit YOLO engines.
+The worker client independently rejects empty and unsupported engines before HTTP
+dispatch and never selects YOLO as a default.
+
 `ModelWorkerClient` raises explicit errors for request failures, non-JSON responses, non-success HTTP responses, worker-reported errors, and missing required output. Business owners decide how those failures affect their state:
 
 - synchronous persisted inference records worker execution failures in `InferenceRun.error_message`;

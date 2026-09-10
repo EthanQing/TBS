@@ -172,7 +172,7 @@ def run_evaluation(
             if observer.is_cancel_requested():
                 return cancelled_result(index - 1)
             output = worker_client.execute_model(
-                engine=engine or "ultralytics-yolo",
+                engine=engine,
                 weights_path=prepared.model.weights_path,
                 image_path=image_path,
                 conf=float(prepared.conf),

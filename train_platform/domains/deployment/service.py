@@ -13,6 +13,7 @@ from train_platform.domains.deployment.logs import (
     map_rollback_log,
     rollback_log_data,
 )
+from train_platform.domains.model_assets.runtime import resolve_model_runtime
 from train_platform.models.v3.deployment import Deployment, DeploymentLog
 from train_platform.models.v3.deployment_run import DeploymentRun
 from train_platform.models.v3.enums import DeploymentRunStatus, DeploymentStatus, LogLevel, ModelStage
@@ -96,6 +97,7 @@ class DeploymentService:
             raise NotFoundError("Model version not found")
         if model_version.stage == ModelStage.DEPRECATED:
             raise ConflictError("Cannot deploy a deprecated model version")
+        resolve_model_runtime(db, model_version=model_version)
 
         name = str(obj.get("name") or "").strip()
         if not name:
@@ -241,10 +243,17 @@ class DeploymentService:
             .order_by(ModelVersion.updated_at.desc(), ModelVersion.model_version_id.desc())
             .all()
         )
+        runtime_safe_candidates = []
+        for candidate in candidates:
+            try:
+                resolve_model_runtime(db, model_version=candidate)
+            except (NotFoundError, ValidationError, ConflictError):
+                continue
+            runtime_safe_candidates.append(candidate)
         return {
             "deployment": deployment,
             "current_model_version_id": current_model_version_id,
-            "candidates": candidates,
+            "candidates": runtime_safe_candidates,
         }
 
     def rollback_deployment(
@@ -287,6 +296,7 @@ class DeploymentService:
         )
         if target_id not in allowed:
             raise ConflictError("Target model version has not been successfully deployed in this project")
+        resolve_model_runtime(db, model_version=target)
 
         activation_result = activation.activate_deployment(
             db,

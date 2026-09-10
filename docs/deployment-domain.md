@@ -28,6 +28,18 @@ the model switch, activation invariants, stage synchronization, and rollback
 audit write in one database transaction. The activation result records the
 authoritative previous model ID for that audit.
 
+Creation validates runtime readiness through `resolve_model_runtime` before
+creating a Deployment row. Execution repeats that admission check before the
+project lock, credential generation, lifecycle changes, run creation, or thread
+dispatch; retry reuses execution admission. The pipeline retains its own artifact
+validation. Only `ultralytics-yolo` and `paddle-det` are runtime-supported;
+missing or unsupported engines fail closed with HTTP 409.
+
+Rollback history is eligibility evidence, not runtime readiness. Candidate lists
+filter models whose runtime resolution fails, including missing weights or invalid
+Paddle config. Rollback submission validates the target again before activation
+and the rollback audit write.
+
 ## Deployment Run ownership
 
 - `runs/service.py` owns run creation, read operations, retry, cancellation,

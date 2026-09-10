@@ -11,6 +11,7 @@ from train_platform.domains.deployment.credentials import generate_api_key
 from train_platform.domains.deployment.logs import append_run_log, list_run_logs
 from train_platform.domains.deployment.runs import lifecycle
 from train_platform.domains.deployment.runs.pipeline import execute_pipeline
+from train_platform.domains.model_assets.runtime import resolve_model_runtime
 from train_platform.models.v3.deployment import Deployment
 from train_platform.models.v3.deployment_run import DeploymentRun
 from train_platform.models.v3.enums import DeploymentRunStatus, LogLevel
@@ -59,6 +60,7 @@ class DeploymentRunService:
         )
         if not model_version:
             raise NotFoundError("Model version not found")
+        resolve_model_runtime(db, model_version=model_version)
 
         # The project row is the admission lock.  DeploymentRun status queries
         # are made only after taking it, so concurrent requests serialize.

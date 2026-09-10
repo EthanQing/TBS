@@ -8,6 +8,10 @@ from typing import Any, Dict, List
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.domains.model_assets.runtime import (
+    normalize_runtime_engine,
+    require_supported_runtime_engine,
+)
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun, TrainingRunResult
 from train_platform.platform.runtime import ModelWorkerClient
@@ -50,7 +54,7 @@ class TrainingRunBenchmarkService:
 
     def measure_yolo_stats(self, run: TrainingRun, result: TrainingRunResult) -> Dict[str, Any]:
         arch = run.architecture
-        engine = str(getattr(arch, "engine", "") or "ultralytics-yolo").strip().lower()
+        engine = normalize_runtime_engine(getattr(arch, "engine", None))
         if engine != "ultralytics-yolo":
             return {}
 
@@ -97,7 +101,7 @@ class TrainingRunBenchmarkService:
             raise NotFoundError(f"Weights not found: {weights_path}")
 
         arch = run.architecture
-        engine = str(getattr(arch, "engine", "") or "ultralytics-yolo").strip().lower()
+        engine = require_supported_runtime_engine(getattr(arch, "engine", None))
         config_path = None
         if engine == "paddle-det":
             params = arch.default_params if isinstance(getattr(arch, "default_params", None), dict) else {}
@@ -166,7 +170,9 @@ class TrainingRunBenchmarkService:
             engine: str | None = None
             try:
                 run = TrainingRunService().get_run(db, run_id)
-                engine = str(getattr(run.architecture, "engine", "") or "").strip().lower() or None
+                engine = require_supported_runtime_engine(
+                    getattr(run.architecture, "engine", None)
+                )
                 if run.status != TrainingRunStatus.COMPLETED:
                     items.append(
                         {
@@ -197,8 +203,7 @@ class TrainingRunBenchmarkService:
                     db.add(run.result)
                     db.flush()
 
-                engine_norm = str(engine or "ultralytics-yolo").strip().lower()
-                if engine_norm == "ultralytics-yolo":
+                if engine == "ultralytics-yolo":
                     if not run.result.best_weights_path and not run.result.last_weights_path:
                         index_completion_artifacts(db, str(run.run_id))
                         db.flush()

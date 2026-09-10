@@ -6,7 +6,11 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
-from train_platform.domains.model_assets.runtime import resolve_architecture_config_path
+from train_platform.domains.model_assets.runtime import (
+    is_supported_runtime_engine,
+    normalize_runtime_engine,
+    resolve_architecture_config_path,
+)
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.model_registry import ModelVersion
@@ -20,9 +24,11 @@ class ModelCandidateService:
 
     def _weights_ext_ok(self, engine: str, weights_path: Path) -> bool:
         ext = weights_path.suffix.lower()
+        if engine == "ultralytics-yolo":
+            return ext in {".pt", ".pth"}
         if engine == "paddle-det":
             return ext == ".pdparams"
-        return ext in {".pt", ".pth"}
+        return False
 
     def _build_candidate(
         self,
@@ -32,7 +38,9 @@ class ModelCandidateService:
         run: TrainingRun,
         arch: ModelArchitecture | None,
     ) -> Optional[InferenceModelCandidate]:
-        engine = str(getattr(arch, "engine", "") or "ultralytics-yolo").strip().lower()
+        engine = normalize_runtime_engine(getattr(arch, "engine", None))
+        if not is_supported_runtime_engine(engine):
+            return None
         family = str(getattr(arch, "family", "") or "").strip() or None
         variant = str(getattr(arch, "variant", "") or "").strip() or None
 

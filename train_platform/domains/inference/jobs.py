@@ -123,7 +123,7 @@ class InferenceJobService:
         model: ModelRuntimeSpec,
     ) -> None:
         self._worker.dispatch_inference_job(
-            engine=str(model.engine or status.get("engine") or "ultralytics-yolo"),
+            engine=model.engine,
             job_id=job_id,
             mode=str(status.get("mode") or "image"),
             weights_path=model.weights_path,

@@ -17,6 +17,7 @@ class ModelWorkerClient:
     """Small HTTP client for the model inference worker processes."""
 
     INTERNAL_TOKEN_HEADER = "X-Internal-Token"
+    SUPPORTED_ENGINES = frozenset({"ultralytics-yolo", "paddle-det"})
 
     def __init__(self) -> None:
         self._internal_token = str(settings.internal_api_token or "").strip()
@@ -213,7 +214,10 @@ class ModelWorkerClient:
 
     @staticmethod
     def _normalize_engine(engine: str) -> str:
-        return str(engine or "").strip().lower() or "ultralytics-yolo"
+        normalized = str(engine or "").strip().lower()
+        if normalized not in ModelWorkerClient.SUPPORTED_ENGINES:
+            raise ModelWorkerError(f"Model runtime engine is not supported: {normalized or 'missing'}")
+        return normalized
 
     @staticmethod
     def _timeout(env_name: str, default: float) -> float:
@@ -225,9 +229,12 @@ class ModelWorkerClient:
 
     @staticmethod
     def _worker_url(engine: str) -> str:
-        if engine == "paddle-det":
+        normalized = ModelWorkerClient._normalize_engine(engine)
+        if normalized == "ultralytics-yolo":
+            return os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
+        if normalized == "paddle-det":
             return os.getenv("PADDLE_INFERENCE_WORKER_URL", "http://127.0.0.1:18003").rstrip("/")
-        return os.getenv("INFERENCE_WORKER_URL", "http://127.0.0.1:18002").rstrip("/")
+        raise ModelWorkerError(f"Model runtime engine is not supported: {normalized}")
 
     def _endpoint(self, engine: str, path: str) -> str:
         return f"{self._worker_url(engine)}{path}"
