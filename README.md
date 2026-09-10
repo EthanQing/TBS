@@ -130,8 +130,17 @@ alembic -c alembic.ini upgrade head
 ### 4. Start the API server
 
 ```bash
-uvicorn train_platform.app:app --host 0.0.0.0 --port 18000 --reload
+uv run python -m uvicorn train_platform.app:app --host 0.0.0.0 --port 18000
 ```
+
+Avoid an unrestricted `--reload` while uploading custom models or running training.
+Uploads extract Python files under `temp`, and training prepares Python sources
+under `training_runs`. The watcher treats these runtime files as application
+changes, restarting the API and disconnecting WebSockets. In the pinned Uvicorn
+0.29.0, `--reload-dir` alone does not isolate application sources; development
+reload requires absolute runtime directory exclusions, with those directories
+already present when Uvicorn starts. Use the command above for uninterrupted
+operation.
 
 Available endpoints after startup:
 
