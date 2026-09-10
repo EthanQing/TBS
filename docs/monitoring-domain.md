@@ -8,7 +8,7 @@ engine because current alarm rules only evaluate persisted Training Runs.
 
 - `alarms/catalog.py` owns the two fixed rule types and their validation:
   `training_run_failed` and `training_run_stale`.
-- `alarms/service.py` owns default seeding, rule administration, alert queries,
+- `alarms/service.py` owns rule administration, alert queries,
   acknowledgement metadata, and the active-alert summary. Acknowledgement does
   not resolve an alert.
 - `alarms/training.py` reads the persisted `TrainingRun` model, evaluates the
@@ -18,9 +18,17 @@ engine because current alarm rules only evaluate persisted Training Runs.
   A missing Training Run does not match, so an existing active alert resolves.
 
 Without explicit run IDs, manual evaluation targets both active training-alert
-source IDs and all `RUNNING` or `FAILED` Training Runs. Default rules are seeded
-at database startup; evaluation also ensures them so the explicit manual
-capability remains usable when invoked independently.
+source IDs and all `RUNNING` or `FAILED` Training Runs. Evaluation only uses
+currently persisted, enabled rules. The catalog defines supported types and
+creation defaults, not required database rows. Rules are user-managed with at
+most one row per type; an empty rule table is valid. Neither database startup
+nor evaluation creates missing rules or resets existing configuration.
+
+Deleting a rule resolves its active alerts by `rule_id` in the same transaction
+as the deletion. Alert history and acknowledgement metadata remain intact;
+the rule foreign key becomes null. Restoring a deleted rule requires an
+explicit create request, which starts a new rule lifecycle. Evaluation does
+not attempt to repair pre-existing orphan alerts.
 
 Alarm evaluation is an integration concern. The queue worker invokes the
 Monitoring capability after execution start, terminal finalization, and stale

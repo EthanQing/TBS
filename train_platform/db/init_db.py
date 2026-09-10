@@ -20,7 +20,6 @@ def init_db() -> None:
     _ensure_v3_schema_ready()
     with SessionLocal() as db:
         _seed_architectures(db)
-        _seed_alarm_rules(db)
 
 
 def _ensure_v3_schema_ready() -> None:
@@ -73,12 +72,3 @@ def _seed_architectures(db: Session) -> None:
         )
     else:
         logger.info("Model architectures already seeded; no new rows added.")
-
-
-def _seed_alarm_rules(db: Session) -> None:
-    try:
-        from train_platform.domains.monitoring.alarms.service import ensure_default_rules
-
-        ensure_default_rules(db)
-    except Exception as e:
-        logger.warning("Failed to seed alarm rules: %s", e)

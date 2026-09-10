@@ -13,6 +13,7 @@ from .catalog import (
     ALLOWED_SEVERITIES,
     RULE_CATALOG,
     STATUS_ACTIVE,
+    STATUS_RESOLVED,
     validate_cooldown,
     validate_rule_type,
     validate_severity,
@@ -22,28 +23,6 @@ from .catalog import (
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def ensure_default_rules(db: Session) -> None:
-    existing = {str(row[0]) for row in db.query(AlarmRule.rule_type).all()}
-    defaults = []
-    for rule_type, meta in RULE_CATALOG.items():
-        if rule_type in existing:
-            continue
-        defaults.append(
-            AlarmRule(
-                rule_type=rule_type,
-                name=str(meta["name"]),
-                description=str(meta["description"]),
-                severity=str(meta["default_severity"]),
-                enabled=bool(meta["default_enabled"]),
-                cooldown_seconds=int(meta["default_cooldown_seconds"]),
-                config={},
-            )
-        )
-    if defaults:
-        db.add_all(defaults)
-        db.commit()
 
 
 def list_rules(
@@ -123,6 +102,16 @@ def update_rule(db: Session, rule_id: int, *, patch: dict[str, Any]) -> AlarmRul
 
 def delete_rule(db: Session, rule_id: int) -> None:
     row = get_rule(db, int(rule_id))
+    resolved_at = _utcnow()
+    active_alerts = (
+        db.query(AlarmAlert)
+        .filter(AlarmAlert.rule_id == int(row.rule_id))
+        .filter(AlarmAlert.status == STATUS_ACTIVE)
+        .all()
+    )
+    for alert in active_alerts:
+        alert.status = STATUS_RESOLVED
+        alert.resolved_at = resolved_at
     db.delete(row)
     db.commit()
 

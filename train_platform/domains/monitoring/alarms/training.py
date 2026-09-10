@@ -16,9 +16,9 @@ from .catalog import (
     RULE_TYPE_TRAINING_STALE,
     SOURCE_TRAINING_RUN,
     STATUS_ACTIVE,
+    STATUS_RESOLVED,
     resolve_stale_after_seconds,
 )
-from .service import ensure_default_rules
 
 
 logger = logging.getLogger(__name__)
@@ -149,7 +149,6 @@ def evaluate_training_alerts(
     *,
     run_ids: Optional[Iterable[str]] = None,
 ) -> dict[str, Any]:
-    ensure_default_rules(db)
     rules = (
         db.query(AlarmRule)
         .filter(AlarmRule.enabled == True)  # noqa: E712
