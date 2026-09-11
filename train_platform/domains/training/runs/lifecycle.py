@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 
@@ -82,7 +83,13 @@ def queue_run(db: Session, run_id: str) -> TrainingRun:
     return run
 
 
-def resume_run(db: Session, run_id: str, *, has_resume_checkpoint: bool) -> TrainingRun:
+def resume_run(
+    db: Session,
+    run_id: str,
+    *,
+    has_resume_checkpoint: bool,
+    resume_checkpoint: Path | None = None,
+) -> TrainingRun:
     run = _load_run(db, run_id, for_update=True)
     if run.status == TrainingRunStatus.COMPLETED:
         raise ConflictError("Run is COMPLETED and cannot be resumed; create a new training run instead")
@@ -102,11 +109,11 @@ def resume_run(db: Session, run_id: str, *, has_resume_checkpoint: bool) -> Trai
         run.current_epoch = 0
         run.progress = 0
     _queue_locked(run, now=_utcnow())
-    resume_message = (
-        "Run resume requested using weights/last.pt"
-        if has_resume_checkpoint
-        else "No weights/last.pt found; queued run to restart with saved parameters"
-    )
+    if has_resume_checkpoint:
+        checkpoint_label = str(resume_checkpoint) if resume_checkpoint is not None else "resolved checkpoint"
+        resume_message = f"Run resume requested using {checkpoint_label}"
+    else:
+        resume_message = "No resume checkpoint found; queued run to restart with saved parameters"
     _event(db, run.run_id, "resumed", resume_message)
     _event(db, run.run_id, "queued", "Run queued")
     db.commit()

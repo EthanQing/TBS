@@ -131,11 +131,45 @@ or Training Run lifecycle modules.
 The PaddleDetection adapter separates three framework-specific capabilities:
 YOLO-to-COCO dataset preparation, Paddle configuration transformation, and
 runtime compatibility patches. Its plugin module retains the readable training
-orchestration and native checkpoint handling. Ultralytics remains a cohesive
-single adapter because its compatibility, argument construction, callbacks,
-and invocation flow are already readable together. Registry membership remains
+orchestration and native checkpoint handling. The Ultralytics adapter owns
+argument construction, callbacks, and invocation; its importable trainer
+subclasses apply execution paths after checkpoint argument restoration and
+before the framework creates output directories, including in DDP children.
+Registry membership remains
 a simple static list of the three supported plugins; there is no dynamic discovery
 or execution framework.
+
+## Ultralytics execution paths
+
+`domains/training/execution_paths.py` owns filesystem layout resolution shared
+by framework execution and the runs domain. `TrainingExecutionSpec.run_dir`
+and `TrainingRunResult.results_dir` continue to identify the task root under
+`settings.training_dir / run_id`.
+
+New Ultralytics executions place platform configuration in
+`runtime/data.runtime.yaml` and `runtime/layout.json`, worker streams in
+`logs/train.stdout.log` and `logs/train.stderr.log`, and all framework output
+in `output/`. The version 1 manifest records engine `ultralytics-yolo` and the
+relative `output_dir`. Execution preparation creates directories and writes
+the manifest atomically; path reads do not create directories. Ultralytics
+DDP cleanup therefore affects `output/` without removing platform runtime
+configuration or open worker logs.
+
+A recorded layout is authoritative for artifact discovery, including weights,
+configuration, CSV, and plots. Unrecorded historical tasks use the original
+root layout. Resume checkpoint discovery alone also checks root-level
+`weights/last.pt` after the effective output directory. The adapter resolves
+the source checkpoint before preparing the current layout. Both same-task
+and cross-task resume retain framework checkpoint state while applying the
+current task's data, project, name, and save directory after framework resume
+argument handling. The source checkpoint is not relocated.
+
+Indexed artifact paths remain relative to `settings.training_dir`, for example
+`run_id/output/weights/best.pt`, and semantic weight roles update the result
+projection. ONNX export writes beside its selected PT source; ONNX downloads
+prefer an indexed export path and otherwise resolve the task layout.
+PaddleDetection retains its native layout, and custom-source retains reported
+semantic artifacts. Deletion removes the whole task root.
 
 ## Custom-source runtime v1
 

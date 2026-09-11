@@ -8,6 +8,7 @@ from io import BytesIO
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.domains.training.execution_paths import read_ultralytics_paths
 from train_platform.models.v3.training_run import TrainingRunArtifact
 from train_platform.platform.runtime import ModelWorkerClient, ModelWorkerError
 from train_platform.utils.exceptions import NotFoundError, ValidationError
@@ -43,10 +44,33 @@ def _normalize_export(format: str | None, weights: str | None) -> tuple[str, str
 
 def _safe_run_path(run_id: str, filename: str) -> Path:
     base = settings.training_dir.resolve()
-    path = (settings.training_dir / str(run_id) / "weights" / filename).resolve(strict=False)
-    if base not in path.parents:
+    run_root = (base / str(run_id)).resolve(strict=False)
+    if base not in run_root.parents:
+        raise ValidationError("Unsafe run path")
+    path = (read_ultralytics_paths(run_root).weights_dir / filename).resolve(strict=False)
+    if run_root not in path.parents:
         raise ValidationError("Unsafe weights path")
     return path
+
+
+def _safe_indexed_artifact_path(run_id: str, stored_path: str) -> Path:
+    base = settings.training_dir.resolve()
+    run_root = (base / str(run_id)).resolve(strict=False)
+    if base not in run_root.parents:
+        raise ValidationError("Unsafe run path")
+    path = (base / str(stored_path)).resolve(strict=False)
+    if run_root not in path.parents:
+        raise ValidationError("Unsafe artifact path")
+    return path
+
+
+def _safe_resolved_run_path(run_id: str, path: Path) -> Path:
+    base = settings.training_dir.resolve()
+    run_root = (base / str(run_id)).resolve(strict=False)
+    resolved = Path(path).resolve(strict=False)
+    if base not in run_root.parents or run_root not in resolved.parents:
+        raise ValidationError("Unsafe export path")
+    return resolved
 
 
 def export_training_run(
@@ -62,14 +86,14 @@ def export_training_run(
     run = TrainingRunService().get_run(db, run_id)
     fmt, weights_key = _normalize_export(format, weights)
     src_weights = _safe_run_path(str(run.run_id), f"{weights_key}.pt")
-    if not src_weights.exists():
+    if not src_weights.is_file():
         raise ValidationError("Weights not found")
 
     if fmt == "pt":
         return TrainingExport(str(run.run_id), fmt, weights_key)
 
     out_name = f"{weights_key}.onnx"
-    out_onnx = _safe_run_path(str(run.run_id), out_name)
+    out_onnx = _safe_resolved_run_path(str(run.run_id), src_weights.with_suffix(".onnx"))
     if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
         try:
             ModelWorkerClient().export_ultralytics_onnx(
@@ -83,30 +107,9 @@ def export_training_run(
             raise ValidationError(f"Failed to reach inference worker: {exc}") from exc
 
         if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
-            newest: Path | None = None
-            run_root = (settings.training_dir / str(run.run_id)).resolve(strict=False)
-            try:
-                candidates = list(out_onnx.parent.glob("*.onnx"))
-                if not candidates:
-                    candidates = list(run_root.rglob("*.onnx"))
-                for candidate in candidates:
-                    if newest is None or candidate.stat().st_mtime > newest.stat().st_mtime:
-                        newest = candidate
-            except Exception:
-                newest = None
-
-            if newest and newest.exists() and newest != out_onnx and newest.stat().st_size > 0:
-                try:
-                    import shutil
-
-                    shutil.copy2(newest, out_onnx)
-                except Exception:
-                    pass
-
-        if not out_onnx.exists() or out_onnx.stat().st_size <= 0:
             raise ValidationError("ONNX export failed: non-empty output file not found")
 
-    relative_path = out_onnx.relative_to(settings.training_dir).as_posix()
+    relative_path = out_onnx.relative_to(settings.training_dir.resolve()).as_posix()
     db.query(TrainingRunArtifact).filter(
         TrainingRunArtifact.run_id == str(run.run_id),
         TrainingRunArtifact.kind == "export",
@@ -140,7 +143,25 @@ def download_export(
     run = TrainingRunService().get_run(db, run_id)
     fmt, weights_key = _normalize_export(format, weights)
     extension = "onnx" if fmt == "onnx" else "pt"
-    path = _safe_run_path(str(run.run_id), f"{weights_key}.{extension}")
+    path: Path
+    if fmt == "onnx":
+        artifact = (
+            db.query(TrainingRunArtifact)
+            .filter(
+                TrainingRunArtifact.run_id == str(run.run_id),
+                TrainingRunArtifact.kind == "export",
+                TrainingRunArtifact.name == f"{weights_key}.onnx",
+            )
+            .order_by(TrainingRunArtifact.artifact_id.desc())
+            .first()
+        )
+        path = (
+            _safe_indexed_artifact_path(str(run.run_id), str(artifact.path))
+            if artifact is not None
+            else _safe_run_path(str(run.run_id), f"{weights_key}.{extension}")
+        )
+    else:
+        path = _safe_run_path(str(run.run_id), f"{weights_key}.{extension}")
     if not path.exists() or not path.is_file():
         raise NotFoundError(f"Export file not found: {path.name}")
     if not include_report:

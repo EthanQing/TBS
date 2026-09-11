@@ -14,6 +14,10 @@ from train_platform.core.config import settings
 from train_platform.platform.runtime.ultralytics import apply_torch_safe_load_patches
 from .contract import TrainingCallbacks, TrainingExecutionSpec
 from train_platform.domains.datasets.yolo import find_yolo_dataset_yaml
+from train_platform.domains.training.execution_paths import (
+    prepare_ultralytics_execution,
+    resolve_ultralytics_resume_checkpoint,
+)
 from train_platform.platform.filesystem.locations import resolve_pretrain_path, resolve_temp_path
 from train_platform.domains.training.parameters import (
     AUTO_BATCH_SIZE,
@@ -219,6 +223,7 @@ class UltralyticsYOLOTrainer:
         model_variant_lower = model_variant.lower()
         is_rtdetr_variant = model_variant_lower.startswith("rtdetr")
         framework_config = dict(spec.framework_config)
+        run_root = Path(spec.run_dir).resolve(strict=False)
 
         resume_training = bool(spec.resume_training)
         resume_job_id = spec.resume_job_id
@@ -240,14 +245,15 @@ class UltralyticsYOLOTrainer:
 
         if resume_training:
             if resume_job_id and str(resume_job_id) != str(spec.run_id):
-                resume_weights_path = settings.training_dir / str(resume_job_id) / "weights" / "last.pt"
-                if not resume_weights_path.exists():
-                    raise ValueError(f"resume weights not found: {resume_weights_path}")
+                source_run_root = settings.training_dir / str(resume_job_id)
+                resume_weights_path = resolve_ultralytics_resume_checkpoint(source_run_root)
+                if resume_weights_path is None:
+                    raise ValueError(f"resume weights not found for run: {resume_job_id}")
                 model_path = str(resume_weights_path)
                 model_load_mode = "resume"
             else:
-                my_weights = spec.run_dir / "weights" / "last.pt"
-                if my_weights.exists():
+                my_weights = resolve_ultralytics_resume_checkpoint(run_root)
+                if my_weights is not None:
                     model_path = str(my_weights)
                     model_load_mode = "resume"
                 else:
@@ -296,6 +302,9 @@ class UltralyticsYOLOTrainer:
         amp_probe_ready = _ensure_amp_check_weight()
         try:
             model = model_loader_cls(model_path)
+            from .ultralytics_trainers import platform_trainer_for
+
+            trainer_class = platform_trainer_for(model._smart_load("trainer"))
 
             try:
                 from ultralytics import settings as ultralytics_settings
@@ -327,25 +336,20 @@ class UltralyticsYOLOTrainer:
             model.add_callback("on_train_epoch_end", on_epoch_end)
             model.add_callback("on_train_batch_end", on_batch_end)
 
-            run_dir = spec.run_dir
-            run_dir.mkdir(parents=True, exist_ok=True)
+            execution_paths = prepare_ultralytics_execution(run_root)
 
             data_yaml = find_yolo_dataset_yaml(spec.dataset_path, dataset_name=spec.dataset_name)
             if data_yaml is None:
                 raise ValueError(f"Dataset YAML not found under: {spec.dataset_path}")
-            run_data_yaml = data_yaml
-            try:
-                with open(data_yaml, "r", encoding="utf-8", errors="replace") as file:
-                    data_cfg = yaml.safe_load(file) or {}
-                if not isinstance(data_cfg, dict):
-                    data_cfg = {}
-                data_cfg.pop("path", None)
-                data_cfg["path"] = str(spec.dataset_path)
-                run_data_yaml = run_dir / "data.runtime.yaml"
-                with open(run_data_yaml, "w", encoding="utf-8") as file:
-                    yaml.safe_dump(data_cfg, file, allow_unicode=True, sort_keys=False)
-            except Exception:
-                run_data_yaml = data_yaml
+            with open(data_yaml, "r", encoding="utf-8", errors="replace") as file:
+                data_cfg = yaml.safe_load(file) or {}
+            if not isinstance(data_cfg, dict):
+                data_cfg = {}
+            data_cfg.pop("path", None)
+            data_cfg["path"] = str(Path(spec.dataset_path).resolve(strict=False))
+            run_data_yaml = execution_paths.data_runtime_yaml
+            with open(run_data_yaml, "w", encoding="utf-8") as file:
+                yaml.safe_dump(data_cfg, file, allow_unicode=True, sort_keys=False)
 
             batch_size = int(spec.batch_size or 16)
             requested_device_value = normalize_device_spec(spec.requested_device or "auto")
@@ -393,13 +397,14 @@ class UltralyticsYOLOTrainer:
             )
 
             train_args: Dict[str, Any] = {
-                "data": str(run_data_yaml),
+                "data": str(run_data_yaml.resolve(strict=False)),
                 "epochs": int(spec.epochs),
                 "batch": batch_size,
                 "imgsz": int(spec.image_size),
                 "workers": int(spec.workers or 8),
-                "project": str(settings.training_dir),
-                "name": spec.run_id,
+                "project": str(run_root),
+                "name": "output",
+                "save_dir": str(execution_paths.output_dir),
                 "device": device_value,
                 "exist_ok": True,
                 "save_period": int(framework_config.get("save_period", -1)),
@@ -462,7 +467,7 @@ class UltralyticsYOLOTrainer:
                 ",".join(sorted(train_args.keys())),
             )
 
-            model.train(**train_args)
+            model.train(trainer=trainer_class, **train_args)
             try:
                 model.val()
             except Exception:

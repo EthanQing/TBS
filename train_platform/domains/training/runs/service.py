@@ -12,6 +12,7 @@ from train_platform.core.license import assert_valid_license
 from train_platform.domains.datasets.storage.paths import resolve_legacy_dataset_path
 from train_platform.domains.model_assets.versions.deletion import delete_model_versions_with_dependents
 from train_platform.domains.training.frameworks import get_plugin
+from train_platform.domains.training.execution_paths import resolve_ultralytics_resume_checkpoint
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.custom_model_package import CustomModelPackage
 from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
@@ -298,8 +299,21 @@ class TrainingRunService:
             raise ConflictError("Run is COMPLETED and cannot be resumed; create a new training run instead")
         if run.status not in (TrainingRunStatus.CANCELLED, TrainingRunStatus.FAILED):
             raise ConflictError(f"Run status is {run.status}; must be CANCELLED or FAILED to resume")
-        weights_path = settings.training_dir / str(run_id) / "weights" / "last.pt"
-        return lifecycle_resume_run(db, run_id, has_resume_checkpoint=weights_path.exists())
+        engine = str(getattr(getattr(run, "architecture", None), "engine", "") or "").strip().lower()
+        run_root = settings.training_dir / str(run_id)
+        checkpoint = (
+            resolve_ultralytics_resume_checkpoint(run_root)
+            if engine == "ultralytics-yolo"
+            else (run_root / "weights" / "last.pt" if (run_root / "weights" / "last.pt").is_file() else None)
+        )
+        return lifecycle_resume_run(
+            db,
+            run_id,
+            has_resume_checkpoint=checkpoint is not None,
+            resume_checkpoint=(
+                checkpoint.relative_to(settings.training_dir.resolve(strict=False)) if checkpoint is not None else None
+            ),
+        )
 
     def request_cancel(self, db: Session, run_id: str, *, reason: str | None = None) -> TrainingRun:
         return lifecycle_request_cancel(db, run_id, reason=reason)

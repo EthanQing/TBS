@@ -7,6 +7,7 @@ from typing import Mapping
 from sqlalchemy.orm import Session
 
 from train_platform.core.config import settings
+from train_platform.domains.training.execution_paths import read_ultralytics_paths
 from train_platform.domains.training.frameworks.contract import (
     TrainingArtifactReport,
     validate_artifact_path,
@@ -156,6 +157,8 @@ def index_completion_artifacts(db: Session, run_id: str) -> None:
 
     base = settings.training_dir
     run_dir = base / str(run_id)
+    run = db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id)).first()
+    engine = str(getattr(getattr(run, "architecture", None), "engine", "") or "").strip().lower()
     existing_artifacts = db.query(TrainingRunArtifact).filter(TrainingRunArtifact.run_id == str(run_id)).all()
     for artifact in existing_artifacts:
         if not isinstance(artifact.meta, Mapping) or artifact.meta.get("source") != "reported":
@@ -163,32 +166,63 @@ def index_completion_artifacts(db: Session, run_id: str) -> None:
     db.flush()
 
     candidates: list[tuple[str, str, Path]] = [
-        ("weights", "best.pt", run_dir / "weights" / "best.pt"),
-        ("weights", "last.pt", run_dir / "weights" / "last.pt"),
-        ("weights", "best.pdparams", run_dir / "weights" / "best.pdparams"),
-        ("weights", "last.pdparams", run_dir / "weights" / "last.pdparams"),
-        ("weights", "best.pdopt", run_dir / "weights" / "best.pdopt"),
-        ("weights", "last.pdopt", run_dir / "weights" / "last.pdopt"),
-        ("export", "best.onnx", run_dir / "weights" / "best.onnx"),
-        ("export", "last.onnx", run_dir / "weights" / "last.onnx"),
-        ("csv", "results.csv", run_dir / "results.csv"),
-        ("config", "args.yaml", run_dir / "args.yaml"),
-        ("config", "results.yaml", run_dir / "results.yaml"),
         ("log", "train.stdout.log", run_dir / "logs" / "train.stdout.log"),
         ("log", "train.stderr.log", run_dir / "logs" / "train.stderr.log"),
     ]
-    for name in (
-        "results.png",
-        "confusion_matrix.png",
-        "confusion_matrix_normalized.png",
-        "PR_curve.png",
-        "P_curve.png",
-        "R_curve.png",
-        "F1_curve.png",
-        "labels.jpg",
-        "labels_correlogram.jpg",
-    ):
-        candidates.append(("plot", name, run_dir / name))
+    if engine == "ultralytics-yolo":
+        execution_paths = read_ultralytics_paths(run_dir)
+        output_dir = execution_paths.output_dir
+        candidates[0] = ("log", "train.stdout.log", execution_paths.stdout_log)
+        candidates[1] = ("log", "train.stderr.log", execution_paths.stderr_log)
+        candidates.extend(
+            [
+                ("weights", "best.pt", output_dir / "weights" / "best.pt"),
+                ("weights", "last.pt", output_dir / "weights" / "last.pt"),
+                ("export", "best.onnx", output_dir / "weights" / "best.onnx"),
+                ("export", "last.onnx", output_dir / "weights" / "last.onnx"),
+                ("csv", "results.csv", output_dir / "results.csv"),
+                ("config", "args.yaml", output_dir / "args.yaml"),
+                ("config", "results.yaml", output_dir / "results.yaml"),
+            ]
+        )
+        for name in (
+            "results.png",
+            "confusion_matrix.png",
+            "confusion_matrix_normalized.png",
+            "PR_curve.png",
+            "P_curve.png",
+            "R_curve.png",
+            "F1_curve.png",
+            "labels.jpg",
+            "labels_correlogram.jpg",
+        ):
+            candidates.append(("plot", name, output_dir / name))
+    elif engine == "paddle-det":
+        candidates.extend(
+            [
+                ("weights", "best.pdparams", run_dir / "weights" / "best.pdparams"),
+                ("weights", "last.pdparams", run_dir / "weights" / "last.pdparams"),
+                ("weights", "best.pdopt", run_dir / "weights" / "best.pdopt"),
+                ("weights", "last.pdopt", run_dir / "weights" / "last.pdopt"),
+                ("export", "best.onnx", run_dir / "weights" / "best.onnx"),
+                ("export", "last.onnx", run_dir / "weights" / "last.onnx"),
+                ("csv", "results.csv", run_dir / "results.csv"),
+                ("config", "args.yaml", run_dir / "args.yaml"),
+                ("config", "results.yaml", run_dir / "results.yaml"),
+            ]
+        )
+        for name in (
+            "results.png",
+            "confusion_matrix.png",
+            "confusion_matrix_normalized.png",
+            "PR_curve.png",
+            "P_curve.png",
+            "R_curve.png",
+            "F1_curve.png",
+            "labels.jpg",
+            "labels_correlogram.jpg",
+        ):
+            candidates.append(("plot", name, run_dir / name))
 
     reported_roles = {
         str(artifact.role)
