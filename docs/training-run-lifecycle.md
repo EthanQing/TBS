@@ -62,12 +62,20 @@ observe completion without duplicating events or artifact indexing. Heartbeat
 only updates liveness for an active execution and never revives a terminal run.
 
 Because one run can be resumed into multiple executions, active mutations are
-also bound to the current `TrainingRun.pid`. The training subprocess supplies
-its own process ID, the supervising worker supplies the spawned process ID, and
-stale reconciliation supplies the PID observed on the stale row. A heartbeat,
+also bound to the current `TrainingRun.pid`. The supervising worker supplies the
+spawned process ID. Before setup, the training subprocess waits up to four seconds
+for a `RUNNING` claim with a non-null PID, using a fresh session every 75 ms.
+It accepts that PID only when it is its own interpreter PID or a verified
+ancestor PID (Windows uv/venv launchers). It logs both the actual and guard PIDs
+and uses the resolved claim PID for metrics, reported artifacts, heartbeat, and
+finalization. Missing, timed-out, or unrelated claims fail closed; unresolved
+executions do not finalize the run. The subprocess never rewrites the claim PID.
+Stale reconciliation supplies the PID observed on the stale row. A heartbeat,
 progress callback, or finalization request whose expected PID no longer matches
 the authoritative row is a no-op. This prevents a callback from an older
 execution from changing a resumed execution of the same run.
+Metric and reported-artifact PID rejections are logged with the run and PID
+context; metric persistence failures include an exception traceback.
 
 Stale queued claims are released back to `QUEUED`. A stale `RUNNING` row is
 finalized as `FAILED` through the same lifecycle owner. Stdout, weights, MLflow,

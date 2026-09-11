@@ -4,10 +4,12 @@ import argparse
 import os
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Dict, Mapping
 
+import psutil
 from sqlalchemy.orm import joinedload
 
 from train_platform.core.config import settings
@@ -28,6 +30,7 @@ from train_platform.domains.training.frameworks import (
     get_trainer,
 )
 from train_platform.models.v3.training_run import TrainingRun
+from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.domains.training.integrations.mlflow import (
     get_mlflow_binding,
     initialize_mlflow_logger,
@@ -36,6 +39,64 @@ from train_platform.domains.training.integrations.mlflow import (
 from train_platform.domains.training.parameters import build_device_runtime, parse_visible_host_gpu_ids
 from train_platform.platform.runtime.custom_training import CustomTrainingCancelled
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
+
+
+def _resolve_execution_guard_pid(run: TrainingRun, *, actual_pid: int) -> int:
+    claimed_pid = getattr(run, "pid", None)
+    if claimed_pid is None:
+        raise RuntimeError("Training execution claim does not have a pid")
+
+    claimed_pid = int(claimed_pid)
+    actual_pid = int(actual_pid)
+    if claimed_pid == actual_pid:
+        return claimed_pid
+
+    try:
+        ancestor_pids = {
+            int(parent.pid) for parent in psutil.Process(actual_pid).parents()
+        }
+    except Exception:
+        ancestor_pids = set()
+
+    if claimed_pid in ancestor_pids:
+        return claimed_pid
+
+    raise RuntimeError(
+        "Training execution ownership mismatch: "
+        f"claimed_pid={claimed_pid} actual_pid={actual_pid}"
+    )
+
+
+def _wait_for_execution_guard_pid(
+    run_id: str,
+    *,
+    actual_pid: int,
+    timeout_sec: float = 4.0,
+    poll_interval_sec: float = 0.075,
+) -> int:
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        claim_db = SessionLocal()
+        try:
+            run = claim_db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id)).first()
+            if run is None:
+                raise RuntimeError(f"Training execution claim not found: run_id={run_id}")
+            if run.status == TrainingRunStatus.RUNNING and run.pid is not None:
+                return _resolve_execution_guard_pid(run, actual_pid=actual_pid)
+            if run.status not in {TrainingRunStatus.QUEUED, TrainingRunStatus.RUNNING}:
+                raise RuntimeError(
+                    "Training execution claim is not active: "
+                    f"run_id={run_id} status={run.status}"
+                )
+        finally:
+            claim_db.close()
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Timed out waiting for training execution claim: "
+                f"run_id={run_id} actual_pid={actual_pid}"
+            )
+        time.sleep(max(0.0, float(poll_interval_sec)))
 
 
 def _coerce_bool(value: object, default: bool) -> bool:
@@ -221,9 +282,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)
     run_id = str(args.run_id)
-    execution_pid = os.getpid()
+    actual_pid = os.getpid()
+    execution_guard_pid: int | None = None
 
-    db = SessionLocal()
+    db = None
     mlflow_logger = None
     mlflow_status = None
     exit_code = 1
@@ -232,6 +294,17 @@ def main(argv: list[str] | None = None) -> int:
     heartbeat_thread: threading.Thread | None = None
     vdl_bridge: VisualDLScalarBridge | None = None
     try:
+        execution_guard_pid = _wait_for_execution_guard_pid(run_id, actual_pid=actual_pid)
+        print(
+            "[train_entry] execution ownership "
+            f"run_id={run_id} "
+            f"actual_pid={actual_pid} "
+            f"guard_pid={execution_guard_pid} "
+            f"launcher_bridge={str(actual_pid != execution_guard_pid).lower()}",
+            flush=True,
+        )
+
+        db = SessionLocal()
         run = (
             db.query(TrainingRun)
             .options(joinedload(TrainingRun.parameters))
@@ -318,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
             db.rollback()
 
         def upsert_epoch_metrics(epoch: int, metrics: Dict[str, float]) -> None:
-            persist_epoch_metrics(run_id, epoch, metrics, expected_pid=execution_pid)
+            persist_epoch_metrics(run_id, epoch, metrics, expected_pid=execution_guard_pid)
             if mlflow_logger:
                 mlflow_logger.log_metrics(metrics, step=int(epoch))
 
@@ -329,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
                     artifact_db,
                     run_id,
                     report,
-                    expected_pid=execution_pid,
+                    expected_pid=execution_guard_pid,
                 )
             except Exception:
                 artifact_db.rollback()
@@ -348,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_thread = threading.Thread(
             target=_heartbeat_loop,
             args=(run_id, heartbeat_stop),
-            kwargs={"expected_pid": execution_pid, "interval_sec": 5.0},
+            kwargs={"expected_pid": execution_guard_pid, "interval_sec": 5.0},
             daemon=True,
         )
         heartbeat_thread.start()
@@ -410,23 +483,25 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat_thread.join(timeout=2.0)
         if vdl_bridge is not None:
             vdl_bridge.stop()
-        try:
-            lifecycle_db = SessionLocal()
+        if execution_guard_pid is not None:
             try:
-                finalize_execution(
-                    lifecycle_db,
-                    run_id,
-                    exit_code=exit_code,
-                    expected_pid=execution_pid,
-                    error_message=error_message,
-                )
-            finally:
-                lifecycle_db.close()
-        except Exception:
-            pass
+                lifecycle_db = SessionLocal()
+                try:
+                    finalize_execution(
+                        lifecycle_db,
+                        run_id,
+                        exit_code=exit_code,
+                        expected_pid=execution_guard_pid,
+                        error_message=error_message,
+                    )
+                finally:
+                    lifecycle_db.close()
+            except Exception:
+                pass
         if mlflow_logger:
             mlflow_logger.terminate(status=mlflow_status or "FAILED")
-        db.close()
+        if db is not None:
+            db.close()
 
 
 if __name__ == "__main__":

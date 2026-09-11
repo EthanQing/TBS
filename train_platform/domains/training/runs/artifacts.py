@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Mapping
 
@@ -20,6 +21,7 @@ from train_platform.models.v3.training_run import (
 
 
 LOSS_METRIC_TERMS: tuple[str, ...] = ("loss", "l1", "dfl")
+logger = logging.getLogger(__name__)
 
 
 def _metric_number(value) -> float | None:
@@ -105,6 +107,13 @@ def register_reported_artifact(
     if not run or run.status != TrainingRunStatus.RUNNING:
         return None
     if expected_pid is not None and (run.pid is None or int(run.pid) != int(expected_pid)):
+        logger.warning(
+            "Training artifact persistence rejected run_id=%s role=%s db_pid=%s expected_pid=%s",
+            run_id,
+            report.role,
+            run.pid,
+            expected_pid,
+        )
         return None
 
     try:

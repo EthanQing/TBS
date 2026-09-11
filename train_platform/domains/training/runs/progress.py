@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Mapping
 
 from train_platform.db.session import SessionLocal
@@ -7,6 +8,9 @@ from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun, TrainingRunEpochMetric
 
 from .lifecycle import touch_heartbeat
+
+
+logger = logging.getLogger(__name__)
 
 
 def _merge_metrics(existing: Mapping | None, incoming: Mapping | None) -> dict:
@@ -42,6 +46,14 @@ def upsert_epoch_metrics(
         if not run or run.status != TrainingRunStatus.RUNNING:
             return
         if expected_pid is not None and (run.pid is None or int(run.pid) != int(expected_pid)):
+            logger.warning(
+                "Training metric persistence rejected run_id=%s epoch=%s db_pid=%s expected_pid=%s status=%s",
+                run_id,
+                epoch,
+                run.pid,
+                expected_pid,
+                run.status,
+            )
             return
 
         row = (
@@ -65,6 +77,11 @@ def upsert_epoch_metrics(
         db.commit()
     except Exception:
         db.rollback()
+        logger.exception(
+            "Failed to persist training metrics run_id=%s epoch=%s",
+            run_id,
+            epoch,
+        )
     finally:
         db.close()
 
