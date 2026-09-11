@@ -36,6 +36,8 @@ def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mod
         checkpoint = source_output / "weights" / "last.pt"
         checkpoint.parent.mkdir(parents=True)
         checkpoint.write_bytes(b"original checkpoint")
+        (source_output / "weights" / "best.pt").write_bytes(b"original best")
+        (source_output / "results.csv").write_text("epoch,time,metric\n1,1,0.1\n2,2,0.2\n", encoding="utf-8")
 
     dataset = tmp_path / "dataset"
     dataset.mkdir()
@@ -47,6 +49,10 @@ def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mod
     class FakeYOLO:
         def __init__(self, model_path):
             calls["model_path"] = model_path
+            self.ckpt = {
+                "epoch": 1,
+                "train_results": {"epoch": [1, 2], "time": [1.0, 2.0], "metric": [0.1, 0.2]},
+            }
 
         def _smart_load(self, key):
             assert key == "trainer"
@@ -56,10 +62,13 @@ def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mod
             pass
 
         def train(self, **kwargs):
+            if resume_mode != "fresh":
+                assert (run_root / "output" / "weights" / "best.pt").read_bytes() == b"original best"
+                assert (run_root / "output" / "results.csv").is_file()
             calls["train_args"] = kwargs
 
-        def val(self):
-            pass
+        def val(self, **kwargs):
+            calls["val_args"] = kwargs
 
     monkeypatch.setattr(ultralytics, "YOLO", FakeYOLO)
     monkeypatch.setattr(ultralytics, "settings", SimpleNamespace(update=lambda values: None))
@@ -92,6 +101,13 @@ def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mod
     assert args["name"] == "output"
     assert args["save_dir"] == str(run_root / "output")
     assert args["exist_ok"] is True
+    assert calls["val_args"] == {
+        "data": str((run_root / "runtime" / "data.runtime.yaml").resolve()),
+        "project": str(run_root.resolve()),
+        "name": "output",
+        "save_dir": str((run_root / "output").resolve()),
+        "exist_ok": True,
+    }
     assert (run_root / "runtime" / "layout.json").is_file()
     assert (run_root / "logs").is_dir()
     assert not (run_root / "output" / "data.runtime.yaml").exists()

@@ -164,6 +164,24 @@ and cross-task resume retain framework checkpoint state while applying the
 current task's data, project, name, and save directory after framework resume
 argument handling. The source checkpoint is not relocated.
 
+When resume switches output directories, the adapter captures the actual
+checkpoint's parent output directory and its `epoch` / `train_results` before
+preparing the current layout. `prepare_ultralytics_resume_output` receives
+these plain values without loading framework objects. It copies source
+`weights/best.pt` only when the current output has no best weight, preserving
+an existing current best on repeated preparation. Source files remain intact;
+checkpoint best fitness, optimizer, and epoch restoration stay framework-owned.
+
+CSV history prefers checkpoint `train_results`, retaining column names and
+order. If unavailable, it reads the captured source output's `results.csv`.
+Checkpoint epochs are zero-based, while CSV epochs are one-based: carried
+records stop at `checkpoint_epoch + 1`. Matching current history is retained
+without duplicate epochs; later records are excluded before training appends
+the next epoch. Carryover is a no-op when source and target output are the
+same. Extra post-training validation explicitly uses the current runtime YAML,
+project, name, and save directory even when the best weight originated in a
+different task.
+
 Indexed artifact paths remain relative to `settings.training_dir`, for example
 `run_id/output/weights/best.pt`, and semantic weight roles update the result
 projection. ONNX export writes beside its selected PT source; ONNX downloads

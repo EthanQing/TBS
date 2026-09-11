@@ -6,7 +6,7 @@ import shutil
 import time
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 import yaml
 
@@ -16,6 +16,7 @@ from .contract import TrainingCallbacks, TrainingExecutionSpec
 from train_platform.domains.datasets.yolo import find_yolo_dataset_yaml
 from train_platform.domains.training.execution_paths import (
     prepare_ultralytics_execution,
+    prepare_ultralytics_resume_output,
     resolve_ultralytics_resume_checkpoint,
 )
 from train_platform.platform.filesystem.locations import resolve_pretrain_path, resolve_temp_path
@@ -242,6 +243,7 @@ class UltralyticsYOLOTrainer:
         resolved_pretrain: Path | None = None
         model_path = ""
         model_load_mode = "yaml"
+        resume_checkpoint_path: Path | None = None
 
         if resume_training:
             if resume_job_id and str(resume_job_id) != str(spec.run_id):
@@ -250,11 +252,13 @@ class UltralyticsYOLOTrainer:
                 if resume_weights_path is None:
                     raise ValueError(f"resume weights not found for run: {resume_job_id}")
                 model_path = str(resume_weights_path)
+                resume_checkpoint_path = resume_weights_path.resolve(strict=False)
                 model_load_mode = "resume"
             else:
                 my_weights = resolve_ultralytics_resume_checkpoint(run_root)
                 if my_weights is not None:
                     model_path = str(my_weights)
+                    resume_checkpoint_path = my_weights.resolve(strict=False)
                     model_load_mode = "resume"
                 else:
                     resume_training = False
@@ -302,6 +306,21 @@ class UltralyticsYOLOTrainer:
         amp_probe_ready = _ensure_amp_check_weight()
         try:
             model = model_loader_cls(model_path)
+            resume_source_output: Path | None = None
+            resume_checkpoint_epoch: int | None = None
+            resume_train_results: Mapping[str, object] | None = None
+            if resume_checkpoint_path is not None:
+                resume_source_output = resume_checkpoint_path.parent.parent
+                checkpoint = getattr(model, "ckpt", None)
+                if not isinstance(checkpoint, dict):
+                    raise ValueError("resume checkpoint metadata is unavailable")
+                checkpoint_epoch = checkpoint.get("epoch")
+                if isinstance(checkpoint_epoch, bool) or not isinstance(checkpoint_epoch, int) or checkpoint_epoch < 0:
+                    raise ValueError("resume checkpoint epoch must be a non-negative integer")
+                resume_checkpoint_epoch = checkpoint_epoch
+                checkpoint_results = checkpoint.get("train_results")
+                if isinstance(checkpoint_results, Mapping):
+                    resume_train_results = checkpoint_results
             from .ultralytics_trainers import platform_trainer_for
 
             trainer_class = platform_trainer_for(model._smart_load("trainer"))
@@ -337,6 +356,13 @@ class UltralyticsYOLOTrainer:
             model.add_callback("on_train_batch_end", on_batch_end)
 
             execution_paths = prepare_ultralytics_execution(run_root)
+            if resume_source_output is not None and resume_checkpoint_epoch is not None:
+                prepare_ultralytics_resume_output(
+                    resume_source_output,
+                    execution_paths.output_dir,
+                    checkpoint_epoch=resume_checkpoint_epoch,
+                    train_results=resume_train_results,
+                )
 
             data_yaml = find_yolo_dataset_yaml(spec.dataset_path, dataset_name=spec.dataset_name)
             if data_yaml is None:
@@ -469,7 +495,13 @@ class UltralyticsYOLOTrainer:
 
             model.train(trainer=trainer_class, **train_args)
             try:
-                model.val()
+                model.val(
+                    data=str(run_data_yaml.resolve(strict=False)),
+                    project=str(run_root),
+                    name="output",
+                    save_dir=str(execution_paths.output_dir),
+                    exist_ok=True,
+                )
             except Exception:
                 pass
         finally:
