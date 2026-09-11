@@ -16,7 +16,7 @@ class _ExecutionPathsMixin:
     def check_resume(self, overrides: dict[str, Any]) -> None:
         current_paths = {
             key: overrides[key]
-            for key in ("data", "project", "name", "exist_ok", "save_dir")
+            for key in ("data", "project", "name", "exist_ok", "save_dir", "amp")
             if key in overrides
         }
         super().check_resume(overrides)

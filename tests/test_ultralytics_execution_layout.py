@@ -1,5 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
+import json
+import weakref
 
 import pytest
 import yaml
@@ -10,17 +12,18 @@ from train_platform.domains.training.frameworks.contract import TrainingCallback
 
 
 @pytest.mark.parametrize(
-    "resume_mode,recorded,device",
+    "resume_mode,recorded,device,visible",
     [
-        ("fresh", False, "0"),
-        ("fresh", False, "0,1"),
-        ("same", False, "cpu"),
-        ("same", True, "cpu"),
-        ("cross", False, "cpu"),
-        ("cross", True, "0,1"),
+        ("fresh", False, "0", "0"),
+        ("fresh", False, "0,1", "0,1"),
+        ("fresh", False, "0,1", "2,5"),
+        ("same", False, "cpu", ""),
+        ("same", True, "cpu", ""),
+        ("cross", False, "cpu", ""),
+        ("cross", True, "0,1", "2,5"),
     ],
 )
-def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mode, recorded, device):
+def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mode, recorded, device, visible):
     import torch
     import ultralytics
     from ultralytics.models.yolo.detect import DetectionTrainer
@@ -45,9 +48,12 @@ def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mod
     source_yaml.write_text("path: old-dataset\ntrain: images/train\nval: images/val\nnames: [object]\n", encoding="utf-8")
     original_yaml = source_yaml.read_bytes()
     calls = {}
+    models = []
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
 
     class FakeYOLO:
         def __init__(self, model_path):
+            models.append(weakref.ref(self))
             calls["model_path"] = model_path
             self.ckpt = {
                 "epoch": 1,
@@ -78,11 +84,21 @@ def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mod
     monkeypatch.setattr(ultralytics_yolo, "_patch_ultralytics_dataloader_pin_memory", lambda value: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    if "," in device:
+        from train_platform.platform.runtime import ultralytics_ddp
+
+        def fake_ddp(context, **kwargs):
+            assert all(model() is None for model in models)
+            assert json.loads(json.dumps(context)) == context
+            calls["ddp_context"] = context
+
+        monkeypatch.setattr(ultralytics_ddp, "run_ultralytics_ddp", fake_ddp)
     spec = TrainingExecutionSpec(
         run_id="current", dataset_path=dataset, dataset_name="dataset", run_dir=run_root,
         engine="ultralytics-yolo", family="YOLOv8", variant="yolov8n", epochs=10,
         batch_size=2, image_size=64, learning_rate=0.001, lr_scheduler="cosine", patience=5,
-        requested_device=device, runtime_device=device, workers=1, optimizer="SGD",
+        requested_device="2,5" if "," in device else device,
+        runtime_device=device, workers=1, optimizer="SGD",
         use_pretrained=False, resume_training=resume_mode != "fresh",
         resume_job_id="source" if resume_mode == "cross" else None,
     )
@@ -93,21 +109,31 @@ def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mod
 
     ultralytics_yolo.UltralyticsYOLOTrainer().run(spec, callbacks)
 
-    args = calls["train_args"]
-    assert args["trainer"] is PlatformDetectionTrainer
+    if "," in device:
+        args = calls["ddp_context"]["train_args"]
+        assert calls["ddp_context"]["world_size"] == 2
+        assert calls["ddp_context"]["cuda_visible_devices"] == visible
+        assert args["device"] == visible
+        assert args["batch"] == 2
+        assert "train_args" not in calls
+        assert "val_args" not in calls
+    else:
+        args = calls["train_args"]
+        assert args["trainer"] is PlatformDetectionTrainer
     assert Path(args["data"]) == run_root / "runtime" / "data.runtime.yaml"
     assert Path(args["data"]).is_absolute()
     assert args["project"] == str(run_root)
     assert args["name"] == "output"
     assert args["save_dir"] == str(run_root / "output")
     assert args["exist_ok"] is True
-    assert calls["val_args"] == {
-        "data": str((run_root / "runtime" / "data.runtime.yaml").resolve()),
-        "project": str(run_root.resolve()),
-        "name": "output",
-        "save_dir": str((run_root / "output").resolve()),
-        "exist_ok": True,
-    }
+    if "," not in device:
+        assert calls["val_args"] == {
+            "data": str((run_root / "runtime" / "data.runtime.yaml").resolve()),
+            "project": str(run_root.resolve()),
+            "name": "output",
+            "save_dir": str((run_root / "output").resolve()),
+            "exist_ok": True,
+        }
     assert (run_root / "runtime" / "layout.json").is_file()
     assert (run_root / "logs").is_dir()
     assert not (run_root / "output" / "data.runtime.yaml").exists()
@@ -121,3 +147,56 @@ def test_adapter_keeps_current_execution_paths(tmp_path, monkeypatch, resume_mod
         assert checkpoint.read_bytes() == b"original checkpoint"
     else:
         assert "resume" not in args
+
+
+@pytest.mark.parametrize("failure", [None, "preparation", "distributed"])
+def test_temporary_pretrained_weight_lives_until_ddp_finishes(tmp_path, monkeypatch, failure):
+    import torch
+    import ultralytics
+    from train_platform.platform.runtime import ultralytics_ddp
+
+    temporary = tmp_path / "uploads"
+    temporary.mkdir()
+    weight = temporary / "ddp-test-upload.pt"
+    weight.write_bytes(b"weight")
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "data.yaml").write_text("train: images/train\nval: images/val\nnames: [object]\n")
+    monkeypatch.setattr(ultralytics_yolo, "settings", SimpleNamespace(temp_dir=temporary))
+    monkeypatch.setattr(ultralytics_yolo, "resolve_temp_path", lambda token: weight)
+    monkeypatch.setattr(ultralytics_yolo, "apply_torch_safe_load_patches", lambda: None)
+    monkeypatch.setattr(ultralytics_yolo, "_ensure_amp_check_weight", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+
+    def load(path):
+        assert Path(path) == weight
+        if failure == "preparation":
+            raise ValueError("preparation failed")
+        return SimpleNamespace()
+
+    def execute(context, **kwargs):
+        assert Path(context["model_path"]).read_bytes() == b"weight"
+        if failure == "distributed":
+            raise ValueError("distributed failed")
+
+    monkeypatch.setattr(ultralytics, "YOLO", load)
+    monkeypatch.setattr(ultralytics_ddp, "run_ultralytics_ddp", execute)
+    spec = TrainingExecutionSpec(
+        run_id="run", dataset_path=dataset, dataset_name="dataset", run_dir=tmp_path / "run",
+        engine="ultralytics-yolo", family="yolo", variant="yolov8n", epochs=1,
+        batch_size=2, image_size=64, learning_rate=0.001, lr_scheduler="cosine", patience=1,
+        requested_device="0,1", runtime_device="0,1", workers=1, optimizer="SGD",
+        use_pretrained=True, pretrained_model_path="ddp-test-upload.pt",
+    )
+    callbacks = TrainingCallbacks(
+        cancel_requested=lambda: False, upsert_epoch_metrics=lambda *args: None,
+        report_artifact=lambda *args: None,
+    )
+    if failure:
+        with pytest.raises(ValueError, match=failure):
+            ultralytics_yolo.UltralyticsYOLOTrainer().run(spec, callbacks)
+    else:
+        ultralytics_yolo.UltralyticsYOLOTrainer().run(spec, callbacks)
+    assert not weight.exists()

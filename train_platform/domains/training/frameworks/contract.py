@@ -127,9 +127,10 @@ class TrainingExecutionSpec:
     warmup_bias_lr: float | None = None
     framework_config: Mapping[str, Any] = field(default_factory=dict)
     custom_source: CustomSourceExecutionSpec | None = None
+    execution_owner: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for field_name in ("augmentation", "loss_weights", "framework_config"):
+        for field_name in ("augmentation", "loss_weights", "framework_config", "execution_owner"):
             value = getattr(self, field_name)
             if isinstance(value, MappingProxyType):
                 continue

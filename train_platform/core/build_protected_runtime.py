@@ -14,6 +14,7 @@ DEFAULT_PROTECTED_FILES = (
     "train_platform/workers/model_conversion_queue.py",
     "train_platform/workers/inference_job_task.py",
     "train_platform/workers/training/train_entry_impl.py",
+    "train_platform/workers/training/ultralytics_ddp_entry_impl.py",
     "train_platform/workers/training/vdl_bridge.py",
 )
 

@@ -189,14 +189,73 @@ prefer an indexed export path and otherwise resolve the task layout.
 PaddleDetection retains its native layout, and custom-source retains reported
 semantic artifacts. Deletion removes the whole task root.
 
+## Platform-managed Ultralytics multi-GPU execution
+
+Explicit selection of multiple GPUs uses one queue claim and one `RunningJob`:
+`DbQueueWorker -> train_entry -> torch.distributed.run -> Rank processes`.
+`TrainingRun.pid` remains the existing train_entry execution guard PID.
+`TrainingExecutionSpec.execution_owner` carries that PID, its process creation
+time, and worker ID; it contains no database objects. Single-GPU and CPU
+executions continue training and extra validation inside train_entry.
+
+The adapter prepares the layout, runtime dataset YAML, resume best weight and
+CSV carryover once. `PreparedUltralyticsExecution` contains only serializable
+paths, model type (`yolo` or `rtdetr`), arguments, settings, and ownership.
+The CPU model used during preparation is released before launching Rank
+processes. Temporary pretrained weights remain available through the entire
+supervised execution. Fresh CSV initialization happens before Rank startup;
+checkpoint state restoration remains owned by the native Trainer. Platform
+Trainer subclasses reapply current execution paths and AMP after check_resume.
+
+`platform/runtime/ultralytics_ddp.py` owns per-attempt control files under
+`runtime/ddp/<attempt_id>/`: `context.json`, `metrics.jsonl`, and `processes/`.
+It launches the dedicated `workers/training/ultralytics_ddp_entry` module using
+the current Python executable, a unique c10d rendezvous ID, an automatically
+assigned local port, and zero restarts. Stdout and stderr inherit train_entry's
+worker log streams. The lightweight entry remains Python source; its
+implementation module is included in protected runtime builds.
+
+All Ranks inherit the same final container `CUDA_VISIBLE_DEVICES` mask and bind
+their local GPU using `LOCAL_RANK`. Ultralytics receives that frozen mask as
+`device`, because select_device writes it back into the environment. Rank code
+does not repeat host-to-container mapping. The total batch is passed unchanged;
+the framework divides it by world size. Each Rank applies safe loading,
+pin-memory and AMP settings, disables built-in MLflow, and uses the existing
+Platform Trainer selection. Distributed final_eval stays inside the Trainer;
+the parent does not invoke train or val in this branch.
+
+Shared callbacks mark a pending zero-based epoch at on_train_epoch_start and
+consume it at on_fit_epoch_end. Metrics combine validation results, labelled
+training losses, and `trainer.lr`. final_eval has no pending training epoch,
+so it does not replace the last epoch's metrics. Only Rank 0 appends flushed
+JSONL events. The supervisor incrementally reads complete lines, checks the
+run/attempt identity, retains partial tails, and forwards metrics to the
+existing PID-guarded database and MLflow callback. Exit status, rather than
+events, CSV, or logs, determines execution success.
+
+Launcher, Rank, and observed descendant registrations contain PID, creation
+time, Linux process group, and execution identity. The supervisor also retains
+observed process handles in memory so registration failure cannot prevent
+cleanup. Cancellation first terminates the launcher with a bounded grace,
+then terminates and kills remaining matching processes. Signal handling and
+callback errors enter the same cleanup path; tail events are drained before
+returning. User cancellation raises `UltralyticsDDPCancelled`; nonzero launcher
+exit or an external termination signal raises `UltralyticsDDPError`.
+The Worker grants 15 seconds for cooperative multi-GPU cancellation before its
+outer fallback. On supervisor exit it checks matching registrations even when
+the root process is already gone, and does not finish Worker cleanup while
+registered processes remain alive. Old execution identities are excluded.
+
+
 ## Custom-source runtime v1
 
 Custom model manifests currently support only the `pytorch-default` runtime
 profile, so the existing `ultralytics-yolo` PyTorch worker also claims
 `custom-source` runs without changing either engine identity. The worker gives
 custom-source cancellation to the inner runtime first and uses a longer hard
-fallback only if the supervising `train_entry` process does not exit. Existing
-built-in engines retain immediate outer-worker termination.
+fallback only if the supervising `train_entry` process does not exit. Built-in
+engines other than platform-managed Ultralytics multi-GPU retain immediate
+outer-worker termination.
 
 The custom-source adapter verifies the immutable package from the
 `TrainingRun.custom_model_package_id` and

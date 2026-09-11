@@ -22,10 +22,16 @@ from train_platform.domains.monitoring.alarms.training import evaluate_training_
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.training_run import TrainingRun
-from train_platform.domains.training.parameters import parse_visible_host_gpu_ids, worker_can_run_device
+from train_platform.domains.training.parameters import (
+    extract_selected_gpu_ids,
+    parse_visible_host_gpu_ids,
+    worker_can_run_device,
+)
+from train_platform.platform.runtime.ultralytics_ddp import UltralyticsDDPError, terminate_registered_processes
 
 
 CUSTOM_CANCEL_FALLBACK_SECONDS = 10.0
+ULTRALYTICS_DDP_CANCEL_FALLBACK_SECONDS = 15.0
 
 
 def _utcnow() -> datetime:
@@ -132,6 +138,8 @@ class RunningJob:
     stdout_f: TextIO
     stderr_f: TextIO
     cancel_seen_at: Optional[datetime] = None
+    guard_create_time: float = 0.0
+    ultralytics_ddp: bool = False
 
 
 class DbQueueWorker:
@@ -179,10 +187,12 @@ class DbQueueWorker:
 
         db = SessionLocal()
         should_cleanup = False
+        registered_cleanup_done = False
         try:
             run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
             if not run:
                 _terminate_process_tree(self._running.proc)
+                self._cleanup_registered_ddp()
                 should_cleanup = True
                 return
 
@@ -199,19 +209,27 @@ class DbQueueWorker:
 
             cancel_requested = bool(run.cancel_requested_at is not None or run.delete_requested_at is not None)
             if cancel_requested and self._running.proc.poll() is None:
-                if self._running.engine == "custom-source":
+                if self._running.engine == "custom-source" or self._running.ultralytics_ddp:
+                    grace_seconds = (
+                        ULTRALYTICS_DDP_CANCEL_FALLBACK_SECONDS
+                        if self._running.ultralytics_ddp
+                        else CUSTOM_CANCEL_FALLBACK_SECONDS
+                    )
                     if self._running.cancel_seen_at is None:
                         self._running.cancel_seen_at = now
-                    elif (
-                        now - self._running.cancel_seen_at
-                    ).total_seconds() >= CUSTOM_CANCEL_FALLBACK_SECONDS:
+                    elif (now - self._running.cancel_seen_at).total_seconds() >= grace_seconds:
                         _terminate_process_tree(self._running.proc)
+                        self._cleanup_registered_ddp()
+                        registered_cleanup_done = True
                 else:
                     _terminate_process_tree(self._running.proc)
 
             rc = self._running.proc.poll()
             if rc is None:
                 return
+
+            if not registered_cleanup_done:
+                self._cleanup_registered_ddp()
 
             result = finalize_execution(
                 db,
@@ -243,6 +261,23 @@ class DbQueueWorker:
             pass
         self._running = None
         self._last_heartbeat_at = None
+
+    def _cleanup_registered_ddp(self) -> None:
+        if self._running is None or not self._running.ultralytics_ddp:
+            return
+        survivors = terminate_registered_processes(
+            settings.training_dir / self._running.run_id,
+            run_id=self._running.run_id,
+            owner={
+                "guard_pid": int(self._running.proc.pid),
+                "guard_create_time": float(self._running.guard_create_time),
+                "worker_id": self.worker_id,
+            },
+            grace_seconds=2.0,
+        )
+        if survivors:
+            pids = ",".join(str(process.pid) for process in survivors)
+            raise UltralyticsDDPError(f"Registered training processes are still alive: run_id={self._running.run_id} pids={pids}")
 
     def _try_start_next_run(self) -> None:
         db = SessionLocal()
@@ -291,6 +326,7 @@ class DbQueueWorker:
             proc = _spawn_training_subprocess(run.run_id, stdout_f=stdout_f, stderr_f=stderr_f)
 
             try:
+                guard_create_time = float(psutil.Process(proc.pid).create_time())
                 started = mark_started(
                     db,
                     run.run_id,
@@ -313,6 +349,11 @@ class DbQueueWorker:
                 stderr_path=stderr_path,
                 stdout_f=stdout_f,
                 stderr_f=stderr_f,
+                guard_create_time=guard_create_time,
+                ultralytics_ddp=(
+                    str(getattr(run.architecture, "engine", "") or "").strip().lower() == "ultralytics-yolo"
+                    and len(extract_selected_gpu_ids(getattr(run.parameters, "device", "auto"))) > 1
+                ),
             )
             self._last_heartbeat_at = now
 

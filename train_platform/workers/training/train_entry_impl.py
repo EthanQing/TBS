@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, Mapping
 
@@ -38,6 +39,7 @@ from train_platform.domains.training.integrations.mlflow import (
 )
 from train_platform.domains.training.parameters import build_device_runtime, parse_visible_host_gpu_ids
 from train_platform.platform.runtime.custom_training import CustomTrainingCancelled
+from train_platform.platform.runtime.ultralytics_ddp import UltralyticsDDPCancelled
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
 
@@ -373,6 +375,15 @@ def main(argv: list[str] | None = None) -> int:
             runtime_device=runtime_device,
             trainer=trainer,
         )
+        guard_process = psutil.Process(execution_guard_pid)
+        spec = replace(
+            spec,
+            execution_owner={
+                "guard_pid": int(execution_guard_pid),
+                "guard_create_time": float(guard_process.create_time()),
+                "worker_id": str(getattr(run, "worker_id", "") or ""),
+            },
+        )
 
         try:
             existing_binding = get_mlflow_binding(db, run_id)
@@ -448,11 +459,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[train_entry] completed run_id={run_id}", flush=True)
         exit_code = 0
         return exit_code
-    except CustomTrainingCancelled:
+    except (CustomTrainingCancelled, UltralyticsDDPCancelled):
         mlflow_status = "KILLED"
         error_message = None
         exit_code = 0
-        print(f"[train_entry] custom training cancellation observed run_id={run_id}", file=sys.stderr, flush=True)
+        print(f"[train_entry] training cancellation observed run_id={run_id}", file=sys.stderr, flush=True)
         return exit_code
     except KeyboardInterrupt:
         mlflow_status = "KILLED"

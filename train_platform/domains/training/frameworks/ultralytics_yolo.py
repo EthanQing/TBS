@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import shutil
 import time
+from contextlib import ExitStack
+from dataclasses import asdict, dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Mapping
@@ -157,30 +160,78 @@ def _ensure_amp_check_weight() -> bool:
 
 
 def _collect_metrics(trainer: Any) -> Dict[str, float]:
-    out: Dict[str, Any] = {}
-    if hasattr(trainer, "metrics") and isinstance(trainer.metrics, dict):
-        out.update(trainer.metrics)
-    lrs = getattr(trainer, "lrs", [])
-    if isinstance(lrs, (list, tuple)):
-        if len(lrs) > 0:
-            out["lr/pg0"] = lrs[0]
-        if len(lrs) > 1:
-            out["lr/pg1"] = lrs[1]
-        if len(lrs) > 2:
-            out["lr/pg2"] = lrs[2]
-
-    cleaned: Dict[str, float] = {}
-    for k, v in out.items():
+    values: Dict[str, Any] = {}
+    if isinstance(getattr(trainer, "metrics", None), dict):
+        values.update(trainer.metrics)
+    if getattr(trainer, "tloss", None) is not None and callable(getattr(trainer, "label_loss_items", None)):
+        losses = trainer.label_loss_items(trainer.tloss, prefix="train")
+        if isinstance(losses, Mapping):
+            values.update(losses)
+    lr = getattr(trainer, "lr", None)
+    if isinstance(lr, Mapping):
+        values.update(lr)
+    elif isinstance(getattr(trainer, "lrs", None), (list, tuple)):
+        values.update({f"lr/pg{i}": v for i, v in enumerate(trainer.lrs)})
+    result = {}
+    for key, value in values.items():
         try:
-            cleaned[str(k)] = float(v)
-        except Exception:
-            continue
-    return cleaned
+            result[str(key)] = float(value)
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def _register_epoch_callbacks(model: Any, emit: Any, *, collect: Any = _collect_metrics) -> None:
+    pending: dict[str, int | None] = {"epoch": None}
+
+    def started(trainer: Any) -> None:
+        pending["epoch"] = int(trainer.epoch)
+
+    def finished(trainer: Any) -> None:
+        # final_eval fires on_fit_epoch_end without starting a training epoch.
+        epoch = pending["epoch"]
+        if epoch is None:
+            return
+        pending["epoch"] = None
+        metrics = collect(trainer)
+        if metrics:
+            emit(epoch, metrics)
+
+    model.add_callback("on_train_epoch_start", started)
+    model.add_callback("on_fit_epoch_end", finished)
+
+
+def _cleanup_pretrained_file(path: Path) -> None:
+    try:
+        if settings.temp_dir.resolve() in path.resolve().parents:
+            path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not remove temporary pretrained weight %s", path, exc_info=True)
+
+
+@dataclass(frozen=True)
+class PreparedUltralyticsExecution:
+    run_id: str
+    run_root: str
+    runtime_dir: str
+    output_dir: str
+    model_type: str
+    model_path: str
+    requested_device: str
+    runtime_device: str
+    cuda_visible_devices: str
+    world_size: int
+    pin_memory: bool
+    amp: bool
+    train_args: dict[str, Any]
+    execution_owner: dict[str, Any]
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 class UltralyticsYOLOTrainer:
-    plugin_id = "ultralytics-yolo"
-    name = "ultralytics-yolo"
+    plugin_id = name = "ultralytics-yolo"
     display_name = "Ultralytics YOLO"
     implemented = True
 
@@ -210,307 +261,232 @@ class UltralyticsYOLOTrainer:
     def normalize_config(self, raw: Dict[str, Any] | None) -> Dict[str, Any]:
         return dict(raw or {})
 
-    def run(self, spec: TrainingExecutionSpec, callbacks: TrainingCallbacks) -> None:
-        try:
-            import torch
-        except Exception as exc:  # pragma: no cover
-            raise RuntimeError("PyTorch not installed") from exc
-        try:
-            from ultralytics import YOLO
-        except Exception as exc:  # pragma: no cover
-            raise RuntimeError("Ultralytics not installed") from exc
-
-        model_variant = (str(spec.variant or "") or "yolov8n").strip()
-        model_variant_lower = model_variant.lower()
-        is_rtdetr_variant = model_variant_lower.startswith("rtdetr")
-        framework_config = dict(spec.framework_config)
+    def _prepare(self, spec: TrainingExecutionSpec, cleanup: ExitStack) -> PreparedUltralyticsExecution:
+        import torch
+        from ultralytics import RTDETR, YOLO
+        variant = (str(spec.variant or "") or "yolov8n").strip()
+        model_type = "rtdetr" if variant.lower().startswith("rtdetr") else "yolo"
+        loader = RTDETR if model_type == "rtdetr" else YOLO
         run_root = Path(spec.run_dir).resolve(strict=False)
-
-        resume_training = bool(spec.resume_training)
-        resume_job_id = spec.resume_job_id
-        use_pretrained = bool(spec.use_pretrained)
-        pretrained_model_path = spec.pretrained_model_path
-
-        model_loader_cls = YOLO
-        if is_rtdetr_variant:
-            try:
-                from ultralytics import RTDETR
-            except Exception as exc:  # pragma: no cover
-                raise RuntimeError("Ultralytics RT-DETR runtime not available") from exc
-            model_loader_cls = RTDETR
-
-        cleanup_candidate: Path | None = None
+        resume = bool(spec.resume_training)
+        checkpoint_path = None
         resolved_pretrain: Path | None = None
         model_path = ""
-        model_load_mode = "yaml"
-        resume_checkpoint_path: Path | None = None
-
-        if resume_training:
-            if resume_job_id and str(resume_job_id) != str(spec.run_id):
-                source_run_root = settings.training_dir / str(resume_job_id)
-                resume_weights_path = resolve_ultralytics_resume_checkpoint(source_run_root)
-                if resume_weights_path is None:
-                    raise ValueError(f"resume weights not found for run: {resume_job_id}")
-                model_path = str(resume_weights_path)
-                resume_checkpoint_path = resume_weights_path.resolve(strict=False)
-                model_load_mode = "resume"
-            else:
-                my_weights = resolve_ultralytics_resume_checkpoint(run_root)
-                if my_weights is not None:
-                    model_path = str(my_weights)
-                    resume_checkpoint_path = my_weights.resolve(strict=False)
-                    model_load_mode = "resume"
-                else:
-                    resume_training = False
-
-        if not model_path and use_pretrained:
-            if pretrained_model_path:
-                direct = Path(str(pretrained_model_path))
+        if resume:
+            source_root = run_root
+            if spec.resume_job_id and str(spec.resume_job_id) != str(spec.run_id):
+                source_root = settings.training_dir / str(spec.resume_job_id)
+            checkpoint_path = resolve_ultralytics_resume_checkpoint(source_root)
+            if checkpoint_path is None and source_root != run_root:
+                raise ValueError(f"resume weights not found for run: {spec.resume_job_id}")
+            resume = checkpoint_path is not None
+            if checkpoint_path:
+                model_path = str(checkpoint_path.resolve())
+        if not model_path and spec.use_pretrained:
+            if spec.pretrained_model_path:
+                direct = Path(spec.pretrained_model_path)
                 if direct.exists():
                     resolved_pretrain = direct
                 else:
-                    candidate = resolve_temp_path(str(pretrained_model_path))
-                    if candidate.exists():
-                        resolved_pretrain = candidate
-                        if settings.temp_dir.resolve() in candidate.resolve().parents:
-                            cleanup_candidate = candidate
+                    temporary = resolve_temp_path(spec.pretrained_model_path)
+                    if temporary.exists():
+                        resolved_pretrain = temporary
+                        cleanup.callback(_cleanup_pretrained_file, temporary)
                     else:
-                        candidate = resolve_pretrain_path(str(pretrained_model_path))
+                        candidate = resolve_pretrain_path(spec.pretrained_model_path)
                         if candidate.exists():
                             resolved_pretrain = candidate
-
                 if resolved_pretrain is None:
-                    raise ValueError(f"pretrained weights not found: {pretrained_model_path}")
-
-                model_path = str(resolved_pretrain)
-                model_load_mode = "pt"
+                    raise ValueError(f"pretrained weights not found: {spec.pretrained_model_path}")
+                model_path = str(resolved_pretrain.resolve())
             else:
-                official = resolve_pretrain_path(f"{model_variant}.pt")
-                model_path = str(official) if official.exists() else f"{model_variant}.pt"
-                model_load_mode = "pt"
+                official = resolve_pretrain_path(f"{variant}.pt")
+                model_path = str(official.resolve()) if official.exists() else f"{variant}.pt"
         if not model_path:
-            model_path = f"{model_variant}.yaml"
-            model_load_mode = "yaml"
+            model_path = f"{variant}.yaml"
 
         logger.info(
-            "Preparing training run_id=%s variant=%s loader=%s mode=%s resume=%s use_pretrained=%s",
-            spec.run_id,
-            model_variant,
-            model_loader_cls.__name__,
-            model_load_mode,
-            resume_training,
-            use_pretrained,
+            "Preparing Ultralytics run_id=%s model_type=%s model_path=%s resume=%s",
+            spec.run_id, model_type, model_path, resume,
         )
-
         apply_torch_safe_load_patches()
-        amp_probe_ready = _ensure_amp_check_weight()
-        try:
-            model = model_loader_cls(model_path)
-            resume_source_output: Path | None = None
-            resume_checkpoint_epoch: int | None = None
-            resume_train_results: Mapping[str, object] | None = None
-            if resume_checkpoint_path is not None:
-                resume_source_output = resume_checkpoint_path.parent.parent
-                checkpoint = getattr(model, "ckpt", None)
-                if not isinstance(checkpoint, dict):
-                    raise ValueError("resume checkpoint metadata is unavailable")
-                checkpoint_epoch = checkpoint.get("epoch")
-                if isinstance(checkpoint_epoch, bool) or not isinstance(checkpoint_epoch, int) or checkpoint_epoch < 0:
-                    raise ValueError("resume checkpoint epoch must be a non-negative integer")
-                resume_checkpoint_epoch = checkpoint_epoch
-                checkpoint_results = checkpoint.get("train_results")
-                if isinstance(checkpoint_results, Mapping):
-                    resume_train_results = checkpoint_results
+        amp_probe = _ensure_amp_check_weight()
+        metadata_model = loader(model_path)
+        epoch = None
+        train_results = None
+        checkpoint = None
+        if checkpoint_path:
+            checkpoint = getattr(metadata_model, "ckpt", None)
+            if (
+                not isinstance(checkpoint, dict)
+                or isinstance(checkpoint.get("epoch"), bool)
+                or not isinstance(checkpoint.get("epoch"), int)
+                or checkpoint["epoch"] < 0
+            ):
+                raise ValueError("resume checkpoint metadata is unavailable or invalid")
+            epoch = int(checkpoint["epoch"])
+            raw_results = checkpoint.get("train_results")
+            if isinstance(raw_results, Mapping):
+                train_results = {str(k): list(v) if isinstance(v, (list, tuple)) else v for k, v in raw_results.items()}
+        loaded_path = getattr(metadata_model, "ckpt_path", None)
+        if loaded_path and Path(str(loaded_path)).exists():
+            model_path = str(Path(str(loaded_path)).resolve())
+        module = getattr(metadata_model, "model", None)
+        if callable(getattr(module, "cpu", None)):
+            module.cpu()
+
+        paths = prepare_ultralytics_execution(run_root)
+        if checkpoint_path and epoch is not None:
+            prepare_ultralytics_resume_output(
+                checkpoint_path.parent.parent,
+                paths.output_dir,
+                checkpoint_epoch=epoch,
+                train_results=train_results,
+            )
+        else:
+            # Each Rank's BaseTrainer checks this file; initialize old history once.
+            (paths.output_dir / "results.csv").unlink(missing_ok=True)
+        data_yaml = find_yolo_dataset_yaml(spec.dataset_path, dataset_name=spec.dataset_name)
+        if data_yaml is None:
+            raise ValueError(f"Dataset YAML not found under: {spec.dataset_path}")
+        with data_yaml.open("r", encoding="utf-8", errors="replace") as file:
+            data = yaml.safe_load(file) or {}
+        if not isinstance(data, dict):
+            data = {}
+        data.pop("path", None)
+        data["path"] = str(Path(spec.dataset_path).resolve(strict=False))
+        paths.data_runtime_yaml.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+        requested = normalize_device_spec(spec.requested_device or "auto")
+        runtime = normalize_device_spec(spec.runtime_device or requested)
+        gpu_ids = extract_selected_gpu_ids(runtime)
+        world_size = len(gpu_ids)
+        if gpu_ids and not torch.cuda.is_available():
+            raise RuntimeError(f"GPU device(s) requested ({requested}) but CUDA is not available")
+        if gpu_ids and any(index >= torch.cuda.device_count() for index in gpu_ids):
+            raise RuntimeError(f"Requested local devices {runtime} but only {torch.cuda.device_count()} are visible")
+        batch = int(spec.batch_size or 16)
+        if world_size > 1 and batch == AUTO_BATCH_SIZE:
+            raise RuntimeError("Ultralytics auto batch is not supported for multi-GPU training")
+        if world_size > 1 and batch > 0 and batch % world_size:
+            raise RuntimeError(f"batch_size ({batch}) must be divisible by GPU count ({world_size})")
+        visible = os.getenv("CUDA_VISIBLE_DEVICES", runtime if gpu_ids else "")
+        if world_size > 1:
+            if len(extract_selected_gpu_ids(visible)) != world_size:
+                raise ValueError("Frozen CUDA_VISIBLE_DEVICES does not match the assigned GPU count")
+            os.environ["CUDA_VISIBLE_DEVICES"] = visible
+        logger.info(
+            "Ultralytics devices run_id=%s requested_device=%s CUDA_VISIBLE_DEVICES=%s runtime_device=%s",
+            spec.run_id, requested, visible, runtime,
+        )
+        pin_memory = _coerce_bool_config(spec.framework_config.get("pin_memory"), os.name != "nt")
+        amp = _coerce_bool_config(spec.framework_config.get("amp", True), True)
+        if amp and not amp_probe:
+            amp = False
+            logger.warning("AMP probe unavailable; disabling AMP for run_id=%s", spec.run_id)
+        logger.info("Ultralytics settings run_id=%s pin_memory=%s amp=%s", spec.run_id, pin_memory, amp)
+        args: Dict[str, Any] = {
+            "data": str(paths.data_runtime_yaml.resolve()),
+            "epochs": int(spec.epochs),
+            "batch": batch,
+            "imgsz": int(spec.image_size),
+            "workers": int(spec.workers or 8),
+            "project": str(run_root),
+            "name": "output",
+            "save_dir": str(paths.output_dir),
+            "device": visible if world_size > 1 else runtime,
+            "exist_ok": True,
+            "save_period": int(spec.framework_config.get("save_period", -1)),
+            "amp": amp,
+            "lr0": float(spec.learning_rate),
+            **_lr_scheduler_to_ultralytics_args(spec.lr_scheduler),
+            "optimizer": str(spec.optimizer or "auto"),
+            "patience": int(spec.patience or 50),
+            "weight_decay": float(spec.weight_decay if spec.weight_decay is not None else 0.0005),
+        }
+        if model_type == "yolo":
+            args.update(
+                momentum=float(spec.momentum if spec.momentum is not None else 0.937),
+                warmup_epochs=float(spec.warmup_epochs if spec.warmup_epochs is not None else 3.0),
+                warmup_momentum=float(spec.warmup_momentum if spec.warmup_momentum is not None else 0.8),
+                warmup_bias_lr=float(spec.warmup_bias_lr if spec.warmup_bias_lr is not None else 0.1),
+            )
+        for source, allowed in (
+            (spec.augmentation, ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY),
+            (spec.loss_weights, ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY),
+        ):
+            for key, value in source.items():
+                key = str(key or "").strip()
+                if key in allowed:
+                    args[key] = value
+        if resume:
+            args["resume"] = True
+        elif resolved_pretrain is not None:
+            args["pretrained"] = str(resolved_pretrain.resolve())
+        else:
+            args["pretrained"] = bool(spec.use_pretrained)
+        prepared = PreparedUltralyticsExecution(
+            run_id=str(spec.run_id),
+            run_root=str(run_root),
+            runtime_dir=str(paths.runtime_dir),
+            output_dir=str(paths.output_dir),
+            model_type=model_type,
+            model_path=model_path,
+            requested_device=requested,
+            runtime_device=runtime,
+            cuda_visible_devices=str(visible),
+            world_size=world_size,
+            pin_memory=pin_memory,
+            amp=amp,
+            train_args=args,
+            execution_owner=dict(spec.execution_owner),
+        )
+        del metadata_model, module, checkpoint
+        gc.collect()
+        return prepared
+
+    def run(self, spec: TrainingExecutionSpec, callbacks: TrainingCallbacks) -> None:
+        with ExitStack() as cleanup:
+            prepared = self._prepare(spec, cleanup)
+            if prepared.world_size > 1:
+                from train_platform.platform.runtime.ultralytics_ddp import run_ultralytics_ddp
+
+                run_ultralytics_ddp(
+                    prepared.to_json(),
+                    cancel_requested=callbacks.cancel_requested,
+                    upsert_epoch_metrics=callbacks.upsert_epoch_metrics,
+                )
+                return
+
+            from ultralytics import RTDETR, YOLO, settings as ultralytics_settings
             from .ultralytics_trainers import platform_trainer_for
 
-            trainer_class = platform_trainer_for(model._smart_load("trainer"))
+            ultralytics_settings.update({"mlflow": False})
+            _patch_ultralytics_dataloader_pin_memory(prepared.pin_memory)
+            model = (RTDETR if prepared.model_type == "rtdetr" else YOLO)(prepared.model_path)
+            _register_epoch_callbacks(model, callbacks.upsert_epoch_metrics)
+            last_check = 0.0
 
-            try:
-                from ultralytics import settings as ultralytics_settings
-                ultralytics_settings.update({"mlflow": False})
-            except Exception:
-                pass
+            def cancel_on_batch(_trainer: Any) -> None:
+                nonlocal last_check
+                now = time.monotonic()
+                if now - last_check >= 2.0:
+                    last_check = now
+                    if callbacks.cancel_requested():
+                        raise SystemExit(0)
 
-            last_cancel_check = {"t": 0.0}
-
-            def should_cancel() -> bool:
-                now = time.time()
-                if now - last_cancel_check["t"] < 2.0:
-                    return False
-                last_cancel_check["t"] = now
-                return bool(callbacks.cancel_requested())
-
-            def on_epoch_end(trainer):
-                epoch = int(getattr(trainer, "epoch", 0))
-                metrics = _collect_metrics(trainer)
-                if metrics:
-                    callbacks.upsert_epoch_metrics(epoch, metrics)
-                if should_cancel():
-                    raise SystemExit(0)
-
-            def on_batch_end(_trainer):
-                if should_cancel():
-                    raise SystemExit(0)
-
-            model.add_callback("on_train_epoch_end", on_epoch_end)
-            model.add_callback("on_train_batch_end", on_batch_end)
-
-            execution_paths = prepare_ultralytics_execution(run_root)
-            if resume_source_output is not None and resume_checkpoint_epoch is not None:
-                prepare_ultralytics_resume_output(
-                    resume_source_output,
-                    execution_paths.output_dir,
-                    checkpoint_epoch=resume_checkpoint_epoch,
-                    train_results=resume_train_results,
-                )
-
-            data_yaml = find_yolo_dataset_yaml(spec.dataset_path, dataset_name=spec.dataset_name)
-            if data_yaml is None:
-                raise ValueError(f"Dataset YAML not found under: {spec.dataset_path}")
-            with open(data_yaml, "r", encoding="utf-8", errors="replace") as file:
-                data_cfg = yaml.safe_load(file) or {}
-            if not isinstance(data_cfg, dict):
-                data_cfg = {}
-            data_cfg.pop("path", None)
-            data_cfg["path"] = str(Path(spec.dataset_path).resolve(strict=False))
-            run_data_yaml = execution_paths.data_runtime_yaml
-            with open(run_data_yaml, "w", encoding="utf-8") as file:
-                yaml.safe_dump(data_cfg, file, allow_unicode=True, sort_keys=False)
-
-            batch_size = int(spec.batch_size or 16)
-            requested_device_value = normalize_device_spec(spec.requested_device or "auto")
-            device_value = normalize_device_spec(spec.runtime_device or requested_device_value)
-            selected_gpu_ids = extract_selected_gpu_ids(device_value)
-            multi_gpu = len(selected_gpu_ids) > 1
-
-            logger.info(
-                "Resolved Ultralytics device run_id=%s requested=%s runtime=%s visible=%s",
-                spec.run_id,
-                requested_device_value,
-                device_value,
-                os.getenv("CUDA_VISIBLE_DEVICES", "<inherit>"),
-            )
-
-            if selected_gpu_ids:
-                if not torch.cuda.is_available():
-                    raise RuntimeError(
-                        f"GPU device(s) requested ({requested_device_value}) but CUDA is not available on this worker"
-                    )
-                available_gpu_count = int(torch.cuda.device_count())
-                missing_gpu_ids = [idx for idx in selected_gpu_ids if idx >= available_gpu_count]
-                if missing_gpu_ids:
-                    raise RuntimeError(
-                        f"Requested GPU device(s) {requested_device_value} but this training process only has "
-                        f"{available_gpu_count} visible CUDA device(s) after runtime binding"
-                    )
-
-            if multi_gpu and batch_size == AUTO_BATCH_SIZE:
-                raise RuntimeError("Ultralytics auto batch (batch_size=-1) is not supported for multi-GPU training")
-            if multi_gpu and batch_size > 0 and batch_size % len(selected_gpu_ids) != 0:
-                raise RuntimeError(
-                    f"Ultralytics multi-GPU batch_size ({batch_size}) must be divisible by the "
-                    f"selected GPU count ({len(selected_gpu_ids)})"
-                )
-
-            pin_memory_default = os.name != "nt"
-            pin_memory_enabled = _coerce_bool_config(framework_config.get("pin_memory"), pin_memory_default)
-            _patch_ultralytics_dataloader_pin_memory(pin_memory_enabled)
-            logger.info(
-                "Ultralytics dataloader pin_memory=%s run_id=%s default=%s",
-                pin_memory_enabled,
-                spec.run_id,
-                pin_memory_default,
-            )
-
-            train_args: Dict[str, Any] = {
-                "data": str(run_data_yaml.resolve(strict=False)),
-                "epochs": int(spec.epochs),
-                "batch": batch_size,
-                "imgsz": int(spec.image_size),
-                "workers": int(spec.workers or 8),
-                "project": str(run_root),
-                "name": "output",
-                "save_dir": str(execution_paths.output_dir),
-                "device": device_value,
-                "exist_ok": True,
-                "save_period": int(framework_config.get("save_period", -1)),
-                "amp": _coerce_bool_config(framework_config.get("amp", True), True),
-            }
-
-            if train_args["amp"] and not amp_probe_ready:
-                train_args["amp"] = False
-                logger.warning(
-                    "AMP probe weights are not available; disable AMP for run_id=%s to avoid check_amp failure",
-                    spec.run_id,
-                )
-
-            if is_rtdetr_variant:
-                train_args.update(
-                    {
-                        "lr0": float(spec.learning_rate),
-                        **_lr_scheduler_to_ultralytics_args(spec.lr_scheduler),
-                        "optimizer": str(spec.optimizer or "auto"),
-                        "patience": int(spec.patience or 50),
-                        "weight_decay": float(spec.weight_decay if spec.weight_decay is not None else 0.0005),
-                    }
-                )
-            else:
-                train_args.update(
-                    {
-                        "lr0": float(spec.learning_rate),
-                        **_lr_scheduler_to_ultralytics_args(spec.lr_scheduler),
-                        "optimizer": str(spec.optimizer or "auto"),
-                        "patience": int(spec.patience or 50),
-                        "momentum": float(spec.momentum if spec.momentum is not None else 0.937),
-                        "weight_decay": float(spec.weight_decay if spec.weight_decay is not None else 0.0005),
-                        "warmup_epochs": float(spec.warmup_epochs if spec.warmup_epochs is not None else 3.0),
-                        "warmup_momentum": float(spec.warmup_momentum if spec.warmup_momentum is not None else 0.8),
-                        "warmup_bias_lr": float(spec.warmup_bias_lr if spec.warmup_bias_lr is not None else 0.1),
-                    }
-                )
-
-            for key, value in spec.augmentation.items():
-                key_s = str(key or "").strip()
-                if key_s in ULTRALYTICS_AUGMENTATION_SPEC_BY_KEY:
-                    train_args[key_s] = value
-
-            for key, value in spec.loss_weights.items():
-                key_s = str(key or "").strip()
-                if key_s in ULTRALYTICS_LOSS_WEIGHT_SPEC_BY_KEY:
-                    train_args[key_s] = value
-
-            if resume_training:
-                train_args["resume"] = True
-            elif resolved_pretrain is not None:
-                train_args["pretrained"] = str(resolved_pretrain)
-            else:
-                train_args["pretrained"] = bool(use_pretrained)
-
-            logger.info(
-                "Training args prepared run_id=%s variant=%s keys=%s",
-                spec.run_id,
-                model_variant,
-                ",".join(sorted(train_args.keys())),
-            )
-
-            model.train(trainer=trainer_class, **train_args)
+            model.add_callback("on_train_batch_end", cancel_on_batch)
+            model.train(trainer=platform_trainer_for(model._smart_load("trainer")), **prepared.train_args)
             try:
                 model.val(
-                    data=str(run_data_yaml.resolve(strict=False)),
-                    project=str(run_root),
+                    data=prepared.train_args["data"],
+                    project=prepared.run_root,
                     name="output",
-                    save_dir=str(execution_paths.output_dir),
+                    save_dir=prepared.output_dir,
                     exist_ok=True,
                 )
             except Exception:
                 pass
-        finally:
-            if cleanup_candidate is not None:
-                try:
-                    if cleanup_candidate.exists() and settings.temp_dir.resolve() in cleanup_candidate.resolve().parents:
-                        cleanup_candidate.unlink()
-                except Exception:
-                    pass
 
 
-__all__ = ["UltralyticsYOLOTrainer"]
+__all__ = ["PreparedUltralyticsExecution", "UltralyticsYOLOTrainer"]
