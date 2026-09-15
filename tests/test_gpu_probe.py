@@ -79,6 +79,16 @@ def test_mig_parent_is_single_device(monkeypatch):
     assert result.devices[0].mig_mode == "enabled"
 
 
+@pytest.mark.parametrize("raw", ["N/A", "[N/A]", b"Not Supported", "not_supported"])
+def test_mig_not_supported_is_interpreted_before_generic_text_cleanup(raw):
+    assert probe._mig_mode(raw) == "not_supported"
+
+
+@pytest.mark.parametrize("raw", [None, "permission denied", b"\xff"])
+def test_mig_probe_failures_remain_unknown(raw):
+    assert probe._mig_mode(raw) == "unknown"
+
+
 def test_smi_fallback_parses_units_and_unknowns(monkeypatch):
     monkeypatch.setattr(probe, "pynvml", None)
     monkeypatch.setattr(probe.shutil, "which", lambda _: "nvidia-smi")

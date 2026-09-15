@@ -43,6 +43,11 @@ incomplete. Failed diagnostic entries are excluded from monitoring counts;
 partial observations can still be displayed without a UUID, but cannot be
 registered as physical resources until a complete UUID is available.
 
+MIG normalization preserves `enabled`, `disabled`, `not_supported`, and
+`unknown`. Explicit NVML unsupported results and successful nvidia-smi MIG
+fields containing N/A or Not Supported mean `not_supported`; missing fields
+and probe failures remain `unknown`. Unknown MIG state does not admit sharing.
+
 `workers/gpu_resource_reporter.py` runs periodic reports independently of task
 execution. Each database transaction has its own Session. Inventory services
 mutate the caller's transaction; they do not claim or finalize Training Runs.
@@ -108,6 +113,15 @@ READ COMMITTED and locking current reads for ledger decisions. Multi-card
 requests reserve all devices together. GPU probing and process launch occur
 outside this transaction.
 
+Managed candidate selection filters Worker engines, queue eligibility, active
+allocations and explicit node affinity before selecting a row. Workers retain
+a `(queued_at, created_at, run_id)` cursor across ticks, attempt at most 50
+candidates per scheduling pass, and wrap after reaching the end. Each failed
+attempt commits its wait reason and releases its locks before the next attempt.
+The candidate query does not lock the queue; allocation revalidates the selected
+run under its ordinary resource locks. Local engine or node incompatibility
+does not establish a global `no_compatible_worker` reason.
+
 `accounting.py` is the shared calculation for admission and resource queries.
 For each fresh whole-card sample, total/used/free are T/U/F, safety is S,
 budgets are B, and reliably attributed usage is M:
@@ -131,8 +145,11 @@ its separate GPU and process queries do not provide an atomic snapshot.
 ## Launch and cleanup ownership
 
 After reservation commits, the Worker issues one-use launch authorization.
-`train_entry` consumes it before CUDA/model initialization and records its PID,
-creation time, scope and allocation UUID. Revoked or expired authorization
+`train_entry` first persists the supervisor registration with the prepared
+execution owner and ordered GPU UUIDs, then atomically consumes authorization
+before CUDA/model initialization. Activation validates that same owner, queue
+state, allocation, cancellation intent, scope and assigned UUID order. A failed
+base registration leaves authorization unconsumed. Revoked or expired authorization
 cannot be consumed by a late child. Each child gets an independent UUID mask;
 runtime devices are local 0..N-1. Saved request/device fields stay unchanged.
 Ultralytics train/validation and DDP Ranks receive local `torch.device` values
@@ -152,6 +169,24 @@ transaction, after full scope-checked cleanup. Child-only cleanup proof cannot
 release the supervisor's allocation. Unknown identities, missing registration
 or surviving processes retain the allocation. Heartbeat expiry alone never
 releases an activated allocation. Directory deletion happens after release.
+
+Registration failures are recorded separately under each execution's
+`registration-errors` directory. Cleanup validates the owner of each failed
+identity, retries recoverable registrations, and retains unresolved gaps while
+cleaning other verified processes. A legacy `registration-error.json` scan gap
+can be resolved only after complete verification of the supervisor's owned
+session and the remaining registrations. The watcher uses the original
+supervisor PID, creation time and process scope; it does not adopt a reused PID.
+
+Recovery uses the committed database execution owner. A live, matching
+supervisor can restore its missing base registration; an exited supervisor
+requires an existing matching durable identity with session evidence. A missing
+registration alone never proves process exit. Worker retries retain the job and
+allocation budget, expose cleanup reasons through resource `reason_details`,
+and deduplicate unchanged cleanup events. Final release clears cleanup waiting
+state in the same transaction as the run's terminal state.
+DDP cleanup failures still allow the common registry recovery to run, but both
+cleanup paths must confirm completion before the allocation can be released.
 
 Metrics, heartbeat and finalization callbacks fence managed executions with
 allocation UUID plus PID and creation time. Recovery retains execution owner

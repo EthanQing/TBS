@@ -10,7 +10,7 @@ from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TaskType, TrainingRunStatus
 from train_platform.models.v3.gpu_allocation import GpuAllocation, GpuCudaBinding
 from train_platform.models.v3.gpu_resource import GpuDevice, GpuWorkerObservation, TrainingRunResourceRequest
-from train_platform.models.v3.training_run import TrainingRun, TrainingRunParameters
+from train_platform.models.v3.training_run import TrainingRun, TrainingRunEvent, TrainingRunParameters
 from train_platform.domains.training.resources import allocator, inventory
 
 
@@ -155,6 +155,70 @@ def test_unchanged_queue_reason_does_not_repeat_events(db):
     assert db.query(TrainingRunEvent).filter_by(run_id="b", event_type="resource_wait").count() == 1
 
 
+def test_scan_cursor_advances_past_more_than_one_page_of_resource_blocked_runs(db):
+    cursor = allocator.AllocationScanCursor()
+    for index in range(51):
+        run = enqueue(db, f"blocked-{index:02d}")
+        run.resource_request.selection = "manual"
+        run.resource_request.gpu_uuids = [f"GPU-missing-{index:02d}"]
+        db.commit()
+    enqueue(db, "runnable")
+
+    decision = None
+    for _ in range(52):
+        decision = allocator.reserve_next(
+            db, "instance", scan_cursor=cursor, scheduler_enabled=True,
+            shared_execution_enabled=True, stale_after_seconds=20,
+            node_defaults={"max_shared_tasks_per_device": 2, "memory_safety_mib": 4096},
+        )
+        db.commit()
+        if decision.allocation:
+            break
+
+    assert decision is not None and decision.allocation is not None
+    assert decision.allocation.run_id == "runnable"
+
+
+def test_candidate_query_excludes_foreign_engines_and_nodes_before_attempt(db, monkeypatch):
+    db.add(ModelArchitecture(architecture_id=2, family="Other", variant="x",
+                             task_type=TaskType.DETECTION, engine="other-engine"))
+    db.commit()
+    for index in range(51):
+        run = enqueue(db, f"engine-{index:02d}")
+        run.architecture_id = 2
+        db.commit()
+    for index in range(51):
+        run = enqueue(db, f"node-{index:02d}")
+        run.resource_request.node_id = "other-node"
+        db.commit()
+    enqueue(db, "query-runnable")
+    original = allocator.allocate_run
+    attempted = []
+    monkeypatch.setattr(allocator, "allocate_run",
+                        lambda session, run_id, worker_id, **kw:
+                        attempted.append(run_id) or original(session, run_id, worker_id, **kw))
+    cursor = allocator.AllocationScanCursor()
+    decision = allocator.reserve_next(
+        db, "instance", scan_cursor=cursor, scheduler_enabled=True,
+        shared_execution_enabled=True, stale_after_seconds=20,
+        node_defaults={"max_shared_tasks_per_device": 2, "memory_safety_mib": 4096})
+    assert decision.allocation and attempted == ["query-runnable"]
+    assert all(db.get(TrainingRun, f"engine-{i:02d}").resource_wait_reason is None for i in range(51))
+    assert all(db.get(TrainingRun, f"node-{i:02d}").resource_wait_reason is None for i in range(51))
+    db.commit()
+    assert allocator.reserve_next(
+        db, "instance", scan_cursor=cursor, scheduler_enabled=True,
+        shared_execution_enabled=True, stale_after_seconds=20,
+        node_defaults={"max_shared_tasks_per_device": 2, "memory_safety_mib": 4096}).reason_code == "scan_exhausted"
+    db.get(TrainingRun, "node-00").resource_request.node_id = "node"
+    db.commit()
+    wrapped = allocator.reserve_next(
+        db, "instance", scan_cursor=cursor, scheduler_enabled=True,
+        shared_execution_enabled=True, stale_after_seconds=20,
+        node_defaults={"max_shared_tasks_per_device": 2, "memory_safety_mib": 4096})
+    assert wrapped.allocation and wrapped.allocation.run_id == "node-00"
+
+
 def test_cancel_unactivated_allocation_revokes_and_preserves_intent(db):
     from train_platform.domains.training.runs.lifecycle import request_cancel
 
@@ -187,22 +251,43 @@ def test_outer_worker_retains_budget_until_cleanup_proof(db, monkeypatch, tmp_pa
     monkeypatch.setattr(worker_impl, "SessionLocal", sessionmaker(bind=db.bind, autoflush=False))
     monkeypatch.setattr(worker_impl, "settings", SimpleNamespace(training_dir=tmp_path))
     complete = False
+    cleanup_calls = 0
 
     def cleanup(*args, **kwargs):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
         with sessionmaker(bind=db.bind)() as check:
             assert check.get(GpuAllocation, allocation_id).state == "releasing"
             assert check.get(TrainingRun, "a").status == TrainingRunStatus.RUNNING
+        errors = [{"id": "new-a", "checked_at": "later", "stage": "descendant_scan",
+                   "error": "scan failed", "target": {"pid": 9, "create_time": 2.0, "process_scope": SCOPE}},
+                  {"id": "new-b", "stage": "descendant_scan", "error": "scan failed",
+                   "target": {"pid": 9, "create_time": 2.0, "process_scope": SCOPE}}]
         return {"complete": complete, "allocation_id": allocation_id,
-                "execution_owner": owner, "process_scope": SCOPE, "supervisor_excluded": False}
+                "execution_owner": owner, "process_scope": SCOPE, "supervisor_excluded": False,
+                "registration_errors": [] if complete else list(reversed(errors))}
 
     monkeypatch.setattr(execution_processes, "cleanup_registered_execution", cleanup)
     worker = worker_impl.DbQueueWorker.__new__(worker_impl.DbQueueWorker)
+    ddp_attempts = 0
+
+    def cleanup_ddp(job):
+        nonlocal ddp_attempts
+        ddp_attempts += 1
+        if ddp_attempts <= 2:
+            raise RuntimeError("DDP registration cleanup failed")
+
+    monkeypatch.setattr(worker, "_cleanup_registered_ddp", cleanup_ddp)
     job = worker_impl.RunningJob(run_id="a", engine="ultralytics-yolo", proc=SimpleNamespace(pid=202),
         stdout_path=tmp_path / "out", stderr_path=tmp_path / "err", stdout_f=StringIO(), stderr_f=StringIO(),
-        allocation_id=allocation_id, worker_instance_id="instance", guard_create_time=123.0)
+        allocation_id=allocation_id, worker_instance_id="instance", guard_create_time=123.0,
+        ultralytics_ddp=True)
+    assert worker._finish_managed_job(job, 1)[0] is False
+    assert cleanup_calls == 1
     assert worker._finish_managed_job(job, 1)[0] is False
     db.expire_all()
     assert db.get(GpuAllocation, allocation_id).active_run_id == "a"
+    assert db.query(TrainingRunEvent).filter_by(run_id="a", event_type="cleanup_pending").count() == 1
     complete = True
     result = worker._finish_managed_job(job, 1)
     assert result[0] is True
@@ -210,3 +295,5 @@ def test_outer_worker_retains_budget_until_cleanup_proof(db, monkeypatch, tmp_pa
     db.expire_all()
     assert db.get(GpuAllocation, allocation_id).active_run_id is None
     assert db.get(TrainingRun, "a").current_allocation_id is None
+    assert db.get(TrainingRun, "a").resource_wait_reason is None
+    assert db.get(TrainingRun, "a").resource_wait_details is None

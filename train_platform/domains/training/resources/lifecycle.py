@@ -10,6 +10,7 @@ from train_platform.models.v3.gpu_allocation import GpuAllocation
 from train_platform.models.v3.gpu_allocation import GpuAllocationDevice, GpuNodeSchedulingState
 from train_platform.models.v3.gpu_resource import GpuDevice, GpuWorkerInstance
 from train_platform.models.v3.training_run import TrainingRun
+from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.platform.runtime.process_scope import compare_process_scope
 
 
@@ -47,16 +48,34 @@ def issue_start_authorization(db: Session, allocation_id: str, launcher_identity
     return allocation
 
 
+def prepare_execution_owner(
+    *, allocation_id: str, worker_instance_id: str, worker_id: str,
+    process_scope: dict, supervisor_pid: int, supervisor_create_time: float,
+) -> dict[str, Any]:
+    return {
+        "allocation_id": allocation_id,
+        "worker_instance_id": worker_instance_id,
+        "worker_id": worker_id,
+        "process_scope": dict(process_scope),
+        "guard_pid": int(supervisor_pid),
+        "guard_create_time": float(supervisor_create_time),
+    }
+
+
 def activate_allocation(
     db: Session, allocation_id: str, *, run_id: str, worker_instance_id: str,
     process_scope: dict, supervisor_pid: int, supervisor_create_time: float,
-    assigned_gpu_uuids: list[str], now: datetime | None = None,
+    assigned_gpu_uuids: list[str], execution_owner: dict[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     instant = _now(now)
     allocation = _locked(db, allocation_id)
     run = db.query(TrainingRun).filter_by(run_id=run_id).with_for_update().one()
     if allocation.run_id != run_id or allocation.worker_instance_id != worker_instance_id:
         raise ValueError("allocation execution identity mismatch")
+    if (run.current_allocation_id != allocation_id or run.status != TrainingRunStatus.QUEUED
+            or run.hidden):
+        raise ValueError("training run is not eligible for activation")
     if allocation.authorization_state != "issued" or allocation.state not in {"reserved", "starting"}:
         raise ValueError("start authorization is not active")
     if instant > _aware(allocation.launch_deadline_at):
@@ -70,14 +89,13 @@ def activate_allocation(
     expected = [item.gpu_uuid for item in sorted(allocation.devices, key=lambda item: item.ordinal)]
     if assigned_gpu_uuids != expected:
         raise ValueError("assigned GPU UUIDs do not match allocation")
-    owner = {
-        "allocation_id": allocation_id,
-        "worker_instance_id": worker_instance_id,
-        "worker_id": allocation.worker_id,
-        "process_scope": process_scope,
-        "guard_pid": int(supervisor_pid),
-        "guard_create_time": float(supervisor_create_time),
-    }
+    owner = prepare_execution_owner(
+        allocation_id=allocation_id, worker_instance_id=worker_instance_id,
+        worker_id=allocation.worker_id, process_scope=process_scope,
+        supervisor_pid=supervisor_pid, supervisor_create_time=supervisor_create_time,
+    )
+    if execution_owner is not None and execution_owner != owner:
+        raise ValueError("prepared execution owner does not match allocation")
     allocation.execution_owner = owner
     allocation.authorization_state = "consumed"
     allocation.state = "running"
@@ -166,4 +184,7 @@ def finish_allocation(
     run = result.run
     if run.current_allocation_id == allocation_id:
         run.current_allocation_id = None
+    if run.resource_wait_reason == "cleanup_pending":
+        run.resource_wait_reason = None
+        run.resource_wait_details = None
     return allocation

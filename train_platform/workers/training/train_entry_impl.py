@@ -379,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     process_watch_stop = None
     process_watch_thread = None
     managed_owner = None
+    prepared_owner = None
     assigned_gpu_uuids: list[str] = []
     reserved_memory_mib: tuple[int, ...] = ()
     allocation_sharing: str | None = None
@@ -416,7 +417,7 @@ def main(argv: list[str] | None = None) -> int:
             if not worker_instance_id:
                 raise RuntimeError("managed execution requires worker instance identity")
             from train_platform.models.v3.gpu_allocation import GpuAllocation
-            from train_platform.domains.training.resources.lifecycle import activate_allocation
+            from train_platform.domains.training.resources.lifecycle import activate_allocation, prepare_execution_owner
             allocation = db.query(GpuAllocation).filter_by(allocation_id=allocation_id).first()
             if allocation is None:
                 raise RuntimeError("GPU allocation not found")
@@ -424,24 +425,34 @@ def main(argv: list[str] | None = None) -> int:
             reserved_memory_mib = tuple(item.reserved_memory_mib for item in sorted(allocation.devices, key=lambda item: item.ordinal))
             allocation_sharing = allocation.request_snapshot.get("sharing")
             guard_process = psutil.Process(actual_pid)
-            activated = activate_allocation(
-                db, allocation_id, run_id=run_id, worker_instance_id=worker_instance_id,
-                process_scope=process_scope.get_process_scope(), supervisor_pid=actual_pid,
-                supervisor_create_time=float(guard_process.create_time()),
-                assigned_gpu_uuids=assigned_gpu_uuids,
+            current_scope = process_scope.get_process_scope()
+            prepared_owner = prepare_execution_owner(
+                allocation_id=allocation_id, worker_instance_id=worker_instance_id,
+                worker_id=allocation.worker_id, process_scope=current_scope,
+                supervisor_pid=actual_pid, supervisor_create_time=float(guard_process.create_time()),
             )
-            managed_owner = activated["execution_owner"]
-            os.environ["TRAIN_PLATFORM_EXECUTION_OWNER_JSON"] = json.dumps(managed_owner, separators=(",", ":"))
-            os.environ["TRAIN_PLATFORM_ASSIGNED_GPU_UUIDS"] = ",".join(assigned_gpu_uuids)
-            db.commit()
             run_dir = settings.training_dir / run_id
-            _write_execution_record(run_dir, run_id, managed_owner)
             from train_platform.platform.runtime.execution_processes import register_execution_process
             register_execution_process(
                 settings.training_dir / run_id, run_id=run_id, allocation_id=allocation_id,
-                execution_owner=managed_owner, pid=actual_pid, role="supervisor",
+                execution_owner=prepared_owner, pid=actual_pid, role="supervisor",
                 assigned_gpu_uuids=assigned_gpu_uuids,
             )
+            try:
+                activated = activate_allocation(
+                    db, allocation_id, run_id=run_id, worker_instance_id=worker_instance_id,
+                    process_scope=current_scope, supervisor_pid=actual_pid,
+                    supervisor_create_time=float(prepared_owner["guard_create_time"]),
+                    assigned_gpu_uuids=assigned_gpu_uuids, execution_owner=prepared_owner,
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            managed_owner = activated["execution_owner"]
+            _write_execution_record(run_dir, run_id, managed_owner)
+            os.environ["TRAIN_PLATFORM_EXECUTION_OWNER_JSON"] = json.dumps(managed_owner, separators=(",", ":"))
+            os.environ["TRAIN_PLATFORM_ASSIGNED_GPU_UUIDS"] = ",".join(assigned_gpu_uuids)
             from train_platform.platform.runtime.execution_processes import start_descendant_registration
             process_watch_stop, process_watch_thread = start_descendant_registration(
                 settings.training_dir / run_id, run_id=run_id, allocation_id=allocation_id,
@@ -661,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
                     settings.training_dir / run_id, run_id=run_id,
                     allocation_id=allocation_id, execution_owner=managed_owner,
                     exclude_supervisor=True, grace_seconds=2.0,
+                    assigned_gpu_uuids=assigned_gpu_uuids,
                 )
                 if not cleanup_proof.get("complete"):
                     pending = settings.training_dir / run_id / "runtime" / "cleanup-pending.json"
@@ -669,6 +681,17 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[train_entry] managed cleanup incomplete allocation_id={allocation_id}", file=sys.stderr, flush=True)
             except Exception as exc:
                 print(f"[train_entry] managed cleanup error allocation_id={allocation_id}: {exc}", file=sys.stderr, flush=True)
+        elif allocation_id and prepared_owner is not None:
+            try:
+                from train_platform.platform.runtime.execution_processes import cleanup_registered_execution
+                cleanup_registered_execution(
+                    settings.training_dir / run_id, run_id=run_id,
+                    allocation_id=allocation_id, execution_owner=prepared_owner,
+                    exclude_supervisor=True, grace_seconds=2.0,
+                    assigned_gpu_uuids=assigned_gpu_uuids,
+                )
+            except Exception as exc:
+                print(f"[train_entry] preactivation cleanup error allocation_id={allocation_id}: {exc}", file=sys.stderr, flush=True)
         if heartbeat_stop is not None:
             heartbeat_stop.set()
         if heartbeat_thread is not None:

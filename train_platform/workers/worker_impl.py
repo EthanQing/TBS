@@ -24,8 +24,8 @@ from train_platform.db.session import SessionLocal
 from train_platform.domains.training.runs import finalize_execution, mark_started, release_stale_claim, touch_heartbeat
 from train_platform.domains.monitoring.alarms.training import evaluate_training_alerts_best_effort
 from train_platform.models.v3.architecture import ModelArchitecture
-from train_platform.models.v3.enums import TrainingRunStatus
-from train_platform.models.v3.training_run import TrainingRun
+from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
+from train_platform.models.v3.training_run import TrainingRun, TrainingRunEvent
 from train_platform.domains.training.parameters import (
     extract_selected_gpu_ids,
     parse_visible_host_gpu_ids,
@@ -269,6 +269,33 @@ class DbQueueWorker:
         self._running_jobs: dict[str, RunningJob] = {}
         self._cleanup_executor = ThreadPoolExecutor(max_workers=max(2, getattr(settings, "worker_max_concurrent_trainings", 2)))
         self._gpu_resource_reporter = None
+        # The cursor survives polling ticks so a temporarily blocked queue head
+        # cannot monopolize every bounded scheduling pass.
+        from train_platform.domains.training.resources.allocator import AllocationScanCursor
+        self._allocation_scan_cursor = AllocationScanCursor()
+
+    def _record_cleanup_pending(self, allocation: Mapping[str, Any], reason: str, error: str) -> None:
+        from train_platform.models.v3.gpu_allocation import GpuAllocation
+        db = SessionLocal()
+        try:
+            run = db.query(TrainingRun).filter_by(run_id=allocation["run_id"]).with_for_update().first()
+            locked = db.query(GpuAllocation).filter_by(
+                allocation_id=allocation["allocation_id"],
+            ).with_for_update().first()
+            owner = allocation.get("owner")
+            if (locked is None or run is None or locked.execution_owner != owner
+                    or run.current_allocation_id != allocation["allocation_id"]):
+                db.rollback()
+                return
+            details = {"cleanup_status": reason, "error": error}
+            if run.resource_wait_reason != "cleanup_pending" or (run.resource_wait_details or {}) != details:
+                run.resource_wait_reason = "cleanup_pending"
+                run.resource_wait_details = details
+                db.add(TrainingRunEvent(run_id=run.run_id, level=LogLevel.INFO,
+                                        event_type="cleanup_pending", message=reason, data=details))
+            db.commit()
+        finally:
+            db.close()
 
     def start_resource_reporter(self) -> None:
         try:
@@ -396,10 +423,14 @@ class DbQueueWorker:
                         write_db.close()
                 continue
             if process_scope.compare_process_scope(owner.get("process_scope"), process_scope.get_process_scope()) != "same":
+                self._record_cleanup_pending(allocation, "process_scope_unconfirmed",
+                                             "execution process scope cannot be confirmed on this worker")
                 continue
             live = _identity_is_live({"pid": owner.get("guard_pid"), "create_time": owner.get("guard_create_time"),
                                       "process_scope": owner.get("process_scope")})
             if live is None:
+                self._record_cleanup_pending(allocation, "process_scope_unconfirmed",
+                                             "supervisor process identity cannot be confirmed")
                 continue
             run_dir = settings.training_dir / allocation["run_id"]
             logs_dir = run_dir / "logs"; logs_dir.mkdir(parents=True, exist_ok=True)
@@ -417,7 +448,19 @@ class DbQueueWorker:
                     gpu_count=allocation["gpu_count"], ultralytics_ddp=allocation["gpu_count"] > 1,
                 )
             if live:
-                from train_platform.platform.runtime.execution_processes import start_descendant_registration
+                from train_platform.platform.runtime.execution_processes import register_execution_process, start_descendant_registration
+                try:
+                    register_execution_process(
+                        settings.training_dir / allocation["run_id"], run_id=allocation["run_id"],
+                        allocation_id=allocation["allocation_id"], execution_owner=owner,
+                        pid=int(owner["guard_pid"]), role="supervisor",
+                        assigned_gpu_uuids=allocation["assigned_gpu_uuids"], expected_identity={
+                            "pid": owner["guard_pid"], "create_time": owner["guard_create_time"],
+                            "process_scope": owner["process_scope"],
+                        },
+                    )
+                except (OSError, RuntimeError, ValueError, psutil.Error) as exc:
+                    self._record_cleanup_pending(allocation, "registration_temporarily_failed", str(exc))
                 job.process_watch_stop, job.process_watch_thread = start_descendant_registration(
                     settings.training_dir / allocation["run_id"], run_id=allocation["run_id"],
                     allocation_id=allocation["allocation_id"], execution_owner=owner,
@@ -559,20 +602,36 @@ class DbQueueWorker:
         from train_platform.domains.training.resources.lifecycle import record_execution_result, request_releasing, finish_allocation
         from train_platform.models.v3.gpu_allocation import GpuAllocation
         from train_platform.platform.runtime.execution_processes import cleanup_registered_execution
+        if job.process_watch_stop is not None:
+            job.process_watch_stop.set()
+        if job.process_watch_thread is not None:
+            job.process_watch_thread.join(timeout=2.0)
+            if job.process_watch_thread.is_alive():
+                if job.execution_owner:
+                    self._record_cleanup_pending({
+                        "allocation_id": job.allocation_id, "run_id": job.run_id,
+                        "owner": job.execution_owner,
+                    }, "registration_temporarily_failed", "descendant registration scan is still running")
+                return False, None, False
         db = SessionLocal()
+        assigned_gpu_uuids: list[str] = []
         try:
             allocation = db.get(GpuAllocation, job.allocation_id)
             if allocation and allocation.state == "released":
                 run = db.get(TrainingRun, job.run_id)
                 return True, run.status if run else None, False
             owner = allocation.execution_owner if allocation else None
+            if allocation is not None:
+                assigned_gpu_uuids = [device.gpu_uuid for device in sorted(allocation.devices, key=lambda row: row.ordinal)]
             if not owner:
                 from train_platform.domains.training.resources.lifecycle import revoke_unactivated_allocation
-                revoke_unactivated_allocation(db, job.allocation_id, run_id=job.run_id,
-                                              worker_instance_id=job.worker_instance_id,
-                                              reason="training subprocess exited before activation")
+                released = revoke_unactivated_allocation(
+                    db, job.allocation_id, run_id=job.run_id,
+                    worker_instance_id=job.worker_instance_id,
+                    reason="training subprocess exited before activation",
+                )
                 db.commit()
-                return True, None, False
+                return released, None, False
             job.execution_owner = dict(owner)
             if allocation.exit_code is None:
                 record_execution_result(db, job.allocation_id, owner, rc, f"Training subprocess exited with code {rc}" if rc else None)
@@ -580,13 +639,80 @@ class DbQueueWorker:
             db.commit()
         finally:
             db.close()
+        ddp_cleanup_error: Exception | None = None
         if job.ultralytics_ddp:
-            self._cleanup_registered_ddp(job)
-        proof = cleanup_registered_execution(
-            settings.training_dir / job.run_id, run_id=job.run_id,
-            allocation_id=job.allocation_id, execution_owner=owner,
-        )
+            try:
+                self._cleanup_registered_ddp(job)
+            except (UltralyticsDDPCleanupIncomplete, RuntimeError, OSError, psutil.Error) as exc:
+                ddp_cleanup_error = exc
+        try:
+            proof = cleanup_registered_execution(
+                settings.training_dir / job.run_id, run_id=job.run_id,
+                allocation_id=job.allocation_id, execution_owner=owner,
+                assigned_gpu_uuids=assigned_gpu_uuids,
+            )
+        except (OSError, RuntimeError, ValueError, psutil.Error) as exc:
+            proof = {"complete": False, "survivors": [], "unknown": [],
+                     "error": str(exc), "registration_errors": [
+                         {"stage": "registration_temporarily_failed", "error": str(exc)}
+                     ]}
+        if ddp_cleanup_error is not None:
+            proof = dict(proof)
+            proof["complete"] = False
+            proof["error"] = str(ddp_cleanup_error)
+            proof["registration_errors"] = [
+                *(proof.get("registration_errors") or []),
+                {"stage": "ddp_cleanup", "error": str(ddp_cleanup_error)},
+            ]
         if not proof["complete"]:
+            pending_reason = "registration_temporarily_failed"
+            if proof.get("survivors"):
+                pending_reason = "processes_still_alive"
+            elif proof.get("unknown"):
+                pending_reason = "process_scope_unconfirmed"
+            elif any(item.get("stage") == "registration_io_error"
+                     for item in proof.get("registration_errors", [])):
+                pending_reason = "registration_temporarily_failed"
+            elif any(item.get("stage") == "base_registration"
+                     for item in proof.get("registration_errors", [])):
+                pending_reason = "base_registration_missing"
+            elif proof.get("recovered_registration"):
+                pending_reason = "recovered_registration_waiting_cleanup"
+            unresolved_by_key = {}
+            for item in proof.get("registration_errors", []):
+                value = {
+                    "stage": item.get("stage"), "error": item.get("error"),
+                    "target": {key: (item.get("target") or {}).get(key)
+                               for key in ("pid", "create_time", "process_scope")
+                               if (item.get("target") or {}).get(key) is not None},
+                }
+                unresolved_by_key[json.dumps(value, sort_keys=True, default=str)] = value
+            details = {
+                "cleanup_status": pending_reason,
+                "survivors": proof.get("survivors", []),
+                "unknown": proof.get("unknown", []),
+                "error": proof.get("error"),
+                "recovered_registration": bool(proof.get("recovered_registration")),
+                "unresolved_errors": [unresolved_by_key[key] for key in sorted(unresolved_by_key)],
+            }
+            status_db = SessionLocal()
+            try:
+                run = status_db.query(TrainingRun).filter_by(run_id=job.run_id).with_for_update().first()
+                current = status_db.get(GpuAllocation, job.allocation_id)
+                if (run is not None and current is not None
+                        and run.current_allocation_id == job.allocation_id
+                        and current.execution_owner == owner and current.state == "releasing"):
+                    previous = run.resource_wait_details or {}
+                    if (run.resource_wait_reason != "cleanup_pending" or previous != details):
+                        run.resource_wait_reason = "cleanup_pending"
+                        run.resource_wait_details = details
+                        status_db.add(TrainingRunEvent(
+                            run_id=job.run_id, level=LogLevel.INFO,
+                            event_type="cleanup_pending", message=pending_reason, data=details,
+                        ))
+                    status_db.commit()
+            finally:
+                status_db.close()
             return False, None, False
         db = SessionLocal()
         try:
@@ -879,18 +1005,27 @@ class DbQueueWorker:
         try:
             instance_id = self._gpu_resource_reporter.instance_id
             self._adopt_proven_legacy_executions(instance_id)
-            if db.get_bind().dialect.name == "mysql":
-                db.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            decision = reserve_next(
-                db, instance_id, scheduler_enabled=settings.gpu_scheduler_enabled,
-                shared_execution_enabled=settings.gpu_shared_execution_enabled,
-                node_defaults={"max_shared_tasks_per_device": settings.gpu_max_shared_tasks_per_device,
-                               "memory_safety_mib": settings.gpu_memory_safety_mib},
-                stale_after_seconds=settings.gpu_inventory_stale_after_seconds,
-                start_timeout_seconds=settings.gpu_allocation_start_timeout_seconds,
-            )
-            if decision.allocation is None:
+            decision = None
+            for _ in range(50):
+                if db.get_bind().dialect.name == "mysql":
+                    db.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+                decision = reserve_next(
+                    db, instance_id, scan_cursor=self._allocation_scan_cursor,
+                    scheduler_enabled=settings.gpu_scheduler_enabled,
+                    shared_execution_enabled=settings.gpu_shared_execution_enabled,
+                    node_defaults={"max_shared_tasks_per_device": settings.gpu_max_shared_tasks_per_device,
+                                   "memory_safety_mib": settings.gpu_memory_safety_mib},
+                    stale_after_seconds=settings.gpu_inventory_stale_after_seconds,
+                    start_timeout_seconds=settings.gpu_allocation_start_timeout_seconds,
+                )
+                # Release locks and preserve the wait reason after every attempted
+                # candidate. The next query resumes strictly after this row.
                 db.commit()
+                if decision.allocation is not None:
+                    break
+                if decision.reason_code == "scan_exhausted":
+                    return False
+            if decision is None or decision.allocation is None:
                 return False
             allocation = decision.allocation
             allocation_id = allocation.allocation_id

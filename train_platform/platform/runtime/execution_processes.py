@@ -14,6 +14,28 @@ from train_platform.platform.runtime import process_scope
 from train_platform.platform.runtime.execution_identity import process_identity, process_state
 
 
+_pending_errors_lock = threading.Lock()
+_pending_errors: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _flush_pending_registration_errors(root: Path) -> list[dict[str, Any]]:
+    root_key = str(root)
+    with _pending_errors_lock:
+        pending = [((pending_root, item_id), dict(item))
+                   for (pending_root, item_id), item in _pending_errors.items() if pending_root == root_key]
+    failed = []
+    for key, item in pending:
+        path = root / "registration-errors" / f"{item['id']}.json"
+        try:
+            _atomic_json(path, item)
+            with _pending_errors_lock:
+                _pending_errors.pop(key, None)
+        except OSError as exc:
+            item.update(stage="registration_io_error", error=str(exc), persistence_pending=True)
+            failed.append(item)
+    return failed
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
@@ -25,10 +47,32 @@ def execution_root(training_root: Path, allocation_id: str) -> Path:
     return Path(training_root) / "runtime" / "executions" / str(allocation_id)
 
 
+def _record_registration_error(
+    training_root: Path, allocation_id: str, execution_owner: Mapping[str, Any],
+    *, stage: str, error: str, target: Mapping[str, Any] | None = None,
+) -> None:
+    target_value = dict(target or {})
+    entry_id = uuid.uuid4().hex
+    entry = {
+        "id": entry_id, "allocation_id": allocation_id,
+        "execution_owner": dict(execution_owner), "stage": stage,
+        "target": target_value, "error": error,
+        "last_checked_at": datetime.now(timezone.utc).isoformat(), "resolved": False,
+    }
+    key = (str(execution_root(training_root, allocation_id)), entry_id)
+    with _pending_errors_lock:
+        _pending_errors[key] = entry
+    path = execution_root(training_root, allocation_id) / "registration-errors" / f"{entry_id}.json"
+    _atomic_json(path, entry)
+    with _pending_errors_lock:
+        _pending_errors.pop(key, None)
+
+
 def register_execution_process(
     training_root: Path, *, run_id: str, allocation_id: str,
     execution_owner: Mapping[str, Any], pid: int, role: str,
     assigned_gpu_uuids: list[str] | None = None,
+    expected_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if execution_owner.get("allocation_id") != allocation_id:
         raise ValueError("execution owner allocation mismatch")
@@ -39,15 +83,45 @@ def register_execution_process(
         execution_owner=dict(execution_owner), role=role,
         assigned_gpu_uuids=list(assigned_gpu_uuids or []),
     )
+    if role == "supervisor" and expected_identity is None:
+        expected_identity = {
+            "pid": execution_owner.get("guard_pid"),
+            "create_time": execution_owner.get("guard_create_time"),
+            "process_scope": execution_owner.get("process_scope"),
+        }
+    if expected_identity is not None and any(
+        identity.get(field) != expected_identity.get(field)
+        for field in ("pid", "create_time", "process_scope")
+    ):
+        raise ValueError("process identity changed before registration")
+    if role == "supervisor" and any((
+        identity.get("pid") != execution_owner.get("guard_pid"),
+        identity.get("create_time") != execution_owner.get("guard_create_time"),
+        process_scope.compare_process_scope(identity.get("process_scope"), execution_owner.get("process_scope")) != "same",
+    )):
+        raise ValueError("supervisor identity does not match execution owner")
     if os.name != "nt":
         stat = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
         close = stat.rfind(")")
         identity["start_ticks"] = int(stat[close + 2:].split()[19])
         identity["clock_ticks_per_second"] = int(os.sysconf("SC_CLK_TCK"))
         identity["boot_time"] = float(psutil.boot_time())
-    if process_state(identity)[0] != "live":
+    identity_state = process_state(identity)[0]
+    if identity_state == "dead":
         raise psutil.NoSuchProcess(pid)
-    _atomic_json(execution_root(training_root, allocation_id) / "processes" / f"{role}-{pid}.json", identity)
+    if identity_state != "live":
+        raise RuntimeError("process identity cannot be confirmed")
+    try:
+        _atomic_json(execution_root(training_root, allocation_id) / "processes" / f"{role}-{pid}.json", identity)
+    except OSError as exc:
+        try:
+            _record_registration_error(
+                training_root, allocation_id, execution_owner,
+                stage=f"{role}_registration_write", error=str(exc), target=identity,
+            )
+        except OSError:
+            pass
+        raise
     return identity
 
 
@@ -57,34 +131,67 @@ def start_descendant_registration(
     assigned_gpu_uuids: list[str] | None = None, interval_seconds: float = 0.5,
 ) -> tuple[threading.Event, threading.Thread]:
     stopped = threading.Event()
+    supervisor_identity = {
+        "pid": int(execution_owner.get("guard_pid", supervisor_pid)),
+        "create_time": execution_owner.get("guard_create_time"),
+        "process_scope": execution_owner.get("process_scope"),
+    }
 
     def watch() -> None:
-        while not stopped.wait(interval_seconds):
+        try:
+            while not stopped.wait(interval_seconds):
+                _flush_pending_registration_errors(execution_root(training_root, allocation_id))
+                _watch_once()
+        finally:
+            _flush_pending_registration_errors(execution_root(training_root, allocation_id))
+
+    def _watch_once() -> None:
+        state, supervisor_process = process_state(supervisor_identity)
+        if state == "dead":
+            return
+        if state != "live" or supervisor_process is None:
             try:
-                supervisor = psutil.Process(supervisor_pid)
-                children = supervisor.children(recursive=True)
-            except psutil.NoSuchProcess:
-                children = []
-            except psutil.Error as exc:
-                _atomic_json(execution_root(training_root, allocation_id) / "registration-error.json",
-                             {"allocation_id": allocation_id, "error": str(exc)})
-                children = []
-            for child in children:
+                _record_registration_error(
+                    training_root, allocation_id, execution_owner,
+                    stage="supervisor_check", error="supervisor identity could not be confirmed",
+                    target=supervisor_identity,
+                )
+            except OSError:
+                pass
+            return
+        try:
+            children = supervisor_process.children(recursive=True)
+        except psutil.NoSuchProcess:
+            children = []
+        except psutil.Error as exc:
+            try:
+                _record_registration_error(training_root, allocation_id, execution_owner,
+                                           stage="descendant_scan", error=str(exc), target=supervisor_identity)
+            except OSError:
+                pass
+            children = []
+        for child in children:
+            target = {"pid": child.pid, "process_scope": execution_owner.get("process_scope")}
+            try:
+                target["create_time"] = child.create_time()
+                register_execution_process(
+                    training_root, run_id=run_id, allocation_id=allocation_id,
+                    execution_owner=execution_owner, pid=child.pid, role="descendant",
+                    assigned_gpu_uuids=assigned_gpu_uuids,
+                    expected_identity=target,
+                )
+            except (psutil.NoSuchProcess, FileNotFoundError):
+                continue
+            except (OSError, RuntimeError, ValueError, psutil.Error):
                 try:
-                    register_execution_process(
-                        training_root, run_id=run_id, allocation_id=allocation_id,
-                        execution_owner=execution_owner, pid=child.pid, role="descendant",
-                        assigned_gpu_uuids=assigned_gpu_uuids,
+                    _record_registration_error(
+                        training_root, allocation_id, execution_owner,
+                        stage="descendant_registration", error="descendant registration failed",
+                        target=target,
                     )
-                except (psutil.NoSuchProcess, FileNotFoundError):
-                    continue
-                except (OSError, ValueError, psutil.Error):
-                    try:
-                        _atomic_json(execution_root(training_root, allocation_id) / "registration-error.json",
-                                     {"allocation_id": allocation_id, "error": "descendant registration failed"})
-                    except OSError:
-                        pass
-                    continue
+                except OSError:
+                    pass
+                continue
 
     thread = threading.Thread(target=watch, name=f"execution-processes-{allocation_id}", daemon=True)
     thread.start()
@@ -95,42 +202,169 @@ def cleanup_registered_execution(
     training_root: Path, *, run_id: str, allocation_id: str,
     execution_owner: Mapping[str, Any], terminate: bool = True,
     grace_seconds: float = 2.0, exclude_supervisor: bool = False,
+    assigned_gpu_uuids: list[str] | None = None,
 ) -> dict[str, Any]:
     checked_at = datetime.now(timezone.utc).isoformat()
     root = execution_root(training_root, allocation_id)
     processes_dir = root / "processes"
-    if not processes_dir.is_dir():
-        return {"complete": False, "allocation_id": allocation_id, "execution_owner": dict(execution_owner),
-                "process_scope": process_scope.get_process_scope(), "checked_at": checked_at,
-                "error": "process registration directory is missing", "survivors": []}
     error_path = root / "registration-error.json"
+    registration_errors: list[dict[str, Any]] = []
     if error_path.exists():
-        return {"complete": False, "allocation_id": allocation_id, "execution_owner": dict(execution_owner),
-                "process_scope": process_scope.get_process_scope(), "checked_at": checked_at,
-                "error": "process registration was incomplete", "survivors": []}
+        try:
+            value = json.loads(error_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict) and isinstance(value.get("errors"), list):
+                registration_errors = [dict(item) for item in value["errors"] if isinstance(item, dict)]
+            elif isinstance(value, dict) and value.get("resolved"):
+                pass
+            elif isinstance(value, dict):
+                registration_errors = [{"id": "legacy", "stage": "legacy", "error": value.get("error"),
+                                        "resolved": False}]
+            else:
+                raise ValueError("invalid registration error journal")
+        except (OSError, ValueError) as exc:
+            registration_errors = [{"id": "journal", "stage": "journal_read", "error": str(exc),
+                                    "resolved": False}]
+    errors_dir = root / "registration-errors"
+    initial_error_paths: set[str] = set()
+    if errors_dir.is_dir():
+        for path in errors_dir.glob("*.json"):
+            initial_error_paths.add(str(path))
+            try:
+                item = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(item, dict):
+                    raise ValueError("invalid registration error")
+                item["_path"] = str(path)
+                registration_errors.append(item)
+            except (OSError, ValueError) as exc:
+                registration_errors.append({"id": path.name, "stage": "journal_read",
+                                            "error": str(exc), "resolved": False})
+    registration_errors.extend(_flush_pending_registration_errors(root))
     identities = []
-    try:
-        for path in processes_dir.glob("*.json"):
+    registration_read_errors = []
+    for path in processes_dir.glob("*.json"):
+        try:
             value = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(value, dict):
                 raise ValueError(f"invalid process registration: {path}")
             if value.get("run_id") != run_id or value.get("allocation_id") != allocation_id or value.get("execution_owner") != dict(execution_owner):
                 raise ValueError(f"process registration ownership mismatch: {path}")
+            if (not isinstance(value.get("pid"), int)
+                    or not isinstance(value.get("create_time"), (int, float))
+                    or process_scope.compare_process_scope(value.get("process_scope"), execution_owner.get("process_scope")) != "same"):
+                raise ValueError(f"process registration identity is incomplete: {path}")
             identities.append(value)
-    except (OSError, ValueError) as exc:
-        return {"complete": False, "allocation_id": allocation_id, "execution_owner": dict(execution_owner),
-                "process_scope": process_scope.get_process_scope(), "checked_at": checked_at,
-                "error": str(exc), "survivors": []}
+        except (OSError, ValueError) as exc:
+            registration_read_errors.append({"stage": "registration_read", "error": str(exc)})
+    registration_errors.extend(registration_read_errors)
+    for item in registration_errors:
+        target = item.get("target")
+        if item.get("id") == "legacy":
+            continue
+        if item.get("stage") in {"registration_read", "journal_read", "registration_io_error"}:
+            continue
+        trusted = item.get("allocation_id") == allocation_id and item.get("execution_owner") == dict(execution_owner)
+        if isinstance(target, dict):
+            trusted = trusted and process_scope.compare_process_scope(
+                target.get("process_scope"), execution_owner.get("process_scope")) == "same"
+            for field, expected_value in (("run_id", run_id), ("allocation_id", allocation_id),
+                                          ("execution_owner", dict(execution_owner))):
+                if field in target and target.get(field) != expected_value:
+                    trusted = False
+        item["trusted"] = trusted
+        if not trusted:
+            item["stage"] = "registration_ownership_mismatch"
+            item["error"] = "registration error identity is not owned by this execution"
     supervisor = [
         item for item in identities
         if item.get("role") == "supervisor"
         and item.get("pid") == execution_owner.get("guard_pid")
         and item.get("create_time") == execution_owner.get("guard_create_time")
     ]
+    recovered_base = False
     if len(supervisor) != 1:
-        return {"complete": False, "allocation_id": allocation_id, "execution_owner": dict(execution_owner),
-                "process_scope": process_scope.get_process_scope(), "checked_at": checked_at,
-                "error": "exact supervisor registration is missing", "survivors": []}
+        expected = {"pid": execution_owner.get("guard_pid"),
+                    "create_time": execution_owner.get("guard_create_time"),
+                    "process_scope": execution_owner.get("process_scope")}
+        if process_state(expected)[0] == "live":
+            try:
+                supervisor = [register_execution_process(
+                    training_root, run_id=run_id, allocation_id=allocation_id,
+                    execution_owner=execution_owner, pid=int(expected["pid"]), role="supervisor",
+                    expected_identity=expected,
+                    assigned_gpu_uuids=assigned_gpu_uuids,
+                )]
+                recovered_base = True
+            except (OSError, RuntimeError, ValueError, psutil.Error) as exc:
+                supervisor = []
+                registration_errors.append({
+                    "stage": "registration_io_error" if isinstance(exc, OSError) else "process_scope_unconfirmed",
+                    "error": str(exc), "last_checked_at": checked_at,
+                })
+        if not supervisor:
+            durable = next((item for item in identities
+                            if item.get("pid") == expected["pid"]
+                            and item.get("create_time") == expected["create_time"]
+                            and item.get("execution_owner") == dict(execution_owner)
+                            and process_scope.compare_process_scope(item.get("process_scope"), expected["process_scope"]) == "same"
+                            and item.get("sid") == item.get("pid")), None)
+            if durable is None:
+                error_target = next((item.get("target") for item in registration_errors
+                                     if item.get("trusted") and isinstance(item.get("target"), dict)
+                                     and item["target"].get("pid") == expected["pid"]
+                                     and item["target"].get("create_time") == expected["create_time"]
+                                     and item["target"].get("sid") == expected["pid"]
+                                     and item["target"].get("run_id") == run_id
+                                     and item["target"].get("allocation_id") == allocation_id
+                                     and item["target"].get("execution_owner") == dict(execution_owner)), None)
+                if error_target is not None:
+                    durable = dict(error_target)
+                    durable.update(run_id=run_id, allocation_id=allocation_id,
+                                   execution_owner=dict(execution_owner), role="supervisor")
+            if durable is not None:
+                copied = dict(durable)
+                copied["role"] = "supervisor"
+                copied["assigned_gpu_uuids"] = list(assigned_gpu_uuids or copied.get("assigned_gpu_uuids", []))
+                try:
+                    _atomic_json(processes_dir / f"supervisor-{expected['pid']}.json", copied)
+                    supervisor = [copied]
+                    recovered_base = True
+                except OSError as exc:
+                    registration_errors.append({"stage": "registration_io_error", "error": str(exc)})
+        if len(supervisor) != 1:
+            registration_errors.append({"id": "missing-base", "stage": "base_registration",
+                                        "error": "exact supervisor registration is missing", "resolved": False})
+    elif supervisor:
+        expected_scope = execution_owner.get("process_scope")
+        if process_scope.compare_process_scope(supervisor[0].get("process_scope"), expected_scope) != "same":
+            supervisor = []
+            registration_errors.append({"id": "invalid-base", "stage": "base_registration",
+                                        "error": "supervisor registration scope mismatch", "resolved": False})
+    if supervisor and supervisor[0] not in identities:
+        identities.append(supervisor[0])
+
+    # Retry exact identities captured by failed writes. This never recaptures a
+    # PID: expected_identity requires the original creation time and scope.
+    for error in registration_errors:
+        if error.get("resolved") or not error.get("trusted") or not (error.get("stage") == "descendant_registration"
+                                         or str(error.get("stage", "")).endswith("_registration_write")):
+            continue
+        target = error.get("target")
+        if not isinstance(target, dict) or target.get("create_time") is None:
+            continue
+        state, _ = process_state(target)
+        error["last_checked_at"] = checked_at
+        error["last_check"] = state
+        if state == "live":
+            try:
+                recovered = register_execution_process(
+                    training_root, run_id=run_id, allocation_id=allocation_id,
+                    execution_owner=execution_owner, pid=int(target["pid"]), role="recovered",
+                    assigned_gpu_uuids=assigned_gpu_uuids, expected_identity=target,
+                )
+                identities.append(recovered)
+                error["resolved"] = True
+            except (OSError, RuntimeError, ValueError, psutil.Error):
+                pass
     processes: dict[tuple[int, float], psutil.Process] = {}
     unknown = []
     for identity in identities:
@@ -172,10 +406,13 @@ def cleanup_registered_execution(
                 if candidate.create_time() < sessions[sid]["create_time"]:
                     unknown.append(candidate.pid)
                     continue
+                candidate_identity = {"pid": candidate.pid, "create_time": candidate.create_time(),
+                                      "process_scope": execution_owner.get("process_scope")}
                 item = register_execution_process(
                     training_root, run_id=run_id, allocation_id=allocation_id,
                     execution_owner=execution_owner, pid=candidate.pid, role="session-member",
-                    assigned_gpu_uuids=supervisor[0].get("assigned_gpu_uuids", []),
+                    assigned_gpu_uuids=supervisor[0].get("assigned_gpu_uuids", []) if supervisor else [],
+                    expected_identity=candidate_identity,
                 )
                 state, process = process_state(item)
                 if state == "live":
@@ -184,7 +421,7 @@ def cleanup_registered_execution(
                     unknown.append(candidate.pid)
             except (psutil.NoSuchProcess, ProcessLookupError):
                 continue
-            except (psutil.Error, OSError):
+            except (RuntimeError, ValueError, psutil.Error, OSError):
                 # No ownership is inferred for unrelated inaccessible processes.
                 if sid in sessions:
                     unknown.append(candidate.pid)
@@ -218,7 +455,64 @@ def cleanup_registered_execution(
             except (psutil.Error, OSError):
                 if sid in sessions:
                     unknown.append(candidate.pid)
-    return {"complete": not survivors and not unknown, "allocation_id": allocation_id,
+    hard_read_error = any(item.get("stage") in {"registration_read", "journal_read", "registration_io_error"}
+                          for item in registration_errors if not item.get("resolved"))
+    complete_session_scan = bool(sessions) and execution_owner.get("guard_pid") in sessions and not survivors and not unknown and not hard_read_error
+    unresolved_errors = []
+    for item in registration_errors:
+        if item.get("resolved"):
+            continue
+        target = item.get("target")
+        item["last_checked_at"] = checked_at
+        if (item.get("trusted") and isinstance(target, dict)
+                and target.get("pid") is not None and target.get("create_time") is not None):
+            state, _ = process_state(target)
+            item["last_check"] = state
+            if state == "dead" and item.get("stage") not in {
+                "descendant_scan", "supervisor_check", "legacy", "journal_read",
+                "registration_io_error", "registration_read", "base_registration",
+            }:
+                item["resolved"] = True
+                continue
+        elif (item.get("trusted") and isinstance(target, dict)
+              and target.get("sid") in sessions and complete_session_scan):
+            item["last_check"] = "session_complete"
+            item["resolved"] = True
+            continue
+        if item.get("stage") in {"legacy", "descendant_scan", "supervisor_check"} and complete_session_scan:
+            item["last_check"] = "session_complete"
+            item["resolved"] = True
+            continue
+        unresolved_errors.append(item)
+    for item in registration_errors:
+        path_value = item.get("_path")
+        if path_value:
+            stored = {key: value for key, value in item.items() if key != "_path"}
+            try:
+                _atomic_json(Path(path_value), stored)
+            except OSError as exc:
+                unresolved_errors.append({"stage": "journal_write", "error": str(exc)})
+    if error_path.exists() and any(item.get("id") == "legacy" and item.get("resolved") for item in registration_errors):
+        try:
+            _atomic_json(error_path, {"allocation_id": allocation_id, "resolved": True,
+                                      "last_checked_at": checked_at, "last_check": "session_complete"})
+        except OSError as exc:
+            unresolved_errors.append({"stage": "journal_write", "error": str(exc)})
+    missing_directory = not processes_dir.is_dir()
+    if missing_directory and not supervisor:
+        unresolved_errors.append({"stage": "base_registration", "error": "process registration directory is missing"})
+    if errors_dir.is_dir():
+        new_error_paths = {str(path) for path in errors_dir.glob("*.json")} - initial_error_paths
+        if new_error_paths:
+            unresolved_errors.append({"stage": "scan_in_progress",
+                                      "error": "registration changed during cleanup",
+                                      "paths": sorted(new_error_paths)})
+    recovered_registration = recovered_base or any(item.get("resolved") and item.get("last_check") == "live"
+                                                    for item in registration_errors)
+    return {"complete": not survivors and not unknown and not unresolved_errors, "allocation_id": allocation_id,
             "supervisor_excluded": exclude_supervisor,
             "execution_owner": dict(execution_owner), "process_scope": process_scope.get_process_scope(),
-            "checked_at": checked_at, "survivors": sorted(set(survivors)), "unknown": sorted(set(x for x in unknown if x is not None))}
+            "checked_at": checked_at, "survivors": sorted(set(survivors)), "unknown": sorted(set(x for x in unknown if x is not None)),
+            "registration_errors": unresolved_errors,
+            "recovered_registration": recovered_registration,
+            "error": unresolved_errors[0].get("error") if unresolved_errors else None}

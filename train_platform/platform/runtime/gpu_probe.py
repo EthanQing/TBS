@@ -105,7 +105,20 @@ def _compute_mode(value: Any) -> str:
 
 
 def _mig_mode(value: Any) -> str:
-    text = (_text(value) or "").lower()
+    if isinstance(value, bytes):
+        try:
+            raw = value.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return "unknown"
+    elif isinstance(value, str):
+        raw = value
+    elif value is None:
+        return "unknown"
+    else:
+        raw = str(value)
+    text = raw.strip().lower()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
     if text in {"1", "enabled"}: return "enabled"
     if text in {"0", "disabled"}: return "disabled"
     if text in {"n/a", "not supported", "not_supported"}: return "not_supported"

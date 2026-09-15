@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import and_, exists, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
@@ -14,6 +14,8 @@ from train_platform.models.v3.gpu_allocation import (
 )
 from train_platform.models.v3.gpu_resource import GpuDevice, GpuWorkerInstance, GpuWorkerObservation
 from train_platform.models.v3.training_run import TrainingRun, TrainingRunEvent, TrainingRunParameters
+from train_platform.models.v3.architecture import ModelArchitecture
+from train_platform.models.v3.gpu_resource import TrainingRunResourceRequest
 from train_platform.domains.training.resources.accounting import ActiveCommitment, calculate_gpu_accounting
 from train_platform.domains.training.parameters import parse_visible_host_gpu_ids
 
@@ -24,6 +26,16 @@ class AllocationDecision:
     reason_code: str | None
     details: dict[str, Any]
     effective_request: dict[str, Any] | None
+
+
+@dataclass
+class AllocationScanCursor:
+    queued_at: datetime | None = None
+    created_at: datetime | None = None
+    run_id: str | None = None
+
+    def reset(self) -> None:
+        self.queued_at = self.created_at = self.run_id = None
 
 
 def _now(value: datetime | None) -> datetime:
@@ -100,7 +112,12 @@ def allocate_run(
     db.flush()
     run = db.query(TrainingRun).filter_by(run_id=run_id).populate_existing().with_for_update().one()
     worker_hint = db.get(GpuWorkerInstance, worker_instance_id)
-    if run.status != TrainingRunStatus.QUEUED or run.cancel_requested_at or run.delete_requested_at or run.current_allocation_id:
+    active_allocation = db.query(GpuAllocation.allocation_id).filter(
+        GpuAllocation.run_id == run_id, GpuAllocation.state != "released",
+    ).populate_existing().with_for_update().first()
+    if (run.status != TrainingRunStatus.QUEUED or run.queued_at is None or run.hidden
+            or run.cancel_requested_at or run.delete_requested_at or run.current_allocation_id
+            or active_allocation):
         return AllocationDecision(None, "not_eligible", {}, None)
     if not worker_hint or not worker_hint.node_id:
         _set_wait_reason(db, run, "node_id_unconfigured", {})
@@ -122,7 +139,6 @@ def allocate_run(
     engine = str(run.architecture.engine).lower()
     cutoff = instant - timedelta(seconds=stale_after_seconds)
     if engine not in set(worker.allowed_engines or []) or worker.stopped_at or _aware(worker.heartbeat_at) < cutoff:
-        _set_wait_reason(db, run, "no_compatible_worker", {})
         return AllocationDecision(None, "no_compatible_worker", {}, None)
     if run.hidden or run.claimed_at is not None and run.worker_id not in {None, worker.worker_id}:
         return AllocationDecision(None, "not_eligible", {}, None)
@@ -138,7 +154,6 @@ def allocate_run(
         return AllocationDecision(None, "cpu_legacy_mode", {}, None)
     run.resource_wait_details = {**(run.resource_wait_details or {}), "effective_request": request}
     if request.get("node_id") and request["node_id"] != worker.node_id:
-        _set_wait_reason(db, run, "no_compatible_worker", {"requested_node_id": request["node_id"]})
         return AllocationDecision(None, "no_compatible_worker", {}, request)
     if request["gpu_count"] > 1 and engine != "ultralytics-yolo":
         _set_wait_reason(db, run, "no_compatible_worker", {"engine": engine})
@@ -247,25 +262,52 @@ def allocate_run(
     return AllocationDecision(allocation, None, {}, request)
 
 
-def reserve_next(db: Session, worker_instance_id: str, **kwargs) -> AllocationDecision:
+def reserve_next(
+    db: Session, worker_instance_id: str, *, scan_cursor: AllocationScanCursor | None = None,
+    **kwargs,
+) -> AllocationDecision:
     worker = db.get(GpuWorkerInstance, worker_instance_id)
     if not worker:
         return AllocationDecision(None, "no_compatible_worker", {}, None)
+    active = exists().where(and_(
+        GpuAllocation.run_id == TrainingRun.run_id,
+        GpuAllocation.state != "released",
+    ))
     query = (
-        db.query(TrainingRun).join(TrainingRun.architecture)
-        .filter(TrainingRun.status == TrainingRunStatus.QUEUED, TrainingRun.cancel_requested_at.is_(None), TrainingRun.delete_requested_at.is_(None))
-        .filter(TrainingRun.current_allocation_id.is_(None))
-        .order_by(TrainingRun.queued_at.asc(), TrainingRun.created_at.asc())
-        .with_for_update(skip_locked=True).limit(50)
+        db.query(TrainingRun)
+        .join(ModelArchitecture, ModelArchitecture.architecture_id == TrainingRun.architecture_id)
+        .outerjoin(TrainingRunResourceRequest, TrainingRunResourceRequest.run_id == TrainingRun.run_id)
+        .filter(
+            TrainingRun.status == TrainingRunStatus.QUEUED,
+            TrainingRun.queued_at.is_not(None), TrainingRun.hidden.is_(False),
+            TrainingRun.cancel_requested_at.is_(None), TrainingRun.delete_requested_at.is_(None),
+            TrainingRun.current_allocation_id.is_(None), ~active,
+            func.lower(ModelArchitecture.engine).in_([str(item).lower() for item in (worker.allowed_engines or [])]),
+            or_(TrainingRunResourceRequest.node_id.is_(None),
+                TrainingRunResourceRequest.node_id == worker.node_id),
+        )
     )
-    for run in query.all():
-        if str(run.architecture.engine).lower() not in set(worker.allowed_engines or []):
-            _set_wait_reason(db, run, "no_compatible_worker", {})
-            continue
-        decision = allocate_run(db, run.run_id, worker_instance_id, **kwargs)
-        if decision.allocation:
-            return decision
-    return AllocationDecision(None, "no_eligible_task", {}, None)
+    if scan_cursor and scan_cursor.queued_at is not None:
+        query = query.filter(or_(
+            TrainingRun.queued_at > scan_cursor.queued_at,
+            and_(TrainingRun.queued_at == scan_cursor.queued_at,
+                 TrainingRun.created_at > scan_cursor.created_at),
+            and_(TrainingRun.queued_at == scan_cursor.queued_at,
+                 TrainingRun.created_at == scan_cursor.created_at,
+                 TrainingRun.run_id > scan_cursor.run_id),
+        ))
+    run = query.order_by(
+        TrainingRun.queued_at.asc(), TrainingRun.created_at.asc(), TrainingRun.run_id.asc(),
+    ).first()
+    if run is None:
+        if scan_cursor:
+            scan_cursor.reset()
+        return AllocationDecision(None, "scan_exhausted", {}, None)
+    if scan_cursor:
+        scan_cursor.queued_at = run.queued_at
+        scan_cursor.created_at = run.created_at
+        scan_cursor.run_id = str(run.run_id)
+    return allocate_run(db, run.run_id, worker_instance_id, **kwargs)
 
 
 def adopt_legacy_execution(
