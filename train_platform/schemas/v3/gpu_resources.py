@@ -34,6 +34,20 @@ class GpuResourceOut(BaseModel):
     freshness_status: str
     registration_status: str
     workers: list[GpuResourceWorkerOut] = Field(default_factory=list)
+    scheduling_mode: str
+    allocation_enabled: bool
+    shared_execution_enabled: bool
+    active_allocations: list[dict[str, Any]] = Field(default_factory=list)
+    reserved_memory_mib: int
+    reliable_training_used_mib: int | None = None
+    unattributed_used_mib: int | None = None
+    memory_safety_mib: int
+    available_budget_mib: int
+    exclusive_allocation_active: bool
+    shared_task_count: int
+    max_shared_tasks_per_device: int
+    accounting_status: Literal["verified", "conservative", "stale", "unavailable"]
+    accounting_sampled_at: datetime | None = None
 
 class GpuWorkerObservationOut(BaseModel):
     gpu_uuid: str
@@ -58,6 +72,7 @@ class GpuWorkerObservationOut(BaseModel):
     received_at: datetime
 
 class GpuWorkerOut(BaseModel):
+    scheduling_mode: str
     instance_id: str
     worker_id: str
     node_id: str | None = None
@@ -74,23 +89,36 @@ class GpuWorkerOut(BaseModel):
     inventory_status: str
     inventory_error: str | None = None
     last_successful_inventory_at: datetime | None = None
+    cuda_inventory_status: str
+    cuda_inventory_error: str | None = None
+    cuda_environment_fingerprint: str | None = None
+    last_successful_cuda_inventory_at: datetime | None = None
+    cuda_bindings: list[dict[str, Any]] = Field(default_factory=list)
+    running_task_count: int
+    active_allocation_count: int
+    max_training_slots: int
+    accepting_tasks: bool
     observations: list[GpuWorkerObservationOut] = Field(default_factory=list)
 
 class GpuResourcesResponse(BaseModel):
-    scheduler_stage: Literal["inventory_only"] = "inventory_only"
-    allocation_enabled: Literal[False] = False
+    scheduler_stage: Literal["inventory_only", "managed_allocation"] = "inventory_only"
+    allocation_enabled: bool = False
+    shared_execution_enabled: bool = False
     items: list[GpuResourceOut] = Field(default_factory=list)
 
 class GpuWorkersResponse(BaseModel):
-    scheduler_stage: Literal["inventory_only"] = "inventory_only"
-    allocation_enabled: Literal[False] = False
+    scheduler_stage: Literal["inventory_only", "managed_allocation"] = "inventory_only"
+    allocation_enabled: bool = False
     items: list[GpuWorkerOut] = Field(default_factory=list)
 
 class TrainingRunResourcesResponse(BaseModel):
     run_id: str
-    scheduler_stage: Literal["inventory_only"] = "inventory_only"
-    allocation_enabled: Literal[False] = False
+    scheduler_stage: Literal["inventory_only", "managed_allocation"] = "inventory_only"
+    allocation_enabled: bool = False
     resource_request: TrainingRunResourceRequestOut | None = None
     legacy_device_mode: bool
-    allocation: None = None
-    reason_code: Literal["legacy_device_mode", "resource_scheduler_not_enabled"]
+    effective_request: dict[str, Any] | None = None
+    allocation: dict[str, Any] | None = None
+    allocation_history: list[dict[str, Any]] = Field(default_factory=list)
+    reason_code: str | None = None
+    reason_details: dict[str, Any] | None = None

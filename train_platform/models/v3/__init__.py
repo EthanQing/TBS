@@ -32,6 +32,7 @@ from train_platform.models.v3.illegal_dataset import (
 )
 from train_platform.models.v3.inference import InferenceRun
 from train_platform.models.v3.gpu_resource import GpuDevice, GpuWorkerInstance, GpuWorkerObservation, TrainingRunResourceRequest
+from train_platform.models.v3.gpu_allocation import GpuAllocation, GpuAllocationDevice, GpuCudaBinding, GpuNodeSchedulingState
 from train_platform.models.v3.model_registry import ModelVersion
 from train_platform.models.v3.project import Project
 from train_platform.models.v3.qualified_model import QualifiedModel
@@ -82,6 +83,10 @@ __all__ = [
     "GpuWorkerInstance",
     "GpuWorkerObservation",
     "TrainingRunResourceRequest",
+    "GpuAllocation",
+    "GpuAllocationDevice",
+    "GpuCudaBinding",
+    "GpuNodeSchedulingState",
     "DatasetType",
     "DatasetSplit",
     "TaskType",

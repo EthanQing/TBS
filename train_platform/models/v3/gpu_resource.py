@@ -40,6 +40,14 @@ class GpuWorkerInstance(V3Base):
     inventory_status: Mapped[str] = mapped_column(String(32), nullable=False)
     inventory_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     last_successful_inventory_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    cuda_inventory_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    cuda_inventory_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cuda_environment_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_successful_cuda_inventory_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    max_training_slots: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    running_task_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    accepting_tasks: Mapped[bool] = mapped_column(nullable=False, default=True)
+    launcher_identity: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     observations = relationship("GpuWorkerObservation", back_populates="worker_instance", cascade="all, delete-orphan")
 
@@ -69,6 +77,7 @@ class GpuWorkerObservation(V3Base):
     present: Mapped[bool] = mapped_column(nullable=False, default=True)
     sampled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    process_snapshot: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     worker_instance = relationship("GpuWorkerInstance", back_populates="observations")
     device = relationship("GpuDevice", back_populates="observations")

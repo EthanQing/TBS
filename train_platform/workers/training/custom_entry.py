@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import importlib
+import os
 import json
+import importlib
 import sys
 import traceback
 from pathlib import Path
@@ -32,6 +33,17 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         context = _load_context(Path(args.context))
+        allocation_id = os.getenv("TRAIN_PLATFORM_ALLOCATION_ID")
+        owner_json = os.getenv("TRAIN_PLATFORM_EXECUTION_OWNER_JSON")
+        if allocation_id and owner_json:
+            from train_platform.core.config import settings
+            from train_platform.platform.runtime.execution_processes import register_execution_process
+            register_execution_process(
+                settings.training_dir / str(_required(context, "run_id")), run_id=str(_required(context, "run_id")),
+                allocation_id=allocation_id, execution_owner=json.loads(owner_json),
+                pid=os.getpid(), role="custom-source",
+                assigned_gpu_uuids=[item for item in os.getenv("TRAIN_PLATFORM_ASSIGNED_GPU_UUIDS", "").split(",") if item],
+            )
         source_root = Path(_required(context, "source_root")).resolve()
         if not source_root.is_dir():
             raise ValueError(f"Custom source root does not exist: {source_root}")

@@ -259,3 +259,41 @@ def test_main_does_not_finalize_when_execution_claim_is_unresolved(monkeypatch):
 
     assert train_entry_impl.main(["--run-id", "run-ownership"]) == 1
     assert finalized == []
+
+
+def test_managed_execution_rejects_legacy_callback_even_with_same_pid(ownership_db):
+    db = ownership_db()
+    run = db.get(TrainingRun, "run-ownership")
+    run.current_allocation_id = "new-allocation"
+    db.commit()
+    assert not lifecycle.touch_heartbeat(db, run.run_id, expected_pid=202)
+    assert not lifecycle.finalize_execution(db, run.run_id, exit_code=0, expected_pid=202).changed
+    db.close()
+
+
+def test_managed_execution_checks_creation_time_and_allocation(ownership_db):
+    from train_platform.models.v3.gpu_allocation import GpuAllocation
+
+    db = ownership_db()
+    run = db.get(TrainingRun, "run-ownership")
+    run.current_allocation_id = "allocation-new"
+    now = datetime.now(timezone.utc)
+    db.add(GpuAllocation(
+        allocation_id="allocation-new", run_id=run.run_id, active_run_id=run.run_id,
+        worker_instance_id="worker-instance", worker_id="worker-1", node_id="node-1",
+        state="running", authorization_state="consumed", request_snapshot={},
+        reserved_at=now, launch_deadline_at=now,
+        execution_owner={"guard_pid": 202, "guard_create_time": 123.0},
+    ))
+    db.commit()
+    for allocation_id, created in [("allocation-old", 123.0), ("allocation-new", 122.0), ("allocation-new", None)]:
+        assert not lifecycle.touch_heartbeat(db, run.run_id, expected_pid=202,
+                                            allocation_id=allocation_id, expected_create_time=created)
+    assert lifecycle.touch_heartbeat(db, run.run_id, expected_pid=202,
+                                     allocation_id="allocation-new", expected_create_time=123.0, commit=False)
+    result = lifecycle.finalize_execution(db, run.run_id, exit_code=0, expected_pid=202,
+                                         allocation_id="allocation-new", expected_create_time=123.0, commit=False)
+    assert result.changed
+    db.rollback()
+    assert db.get(TrainingRun, run.run_id).status == TrainingRunStatus.RUNNING
+    db.close()

@@ -200,7 +200,7 @@ def test_resource_get_endpoints_are_inventory_only(resource_db):
             if legacy:
                 assert data["resource_request"] is None
             else:
-                assert data["reason_code"] == "resource_scheduler_not_enabled"
+                assert data["reason_code"] == "scheduler_disabled"
                 assert data["resource_request"]["memory_mib_per_gpu"] == 18432
         for path in ["gpu-resources", "gpu-workers"]:
             response = client.get(f"/api/v3/{path}")

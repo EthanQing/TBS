@@ -128,8 +128,15 @@ class TrainingExecutionSpec:
     framework_config: Mapping[str, Any] = field(default_factory=dict)
     custom_source: CustomSourceExecutionSpec | None = None
     execution_owner: Mapping[str, Any] = field(default_factory=dict)
+    allocation_id: str | None = None
+    worker_instance_id: str | None = None
+    assigned_gpu_uuids: tuple[str, ...] = ()
+    reserved_memory_mib: tuple[int, ...] = ()
+    sharing: str | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "assigned_gpu_uuids", tuple(self.assigned_gpu_uuids))
+        object.__setattr__(self, "reserved_memory_mib", tuple(self.reserved_memory_mib))
         for field_name in ("augmentation", "loss_weights", "framework_config", "execution_owner"):
             value = getattr(self, field_name)
             if isinstance(value, MappingProxyType):

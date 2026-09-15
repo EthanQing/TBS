@@ -66,6 +66,9 @@ class TrainingRun(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    current_allocation_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    resource_wait_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    resource_wait_details: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

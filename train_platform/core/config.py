@@ -113,6 +113,13 @@ class Settings:
     gpu_inventory_interval_seconds: int = _int_env("GPU_INVENTORY_INTERVAL_SECONDS", 5, min_value=1)
     gpu_inventory_stale_after_seconds: int = _int_env("GPU_INVENTORY_STALE_AFTER_SECONDS", 20, min_value=1)
     gpu_node_id: str | None = os.getenv("GPU_NODE_ID", "").strip() or None
+    gpu_scheduler_enabled: bool = _bool_env("GPU_SCHEDULER_ENABLED", False)
+    gpu_shared_execution_enabled: bool = _bool_env("GPU_SHARED_EXECUTION_ENABLED", False)
+    worker_max_concurrent_trainings: int = _int_env("WORKER_MAX_CONCURRENT_TRAININGS", 2, min_value=1)
+    gpu_max_shared_tasks_per_device: int = _int_env("GPU_MAX_SHARED_TASKS_PER_DEVICE", 2, min_value=1)
+    gpu_memory_safety_mib: int = _int_env("GPU_MEMORY_SAFETY_MIB", 4096, min_value=0)
+    gpu_allocation_start_timeout_seconds: int = _int_env("GPU_ALLOCATION_START_TIMEOUT_SECONDS", 30, min_value=1)
+    gpu_host_proc_root: str | None = os.getenv("GPU_HOST_PROC_ROOT", "").strip() or None
     thumbnail_max_workers: int = _int_env("THUMBNAIL_MAX_WORKERS", 4, min_value=1)
     thumbnail_first_page_prewarm: int = _int_env("THUMBNAIL_FIRST_PAGE_PREWARM", 32, min_value=0)
     thumbnail_size: int = _int_env("THUMBNAIL_SIZE", 200, min_value=1)

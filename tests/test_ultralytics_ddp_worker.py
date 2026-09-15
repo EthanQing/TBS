@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from concurrent.futures import Future
 
 import pytest
 
@@ -14,10 +15,20 @@ LOCAL_SCOPE = {"boot_id": "test-boot", "pid_namespace": {"device": 1, "inode": 2
 @pytest.fixture(autouse=True)
 def local_process_scope(monkeypatch, tmp_path):
     monkeypatch.setattr(worker.process_scope, "get_process_scope", lambda: LOCAL_SCOPE)
-    monkeypatch.setattr(worker, "settings", SimpleNamespace(training_dir=tmp_path))
+    monkeypatch.setattr(worker, "settings", SimpleNamespace(training_dir=tmp_path, worker_max_concurrent_trainings=2,
+                                                          gpu_scheduler_enabled=False, gpu_node_id=None))
 
 
 def setup_worker(monkeypatch, *, exited=False):
+    class ImmediateExecutor:
+        def submit(self, fn, *args):
+            future = Future()
+            try:
+                future.set_result(fn(*args))
+            except Exception as exc:
+                future.set_exception(exc)
+            return future
+
     now = datetime.now(timezone.utc)
     process = SimpleNamespace(pid=101, returncode=0 if exited else None)
     process.poll = lambda: process.returncode
@@ -29,8 +40,10 @@ def setup_worker(monkeypatch, *, exited=False):
         execution_owner={"guard_pid": 101, "guard_create_time": 123.5, "worker_id": "worker", "process_scope": LOCAL_SCOPE},
     )
     instance = worker.DbQueueWorker(worker_id="worker")
-    instance._running = job
-    instance._last_heartbeat_at = now
+    instance._cleanup_executor.shutdown(wait=False)
+    instance._cleanup_executor = ImmediateExecutor()
+    instance._running_jobs[job.run_id] = job
+    job.last_heartbeat_at = now
     run = SimpleNamespace(cancel_requested_at=now, delete_requested_at=None)
     db = SimpleNamespace(close=lambda: None)
     db.query = lambda *args: db
@@ -39,6 +52,7 @@ def setup_worker(monkeypatch, *, exited=False):
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     monkeypatch.setattr(worker, "_utcnow", lambda: now)
     monkeypatch.setattr(worker, "touch_heartbeat", lambda *args, **kwargs: True)
+    monkeypatch.setattr(worker, "_identity_is_live", lambda identity: True)
     events = []
 
     def terminate(proc):
@@ -63,28 +77,29 @@ def setup_worker(monkeypatch, *, exited=False):
 
 def test_worker_gives_supervisor_grace_before_forced_cleanup(monkeypatch):
     instance, job, events, now = setup_worker(monkeypatch)
-    instance._tick_running()
+    instance._tick_running(job)
     assert job.cancel_seen_at == now
     assert events == []
     job.cancel_seen_at = now - timedelta(seconds=worker.ULTRALYTICS_DDP_CANCEL_FALLBACK_SECONDS)
-    instance._tick_running()
+    instance._tick_running(job)
+    instance._tick_running(job)
     assert events == ["terminate", "cleanup", "finalize"]
-    assert instance._running is None
+    assert not instance.has_running_jobs()
 
 
 def test_worker_cleans_registered_orphans_after_supervisor_exit(monkeypatch):
-    instance, _, events, _ = setup_worker(monkeypatch, exited=True)
-    instance._tick_running()
+    instance, job, events, _ = setup_worker(monkeypatch, exited=True)
+    instance._tick_running(job)
     assert events == ["cleanup", "finalize"]
 
 
 def test_worker_does_not_finalize_while_registered_process_survives(monkeypatch):
-    instance, _, events, _ = setup_worker(monkeypatch, exited=True)
+    instance, job, events, _ = setup_worker(monkeypatch, exited=True)
     monkeypatch.setattr(worker, "terminate_registered_processes", lambda *args, **kwargs: [SimpleNamespace(pid=404)])
     with pytest.raises(worker.UltralyticsDDPError, match="404"):
-        instance._tick_running()
+        instance._tick_running(job)
     assert events == []
-    assert instance._running is not None
+    assert instance.has_running_jobs()
 
 
 @pytest.mark.parametrize("outcome", ["survivor", "unknown"])
@@ -105,13 +120,13 @@ def test_worker_retries_cleanup_before_releasing_job(monkeypatch, outcome):
 
     monkeypatch.setattr(worker, "terminate_registered_processes", cleanup)
     with pytest.raises(worker.UltralyticsDDPError):
-        instance._tick_running()
-    assert instance._running is job
+        instance._tick_running(job)
+    assert instance._running_jobs[job.run_id] is job
     assert not job.stdout_f.closed and not job.stderr_f.closed
     assert events == []
-    instance._tick_running()
+    instance._tick_running(job)
     assert events == ["finalize"]
-    assert instance._running is None
+    assert not instance.has_running_jobs()
     assert job.stdout_f.closed and job.stderr_f.closed
 
 

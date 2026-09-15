@@ -32,13 +32,27 @@ def db(tmp_path, monkeypatch):
     engine.dispose()
 
 
-def register(db, instance="instance-a", node="node-a"):
+def register(db, instance="instance-a", node="node-a", **kwargs):
     return inventory.register_worker_instance(
         db, instance_id=instance, worker_id="same-worker", node_id=node,
         hostname="container-hostname", process_scope={"boot_id": instance},
         allowed_engines=["ultralytics-yolo"], nvidia_visible_devices="all",
-        cuda_visible_devices=None, started_at=NOW,
+        cuda_visible_devices=None, started_at=NOW, **kwargs,
     )
+
+
+def test_managed_node_latches_on_registration_without_queued_tasks(db):
+    from train_platform.models.v3.gpu_allocation import GpuNodeSchedulingState
+
+    policy = dict(shared_execution_enabled=True, max_shared_tasks_per_device=2, memory_safety_mib=4096)
+    register(db, scheduling_policy=policy)
+    db.commit()
+    register(db, "instance-b", scheduling_policy={**policy, "memory_safety_mib": 0})
+    register(db, "instance-c", scheduling_policy=None, accepting_tasks=False)
+    db.commit()
+    node = db.get(GpuNodeSchedulingState, "node-a")
+    assert node.managed and node.shared_execution_enabled
+    assert node.memory_safety_mib == 4096
 
 
 def sample(*, at=NOW, used=100, total=1000, free=900):

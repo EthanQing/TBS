@@ -34,14 +34,8 @@ def _utcnow() -> datetime:
 def _load_run(db: Session, run_id: str, *, for_update: bool = False) -> TrainingRun:
     query = db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id))
     if for_update:
-        try:
-            query = query.with_for_update()
-        except Exception:
-            pass
-    try:
-        run = query.populate_existing().first()
-    except Exception:
-        run = db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id)).first()
+        query = query.with_for_update()
+    run = query.populate_existing().first()
     if not run:
         raise NotFoundError("Training run not found")
     return run
@@ -59,6 +53,8 @@ def _clear_claim(run: TrainingRun) -> None:
 
 
 def _queue_locked(run: TrainingRun, *, now: datetime) -> None:
+    if getattr(run, "current_allocation_id", None):
+        raise ConflictError("cleanup_pending: active allocation must be released before queueing")
     run.queued_at = run.queued_at or now
     run.hidden = False
     run.status = TrainingRunStatus.QUEUED
@@ -128,8 +124,12 @@ def mark_started(
     worker_id: str,
     pid: int,
     started_at: datetime | None = None,
+    allocation_id: str | None = None,
+    commit: bool = True,
 ) -> TrainingRun:
     run = _load_run(db, run_id, for_update=True)
+    if getattr(run, "current_allocation_id", None) != allocation_id:
+        raise ConflictError("Execution allocation mismatch")
     if run.status != TrainingRunStatus.QUEUED:
         raise ConflictError(f"Run status is {run.status}; cannot start")
     if run.worker_id is not None and str(run.worker_id) != str(worker_id):
@@ -145,9 +145,34 @@ def mark_started(
     run.error_message = None
     run.status = TrainingRunStatus.RUNNING
     _event(db, run.run_id, "started", f"Run started by worker {worker_id}")
-    db.commit()
-    db.refresh(run)
+    if commit:
+        db.commit()
+        db.refresh(run)
     return run
+
+
+def execution_matches(
+    db: Session, run: TrainingRun, *, allocation_id: str | None = None,
+    expected_pid: int | None = None, expected_create_time: float | None = None,
+) -> bool:
+    """Fence callbacks from earlier executions, including reused process IDs."""
+    if getattr(run, "current_allocation_id", None) != allocation_id:
+        return False
+    if expected_pid is not None and run.pid != expected_pid:
+        return False
+    if allocation_id is None:
+        return True
+    from train_platform.models.v3.gpu_allocation import GpuAllocation
+
+    allocation = db.get(GpuAllocation, allocation_id)
+    if allocation is None or allocation.active_run_id != run.run_id:
+        return False
+    owner = allocation.execution_owner or {}
+    return (
+        expected_pid is not None and expected_create_time is not None
+        and owner.get("guard_pid") == expected_pid
+        and owner.get("guard_create_time") == expected_create_time
+    )
 
 
 def touch_heartbeat(
@@ -158,8 +183,13 @@ def touch_heartbeat(
     expected_pid: int | None = None,
     heartbeat_at: datetime | None = None,
     commit: bool = True,
+    allocation_id: str | None = None,
+    expected_create_time: float | None = None,
 ) -> bool:
-    run = _load_run(db, run_id)
+    run = _load_run(db, run_id, for_update=True)
+    if not execution_matches(db, run, allocation_id=allocation_id,
+                             expected_pid=expected_pid, expected_create_time=expected_create_time):
+        return False
     if run.status != TrainingRunStatus.RUNNING:
         return False
     if execution_owner is not None and str(run.worker_id or "") != str(execution_owner):
@@ -167,6 +197,10 @@ def touch_heartbeat(
     if expected_pid is not None and (run.pid is None or int(run.pid) != int(expected_pid)):
         return False
     run.heartbeat_at = heartbeat_at or _utcnow()
+    if allocation_id:
+        from train_platform.models.v3.gpu_allocation import GpuAllocation
+
+        db.get(GpuAllocation, allocation_id).heartbeat_at = run.heartbeat_at
     if commit:
         db.commit()
     return True
@@ -174,6 +208,8 @@ def touch_heartbeat(
 
 def release_stale_claim(db: Session, run_id: str) -> TrainingRun:
     run = _load_run(db, run_id, for_update=True)
+    if getattr(run, "current_allocation_id", None):
+        return run
     if run.status != TrainingRunStatus.QUEUED or run.worker_id is None:
         return run
     _clear_claim(run)
@@ -192,7 +228,8 @@ def request_cancel(db: Session, run_id: str, *, reason: str | None = None) -> Tr
     if reason:
         run.cancel_reason = str(reason)
     _event(db, run.run_id, "cancel_requested", reason or "Cancel requested")
-    if run.status in (TrainingRunStatus.CREATED, TrainingRunStatus.QUEUED):
+    _revoke_pending_start(db, run, reason=reason or "Cancel requested")
+    if run.status in (TrainingRunStatus.CREATED, TrainingRunStatus.QUEUED) and not getattr(run, "current_allocation_id", None):
         run.status = TrainingRunStatus.CANCELLED
         run.finished_at = _utcnow()
         _clear_claim(run)
@@ -212,7 +249,8 @@ def request_delete(db: Session, run_id: str) -> TrainingRun:
     if run.cancel_requested_at is None:
         run.cancel_requested_at = _utcnow()
     _event(db, run.run_id, "delete_requested", "Delete requested")
-    if run.status != TrainingRunStatus.RUNNING:
+    _revoke_pending_start(db, run, reason="Delete requested")
+    if run.status != TrainingRunStatus.RUNNING and not getattr(run, "current_allocation_id", None):
         run.status = TrainingRunStatus.DELETED
         run.finished_at = run.finished_at or _utcnow()
         _clear_claim(run)
@@ -222,6 +260,22 @@ def request_delete(db: Session, run_id: str) -> TrainingRun:
     return run
 
 
+def _revoke_pending_start(db: Session, run: TrainingRun, *, reason: str) -> None:
+    allocation_id = getattr(run, "current_allocation_id", None)
+    if allocation_id is None:
+        return
+    from train_platform.models.v3.gpu_allocation import GpuAllocation
+    from train_platform.domains.training.resources.lifecycle import revoke_unactivated_allocation
+
+    allocation = db.get(GpuAllocation, allocation_id)
+    if allocation is None:
+        raise ConflictError("Active GPU allocation is missing")
+    revoke_unactivated_allocation(
+        db, allocation_id, run_id=str(run.run_id),
+        worker_instance_id=allocation.worker_instance_id, reason=reason,
+    )
+
+
 def finalize_execution(
     db: Session,
     run_id: str,
@@ -229,10 +283,16 @@ def finalize_execution(
     exit_code: int,
     expected_pid: int | None = None,
     error_message: str | None = None,
+    allocation_id: str | None = None,
+    expected_create_time: float | None = None,
+    commit: bool = True,
 ) -> FinalizeResult:
     """Finalize one execution exactly once using the authoritative DB row."""
 
     run = _load_run(db, run_id, for_update=True)
+    if not execution_matches(db, run, allocation_id=allocation_id,
+                             expected_pid=expected_pid, expected_create_time=expected_create_time):
+        return FinalizeResult(str(run.run_id), False, run.status, run)
     if run.status in _TERMINAL_STATUSES:
         return FinalizeResult(str(run.run_id), False, run.status, run)
     if expected_pid is not None and (run.pid is None or int(run.pid) != int(expected_pid)):
@@ -272,9 +332,10 @@ def finalize_execution(
         message,
         level=LogLevel.ERROR if status == TrainingRunStatus.FAILED else LogLevel.INFO,
     )
-    db.commit()
+    if commit:
+        db.commit()
 
-    if status == TrainingRunStatus.COMPLETED:
+    if commit and status == TrainingRunStatus.COMPLETED:
         from .artifacts import index_completion_artifacts
 
         try:

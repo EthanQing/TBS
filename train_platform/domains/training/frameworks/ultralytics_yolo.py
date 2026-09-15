@@ -227,9 +227,14 @@ class PreparedUltralyticsExecution:
     amp: bool
     train_args: dict[str, Any]
     execution_owner: dict[str, Any]
+    allocation_id: str | None = None
+    worker_instance_id: str | None = None
+    assigned_gpu_uuids: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        result["assigned_gpu_uuids"] = list(self.assigned_gpu_uuids)
+        return result
 
 
 class UltralyticsYOLOTrainer:
@@ -264,6 +269,10 @@ class UltralyticsYOLOTrainer:
         return dict(raw or {})
 
     def _prepare(self, spec: TrainingExecutionSpec, cleanup: ExitStack) -> PreparedUltralyticsExecution:
+        if spec.allocation_id:
+            from train_platform.platform.runtime.cuda_devices import validate_assigned_devices
+
+            validate_assigned_devices(spec.assigned_gpu_uuids)
         import torch
         from ultralytics import RTDETR, YOLO
         variant = (str(spec.variant or "") or "yolov8n").strip()
@@ -379,7 +388,7 @@ class UltralyticsYOLOTrainer:
 
         requested = normalize_device_spec(spec.requested_device or "auto")
         runtime = normalize_device_spec(spec.runtime_device or requested)
-        gpu_ids = extract_selected_gpu_ids(runtime)
+        gpu_ids = list(range(len(spec.assigned_gpu_uuids))) if spec.allocation_id else extract_selected_gpu_ids(runtime)
         world_size = len(gpu_ids)
         if gpu_ids and not torch.cuda.is_available():
             raise RuntimeError(f"GPU device(s) requested ({requested}) but CUDA is not available")
@@ -391,7 +400,7 @@ class UltralyticsYOLOTrainer:
         if world_size > 1 and batch > 0 and batch % world_size:
             raise RuntimeError(f"batch_size ({batch}) must be divisible by GPU count ({world_size})")
         visible = os.getenv("CUDA_VISIBLE_DEVICES", runtime if gpu_ids else "")
-        if world_size > 1:
+        if world_size > 1 and not spec.allocation_id:
             if len(extract_selected_gpu_ids(visible)) != world_size:
                 raise ValueError("Frozen CUDA_VISIBLE_DEVICES does not match the assigned GPU count")
             os.environ["CUDA_VISIBLE_DEVICES"] = visible
@@ -460,6 +469,9 @@ class UltralyticsYOLOTrainer:
             amp=amp,
             train_args=args,
             execution_owner=dict(spec.execution_owner),
+            allocation_id=spec.allocation_id,
+            worker_instance_id=spec.worker_instance_id,
+            assigned_gpu_uuids=spec.assigned_gpu_uuids,
         )
         del metadata_model, module, checkpoint
         gc.collect()
@@ -496,7 +508,14 @@ class UltralyticsYOLOTrainer:
                         raise SystemExit(0)
 
             model.add_callback("on_train_batch_end", cancel_on_batch)
-            model.train(trainer=platform_trainer_for(model._smart_load("trainer")), **prepared.train_args)
+            train_args = dict(prepared.train_args)
+            validation_device = {}
+            if prepared.allocation_id:
+                import torch
+
+                train_args["device"] = torch.device("cuda", 0)
+                validation_device["device"] = torch.device("cuda", 0)
+            model.train(trainer=platform_trainer_for(model._smart_load("trainer")), **train_args)
             try:
                 model.val(
                     data=prepared.train_args["data"],
@@ -504,6 +523,7 @@ class UltralyticsYOLOTrainer:
                     name="output",
                     save_dir=prepared.output_dir,
                     exist_ok=True,
+                    **validation_device,
                 )
             except Exception:
                 pass

@@ -205,9 +205,11 @@ def test_worker_records_scope_before_publishing_started_claim(tmp_path, monkeypa
     try:
         instance._try_start_next_run()
         assert published == [True]
-        assert instance._running is not None
+        assert instance.has_running_jobs()
     finally:
-        instance._cleanup_running()
+        for job in list(instance._running_jobs.values()):
+            instance._cleanup_running(job)
+        instance._cleanup_executor.shutdown(wait=False)
 
 
 @pytest.mark.parametrize("foreign_pid", [987, 123])

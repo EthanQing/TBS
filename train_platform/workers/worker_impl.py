@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from typing import Any, Mapping, Optional, TextIO
 
 import psutil
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
@@ -61,7 +63,8 @@ def _write_execution_record(run_root: Path, run_id: str, owner: Mapping[str, Any
     target = runtime_dir / "execution.json"
     temporary = runtime_dir / "execution.json.tmp"
     temporary.write_text(
-        json.dumps({"run_id": str(run_id), "execution_owner": dict(owner)}, ensure_ascii=False, indent=2) + "\n",
+        json.dumps({"run_id": str(run_id), "allocation_id": owner.get("allocation_id"),
+                    "execution_owner": dict(owner)}, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     temporary.replace(target)
@@ -96,11 +99,18 @@ def _identity_is_live(identity: Mapping[str, Any]) -> bool | None:
         return None
 
 
-def _spawn_training_subprocess(run_id: str, *, stdout_f: TextIO, stderr_f: TextIO) -> subprocess.Popen:
+def _spawn_training_subprocess(run_id: str, *, stdout_f: TextIO, stderr_f: TextIO,
+                               allocation_id: str | None = None, worker_instance_id: str | None = None,
+                               assigned_gpu_uuids: list[str] | None = None) -> subprocess.Popen:
     args = [sys.executable, "-m", "train_platform.workers.training.train_entry", "--run-id", run_id]
+    if allocation_id:
+        args += ["--allocation-id", allocation_id, "--worker-instance-id", str(worker_instance_id)]
     env = os.environ.copy()
     # Redirected Python streams choose their own encoding, independent of the log file handles.
     env["PYTHONIOENCODING"] = "utf-8"
+    if allocation_id:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned_gpu_uuids or [])
+        env["TRAIN_PLATFORM_ALLOCATION_ID"] = allocation_id
 
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
@@ -211,6 +221,31 @@ class RunningJob:
     guard_create_time: float = 0.0
     ultralytics_ddp: bool = False
     execution_owner: dict[str, Any] | None = None
+    allocation_id: str | None = None
+    worker_instance_id: str | None = None
+    gpu_count: int = 0
+    last_heartbeat_at: Optional[datetime] = None
+    cleanup_state: str = "running"
+    cleanup_future: Future | None = None
+    cancel_future: Future | None = None
+    cleanup_owner: dict[str, Any] | None = None
+    process_watch_stop: Any = None
+    process_watch_thread: Any = None
+
+
+class RecoveredProcess:
+    def __init__(self, pid: int, create_time: float, exit_code: int | None):
+        self.pid = int(pid)
+        self.create_time = float(create_time)
+        self.exit_code = exit_code
+
+    def poll(self):
+        state = _identity_is_live({"pid": self.pid, "create_time": self.create_time,
+                                   "process_scope": process_scope.get_process_scope()})
+        return None if state is True else self.exit_code if state is False else None
+
+    def terminate(self):
+        psutil.Process(self.pid).terminate()
 
 
 class DbQueueWorker:
@@ -231,8 +266,8 @@ class DbQueueWorker:
         )
         self.visible_host_gpu_ids = parse_visible_host_gpu_ids()
 
-        self._running: Optional[RunningJob] = None
-        self._last_heartbeat_at: Optional[datetime] = None
+        self._running_jobs: dict[str, RunningJob] = {}
+        self._cleanup_executor = ThreadPoolExecutor(max_workers=max(2, getattr(settings, "worker_max_concurrent_trainings", 2)))
         self._gpu_resource_reporter = None
 
     def start_resource_reporter(self) -> None:
@@ -273,17 +308,125 @@ class DbQueueWorker:
                     time.sleep(self.poll_interval)
         finally:
             self.stop_resource_reporter()
+            self._cleanup_executor.shutdown(wait=False, cancel_futures=False)
 
     def tick(self) -> None:
         assert_valid_license()
-        if self._running is not None:
-            self._tick_running()
-            return
-        self._try_start_next_run()
+        try:
+            self._reconcile_managed_allocations()
+        except Exception as exc:
+            print(f"[worker] allocation reconciliation deferred: {exc}", file=sys.stderr, flush=True)
+        for key, job in list(self._running_jobs.items()):
+            try:
+                self._tick_running(job)
+            except Exception as exc:
+                print(f"[worker] job maintenance error allocation={key}: {exc}", file=sys.stderr, flush=True)
+        self._publish_running_task_count()
+        while self.available_training_slots() > 0:
+            if not self._try_start_next_run():
+                break
 
-    def _tick_running(self) -> None:
-        assert self._running is not None
-        run_id = self._running.run_id
+    def has_running_jobs(self) -> bool:
+        return bool(self._running_jobs)
+
+    def running_job_count(self) -> int:
+        return len(self._running_jobs)
+
+    def available_training_slots(self) -> int:
+        limit = getattr(settings, "worker_max_concurrent_trainings", 2) if self._managed_scheduling_required() else 1
+        return max(0, limit - len(self._running_jobs))
+
+    def _publish_running_task_count(self) -> None:
+        instance_id = getattr(self._gpu_resource_reporter, "instance_id", None)
+        if not instance_id:
+            return
+        from train_platform.models.v3.gpu_resource import GpuWorkerInstance
+        db = SessionLocal()
+        try:
+            worker = db.get(GpuWorkerInstance, instance_id)
+            if worker is not None and hasattr(worker, "running_task_count"):
+                worker.running_task_count = len(self._running_jobs)
+                db.commit()
+        finally:
+            db.close()
+
+    def _reconcile_managed_allocations(self) -> None:
+        from train_platform.models.v3.gpu_allocation import GpuAllocation
+        from train_platform.domains.training.resources.lifecycle import revoke_unactivated_allocation
+        node_id = getattr(self._gpu_resource_reporter, "node_id", None)
+        if not node_id:
+            return
+        own_instance_id = getattr(self._gpu_resource_reporter, "instance_id", None)
+        db = SessionLocal()
+        try:
+            allocations = db.query(GpuAllocation).filter(
+                GpuAllocation.node_id == node_id,
+                GpuAllocation.state.in_(("reserved", "starting", "running", "releasing")),
+            ).all()
+            snapshots = [{
+                "allocation_id": item.allocation_id, "run_id": item.run_id,
+                "worker_instance_id": item.worker_instance_id, "authorization_state": item.authorization_state,
+                "deadline": item.launch_deadline_at, "owner": dict(item.execution_owner) if item.execution_owner else None,
+                "launcher": dict(item.launcher_identity) if item.launcher_identity else None,
+                "exit_code": item.exit_code, "gpu_count": len(item.devices),
+                "assigned_gpu_uuids": [device.gpu_uuid for device in sorted(item.devices, key=lambda row: row.ordinal)],
+                "cleanup_owner": (item.request_snapshot or {}).get("legacy_execution_owner"),
+            } for item in allocations]
+        finally:
+            db.close()
+        for allocation in snapshots:
+            if allocation["allocation_id"] in self._running_jobs:
+                continue
+            launcher = allocation["launcher"]
+            launcher_live = _identity_is_live(launcher) if launcher else None
+            own = allocation["worker_instance_id"] == own_instance_id
+            if not own and launcher_live is not False:
+                continue
+            owner = allocation["owner"]
+            if not owner:
+                deadline = allocation["deadline"] if allocation["deadline"].tzinfo else allocation["deadline"].replace(tzinfo=timezone.utc)
+                if allocation["authorization_state"] == "issued" and _utcnow() > deadline and (own or launcher_live is False):
+                    write_db = SessionLocal()
+                    try:
+                        revoke_unactivated_allocation(write_db, allocation["allocation_id"], run_id=allocation["run_id"],
+                                                      worker_instance_id=allocation["worker_instance_id"],
+                                                      reason="unactivated allocation launch deadline expired")
+                        write_db.commit()
+                    finally:
+                        write_db.close()
+                continue
+            if process_scope.compare_process_scope(owner.get("process_scope"), process_scope.get_process_scope()) != "same":
+                continue
+            live = _identity_is_live({"pid": owner.get("guard_pid"), "create_time": owner.get("guard_create_time"),
+                                      "process_scope": owner.get("process_scope")})
+            if live is None:
+                continue
+            run_dir = settings.training_dir / allocation["run_id"]
+            logs_dir = run_dir / "logs"; logs_dir.mkdir(parents=True, exist_ok=True)
+            stdout_path = logs_dir / "train.stdout.log"; stderr_path = logs_dir / "train.stderr.log"
+            exit_code = allocation["exit_code"] if allocation["exit_code"] is not None else 1
+            job = RunningJob(
+                    run_id=allocation["run_id"], allocation_id=allocation["allocation_id"],
+                    worker_instance_id=allocation["worker_instance_id"], engine="unknown",
+                    proc=RecoveredProcess(owner["guard_pid"], owner["guard_create_time"], exit_code),
+                    stdout_path=stdout_path, stderr_path=stderr_path,
+                    stdout_f=open(stdout_path, "a", encoding="utf-8", buffering=1),
+                    stderr_f=open(stderr_path, "a", encoding="utf-8", buffering=1),
+                    guard_create_time=float(owner["guard_create_time"]), execution_owner=owner,
+                    cleanup_owner=allocation["cleanup_owner"],
+                    gpu_count=allocation["gpu_count"], ultralytics_ddp=allocation["gpu_count"] > 1,
+                )
+            if live:
+                from train_platform.platform.runtime.execution_processes import start_descendant_registration
+                job.process_watch_stop, job.process_watch_thread = start_descendant_registration(
+                    settings.training_dir / allocation["run_id"], run_id=allocation["run_id"],
+                    allocation_id=allocation["allocation_id"], execution_owner=owner,
+                    supervisor_pid=int(owner["guard_pid"]), assigned_gpu_uuids=allocation["assigned_gpu_uuids"],
+                )
+            self._running_jobs[allocation["allocation_id"]] = job
+
+    def _tick_running(self, job: RunningJob) -> None:
+        run_id = job.run_id
 
         db = SessionLocal()
         should_cleanup = False
@@ -291,55 +434,88 @@ class DbQueueWorker:
         try:
             run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
             if not run:
-                self._validate_running_ddp_scope()
-                _terminate_process_tree(self._running.proc)
-                self._cleanup_registered_ddp()
+                if job.allocation_id:
+                    raise RuntimeError("managed execution lost its task record; allocation retained for reconciliation")
+                _terminate_process_tree(job.proc)
                 should_cleanup = True
                 return
 
             now = _utcnow()
-            if self._last_heartbeat_at is None or (now - self._last_heartbeat_at).total_seconds() >= self.heartbeat_interval:
+            if job.allocation_id and job.execution_owner is None:
+                from train_platform.models.v3.gpu_allocation import GpuAllocation
+                allocation = db.get(GpuAllocation, job.allocation_id)
+                if allocation and allocation.execution_owner:
+                    job.execution_owner = dict(allocation.execution_owner)
+                    job.guard_create_time = float(job.execution_owner["guard_create_time"])
+            if job.last_heartbeat_at is None or (now - job.last_heartbeat_at).total_seconds() >= self.heartbeat_interval:
                 if touch_heartbeat(
                     db,
                     run_id,
-                    execution_owner=self.worker_id,
-                    expected_pid=int(self._running.proc.pid),
+                    execution_owner=(job.execution_owner or {}).get("worker_id", self.worker_id) if job.allocation_id else self.worker_id,
+                    expected_pid=int(job.proc.pid),
                     heartbeat_at=now,
+                    allocation_id=job.allocation_id,
+                    expected_create_time=job.guard_create_time if job.allocation_id else None,
                 ):
-                    self._last_heartbeat_at = now
+                    job.last_heartbeat_at = now
+                    if job.allocation_id:
+                        from train_platform.models.v3.gpu_allocation import GpuAllocation
+                        allocation = db.get(GpuAllocation, job.allocation_id)
+                        if allocation and allocation.state != "released":
+                            allocation.heartbeat_at = now
+                            db.commit()
 
             cancel_requested = bool(run.cancel_requested_at is not None or run.delete_requested_at is not None)
-            if cancel_requested and self._running.proc.poll() is None:
-                if self._running.engine == "custom-source" or self._running.ultralytics_ddp:
+            if cancel_requested and job.proc.poll() is None:
+                if job.cancel_future is not None:
+                    if job.cancel_future.done():
+                        try:
+                            job.cancel_future.result()
+                        finally:
+                            job.cancel_future = None
+                    return
+                if job.engine == "custom-source" or job.ultralytics_ddp:
                     grace_seconds = (
                         ULTRALYTICS_DDP_CANCEL_FALLBACK_SECONDS
-                        if self._running.ultralytics_ddp
+                        if job.ultralytics_ddp
                         else CUSTOM_CANCEL_FALLBACK_SECONDS
                     )
-                    if self._running.cancel_seen_at is None:
-                        self._running.cancel_seen_at = now
-                    elif (now - self._running.cancel_seen_at).total_seconds() >= grace_seconds:
-                        self._validate_running_ddp_scope()
-                        _terminate_process_tree(self._running.proc)
-                        self._cleanup_registered_ddp()
-                        registered_cleanup_done = True
+                    if job.cancel_seen_at is None:
+                        job.cancel_seen_at = now
+                    elif (now - job.cancel_seen_at).total_seconds() >= grace_seconds:
+                        db.close()
+                        job.cancel_future = self._cleanup_executor.submit(self._terminate_running_job, job)
+                        return
                 else:
-                    _terminate_process_tree(self._running.proc)
+                    db.close()
+                    job.cancel_future = self._cleanup_executor.submit(self._terminate_running_job, job)
+                    return
 
-            rc = self._running.proc.poll()
+            rc = job.proc.poll()
             if rc is None:
                 return
 
-            if not registered_cleanup_done:
-                self._cleanup_registered_ddp()
-
-            result = finalize_execution(
-                db,
-                run_id,
-                exit_code=int(rc),
-                expected_pid=int(self._running.proc.pid),
-                error_message=f"Training subprocess exited with code {rc}" if rc != 0 else None,
-            )
+            if job.allocation_id:
+                if job.cleanup_future is None:
+                    job.cleanup_future = self._cleanup_executor.submit(self._finish_managed_job, job, int(rc))
+                    return
+                if not job.cleanup_future.done():
+                    return
+                try:
+                    cleanup_complete, managed_status, managed_changed = job.cleanup_future.result()
+                except Exception:
+                    job.cleanup_future = None
+                    raise
+                if not cleanup_complete:
+                    job.cleanup_future = None
+                    return
+                from types import SimpleNamespace
+                result = SimpleNamespace(changed=managed_changed, run_id=run_id, status=managed_status)
+            else:
+                if not registered_cleanup_done:
+                    self._cleanup_registered_ddp(job)
+                result = finalize_execution(db, run_id, exit_code=int(rc), expected_pid=int(job.proc.pid),
+                    error_message=f"Training subprocess exited with code {rc}" if rc != 0 else None)
             should_cleanup = True
             if result.changed:
                 evaluate_training_alerts_best_effort(db, run_ids=[str(result.run_id)])
@@ -349,60 +525,108 @@ class DbQueueWorker:
         finally:
             db.close()
             if should_cleanup:
-                self._cleanup_running()
-    def _cleanup_running(self) -> None:
-        if self._running is None:
-            return
+                self._cleanup_running(job)
+    def _cleanup_running(self, job: RunningJob) -> None:
+        if job.process_watch_stop is not None:
+            job.process_watch_stop.set()
+        if job.process_watch_thread is not None:
+            job.process_watch_thread.join(timeout=2.0)
         try:
-            self._running.stdout_f.close()
+            job.stdout_f.close()
         except Exception:
             pass
         try:
-            self._running.stderr_f.close()
+            job.stderr_f.close()
         except Exception:
             pass
-        self._running = None
-        self._last_heartbeat_at = None
+        self._running_jobs.pop(job.allocation_id or job.run_id, None)
 
-    def _validate_running_ddp_scope(self) -> None:
-        if self._running is None or not self._running.ultralytics_ddp:
-            return
-        owner = self._running.execution_owner
+    def _terminate_running_job(self, job: RunningJob) -> None:
+        owner = job.execution_owner
+        if owner and process_scope.compare_process_scope(owner.get("process_scope"), process_scope.get_process_scope()) != "same":
+            raise RuntimeError("refusing to terminate execution in a different process scope")
+        if owner:
+            live = _identity_is_live({"pid": owner.get("guard_pid"),
+                                      "create_time": owner.get("guard_create_time"),
+                                      "process_scope": owner.get("process_scope")})
+            if live is False:
+                return
+            if live is None:
+                raise RuntimeError("execution process identity cannot be verified")
+        _terminate_process_tree(job.proc)
+
+    def _finish_managed_job(self, job: RunningJob, rc: int) -> tuple[bool, TrainingRunStatus | None, bool]:
+        from train_platform.domains.training.resources.lifecycle import record_execution_result, request_releasing, finish_allocation
+        from train_platform.models.v3.gpu_allocation import GpuAllocation
+        from train_platform.platform.runtime.execution_processes import cleanup_registered_execution
+        db = SessionLocal()
+        try:
+            allocation = db.get(GpuAllocation, job.allocation_id)
+            if allocation and allocation.state == "released":
+                run = db.get(TrainingRun, job.run_id)
+                return True, run.status if run else None, False
+            owner = allocation.execution_owner if allocation else None
+            if not owner:
+                from train_platform.domains.training.resources.lifecycle import revoke_unactivated_allocation
+                revoke_unactivated_allocation(db, job.allocation_id, run_id=job.run_id,
+                                              worker_instance_id=job.worker_instance_id,
+                                              reason="training subprocess exited before activation")
+                db.commit()
+                return True, None, False
+            job.execution_owner = dict(owner)
+            if allocation.exit_code is None:
+                record_execution_result(db, job.allocation_id, owner, rc, f"Training subprocess exited with code {rc}" if rc else None)
+            request_releasing(db, job.allocation_id, owner)
+            db.commit()
+        finally:
+            db.close()
+        if job.ultralytics_ddp:
+            self._cleanup_registered_ddp(job)
+        proof = cleanup_registered_execution(
+            settings.training_dir / job.run_id, run_id=job.run_id,
+            allocation_id=job.allocation_id, execution_owner=owner,
+        )
+        if not proof["complete"]:
+            return False, None, False
+        db = SessionLocal()
+        try:
+            finish_allocation(db, job.allocation_id, owner, proof)
+            db.commit()
+            run = db.get(TrainingRun, job.run_id)
+            status = run.status if run else None
+        finally:
+            db.close()
+        if status == TrainingRunStatus.COMPLETED:
+            from train_platform.domains.training.runs import index_completion_artifacts
+            artifact_db = SessionLocal()
+            try:
+                index_completion_artifacts(artifact_db, job.run_id)
+                artifact_db.commit()
+            except Exception as exc:
+                artifact_db.rollback()
+                print(f"[worker] artifact indexing failed run_id={job.run_id}: {exc}", file=sys.stderr, flush=True)
+            finally:
+                artifact_db.close()
+        return True, status, True
+
+    def _validate_running_ddp_scope(self, job: RunningJob) -> None:
+        owner = job.execution_owner
         if not isinstance(owner, dict):
-            raise UltralyticsDDPCleanupIncomplete(
-                "running DDP job has no execution owner",
-                run_id=self._running.run_id, attempt_id="unknown",
-                execution_owner={}, survivors=[],
-            )
-        scope_status = process_scope.compare_process_scope(
-            owner.get("process_scope"), process_scope.get_process_scope()
-        )
-        if scope_status != "same":
-            raise UltralyticsDDPCleanupIncomplete(
-                f"running DDP execution process scope is {scope_status}",
-                run_id=self._running.run_id, attempt_id="unknown",
-                execution_owner=owner, survivors=[],
-            )
-        run_root = settings.training_dir / self._running.run_id
-        record = _read_execution_record(run_root)
-        if record is None:
-            _write_execution_record(run_root, self._running.run_id, owner)
+            raise UltralyticsDDPCleanupIncomplete("running DDP job has no execution owner", run_id=job.run_id,
+                                                  attempt_id="unknown", execution_owner={}, survivors=[])
+        status = process_scope.compare_process_scope(owner.get("process_scope"), process_scope.get_process_scope())
+        if status != "same":
+            raise UltralyticsDDPCleanupIncomplete(f"running DDP execution process scope is {status}", run_id=job.run_id,
+                                                  attempt_id="unknown", execution_owner=owner, survivors=[])
 
-    def _cleanup_registered_ddp(self) -> None:
-        if self._running is None or not self._running.ultralytics_ddp:
+    def _cleanup_registered_ddp(self, job: RunningJob) -> None:
+        if not job.ultralytics_ddp:
             return
-        self._validate_running_ddp_scope()
-        owner = self._running.execution_owner
-        assert isinstance(owner, dict)
-        survivors = terminate_registered_processes(
-            settings.training_dir / self._running.run_id,
-            run_id=self._running.run_id,
-            owner=owner,
-            grace_seconds=2.0,
-        )
+        self._validate_running_ddp_scope(job)
+        survivors = terminate_registered_processes(settings.training_dir / job.run_id, run_id=job.run_id,
+                                                     owner=job.cleanup_owner or job.execution_owner, grace_seconds=2.0)
         if survivors:
-            pids = ",".join(str(process.pid) for process in survivors)
-            raise UltralyticsDDPError(f"Registered training processes are still alive: run_id={self._running.run_id} pids={pids}")
+            raise UltralyticsDDPError(f"Registered training processes are still alive: pids={','.join(str(x.pid) for x in survivors)}")
 
     def _cleanup_stale_ddp(self, run: TrainingRun) -> bool:
         run_id = str(run.run_id)
@@ -513,7 +737,15 @@ class DbQueueWorker:
                 return False
         return True
 
-    def _try_start_next_run(self) -> None:
+    def _try_start_next_run(self) -> bool:
+        managed_mode = self._managed_scheduling_required()
+        if managed_mode:
+            if not getattr(settings, "gpu_scheduler_enabled", False):
+                return False
+            if self._gpu_resource_reporter is None:
+                return False
+            if self._try_start_managed():
+                return True
         db = SessionLocal()
         try:
             self._reconcile_stale_claims(db)
@@ -531,6 +763,8 @@ class DbQueueWorker:
             if self.allowed_engines:
                 q = q.filter(ModelArchitecture.engine.in_(sorted(self.allowed_engines)))
             q = q.filter(~TrainingRun.resource_request.has())
+            if managed_mode:
+                q = q.filter(TrainingRun.parameters.has(device="cpu"))
 
             # Best-effort row locking for multi-worker.
             try:
@@ -541,11 +775,21 @@ class DbQueueWorker:
             run = None
             for candidate in q.limit(50).all():
                 device_spec = getattr(getattr(candidate, "parameters", None), "device", "auto")
+                if managed_mode and str(device_spec or "auto").strip().lower() != "cpu":
+                    continue
                 if worker_can_run_device(device_spec, self.visible_host_gpu_ids):
                     run = candidate
                     break
             if not run:
-                return
+                return False
+
+            if not managed_mode:
+                from train_platform.models.v3.gpu_allocation import GpuNodeSchedulingState
+                node_id = getattr(self._gpu_resource_reporter, "node_id", None) or getattr(settings, "gpu_node_id", None)
+                if node_id:
+                    node = db.query(GpuNodeSchedulingState).filter_by(node_id=node_id).with_for_update().first()
+                    if node is not None and node.managed:
+                        return False
 
             engine = str(getattr(run.architecture, "engine", "") or "").strip().lower()
             ultralytics_ddp = (
@@ -592,7 +836,7 @@ class DbQueueWorker:
                 raise
             evaluate_training_alerts_best_effort(db, run_ids=[str(started.run_id)])
 
-            self._running = RunningJob(
+            job = RunningJob(
                 run_id=run.run_id,
                 engine=engine,
                 proc=proc,
@@ -604,10 +848,185 @@ class DbQueueWorker:
                 ultralytics_ddp=ultralytics_ddp,
                 execution_owner=execution_owner,
             )
-            self._last_heartbeat_at = now
+            job.last_heartbeat_at = now
+            self._running_jobs[job.run_id] = job
+            return True
 
         finally:
             db.close()
+
+    def _managed_scheduling_required(self) -> bool:
+        if getattr(settings, "gpu_scheduler_enabled", False):
+            return True
+        node_id = getattr(self._gpu_resource_reporter, "node_id", None) or getattr(settings, "gpu_node_id", None)
+        if not node_id:
+            return False
+        from train_platform.models.v3.gpu_allocation import GpuNodeSchedulingState
+        db = SessionLocal()
+        try:
+            state = db.get(GpuNodeSchedulingState, node_id)
+            return bool(state and state.managed)
+        finally:
+            db.close()
+
+    def _try_start_managed(self) -> bool:
+        from train_platform.domains.training.resources.allocator import reserve_next
+        from train_platform.domains.training.resources.lifecycle import issue_start_authorization, revoke_unactivated_allocation
+        db = SessionLocal()
+        allocation = None
+        proc = None
+        stdout_f = stderr_f = None
+        try:
+            instance_id = self._gpu_resource_reporter.instance_id
+            self._adopt_proven_legacy_executions(instance_id)
+            if db.get_bind().dialect.name == "mysql":
+                db.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            decision = reserve_next(
+                db, instance_id, scheduler_enabled=settings.gpu_scheduler_enabled,
+                shared_execution_enabled=settings.gpu_shared_execution_enabled,
+                node_defaults={"max_shared_tasks_per_device": settings.gpu_max_shared_tasks_per_device,
+                               "memory_safety_mib": settings.gpu_memory_safety_mib},
+                stale_after_seconds=settings.gpu_inventory_stale_after_seconds,
+                start_timeout_seconds=settings.gpu_allocation_start_timeout_seconds,
+            )
+            if decision.allocation is None:
+                db.commit()
+                return False
+            allocation = decision.allocation
+            allocation_id = allocation.allocation_id
+            run_id = allocation.run_id
+            assigned = [item.gpu_uuid for item in sorted(allocation.devices, key=lambda item: item.ordinal)]
+            sharing = allocation.request_snapshot["sharing"]
+            engine = str(db.get(TrainingRun, run_id).architecture.engine).lower()
+            db.commit()
+            deadline = _utcnow() + timedelta(seconds=settings.gpu_allocation_start_timeout_seconds)
+            issue_start_authorization(db, allocation_id, allocation.launcher_identity or {}, deadline)
+            db.commit()
+            run_dir = settings.training_dir / run_id
+            logs_dir = run_dir / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            stdout_path = logs_dir / "train.stdout.log"
+            stderr_path = logs_dir / "train.stderr.log"
+            stdout_f = open(stdout_path, "a", encoding="utf-8", buffering=1)
+            stderr_f = open(stderr_path, "a", encoding="utf-8", buffering=1)
+            proc = _spawn_training_subprocess(
+                run_id, stdout_f=stdout_f, stderr_f=stderr_f,
+                allocation_id=allocation_id, worker_instance_id=instance_id,
+                assigned_gpu_uuids=assigned,
+            )
+            create_time = float(psutil.Process(proc.pid).create_time())
+            self._running_jobs[allocation_id] = RunningJob(
+                run_id=run_id, allocation_id=allocation_id, worker_instance_id=instance_id,
+                engine=engine, proc=proc, stdout_path=stdout_path, stderr_path=stderr_path,
+                stdout_f=stdout_f, stderr_f=stderr_f, guard_create_time=create_time,
+                gpu_count=len(assigned), ultralytics_ddp=engine == "ultralytics-yolo" and len(assigned) > 1,
+                last_heartbeat_at=_utcnow(),
+            )
+            return True
+        except Exception as exc:
+            db.rollback()
+            if proc is not None:
+                # Activation may already have committed. Keep supervising the
+                # child; only the ordinary cleanup flow may release its budget.
+                self._running_jobs[allocation_id] = RunningJob(
+                    run_id=run_id, allocation_id=allocation_id, worker_instance_id=instance_id,
+                    engine=engine, proc=proc, stdout_path=stdout_path, stderr_path=stderr_path,
+                    stdout_f=stdout_f, stderr_f=stderr_f, gpu_count=len(assigned),
+                    ultralytics_ddp=engine == "ultralytics-yolo" and len(assigned) > 1,
+                )
+                print(f"[worker] launch identity pending reconciliation: {exc}", file=sys.stderr, flush=True)
+                return True
+            if allocation is not None:
+                try:
+                    revoke_unactivated_allocation(db, allocation.allocation_id, run_id=allocation.run_id,
+                                                  worker_instance_id=allocation.worker_instance_id,
+                                                  reason=f"launch failed: {exc}")
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            for handle in (stdout_f, stderr_f):
+                if handle:
+                    handle.close()
+            print(f"[worker] managed launch failed: {exc}", file=sys.stderr, flush=True)
+            return False
+        finally:
+            db.close()
+
+    def _adopt_proven_legacy_executions(self, worker_instance_id: str) -> None:
+        from train_platform.domains.training.resources.allocator import adopt_legacy_execution
+        from train_platform.platform.runtime.cuda_devices import cuda_environment_fingerprint
+        read_db = SessionLocal()
+        try:
+            candidates = [(str(run.run_id), str(run.worker_id or "")) for run in read_db.query(TrainingRun).filter(
+                TrainingRun.status == TrainingRunStatus.RUNNING,
+                TrainingRun.current_allocation_id.is_(None),
+            ).all()]
+        finally:
+            read_db.close()
+        for run_id, _worker_id in candidates:
+            run_dir = settings.training_dir / run_id
+            records: list[dict[str, Any]] = []
+            try:
+                execution = _read_execution_record(run_dir)
+                if execution:
+                    records.append(execution)
+                for path in (run_dir / "runtime" / "ddp").glob("*/context.json"):
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(value, dict):
+                        records.append(value)
+            except (OSError, ValueError):
+                continue
+            for record in records:
+                owner = record.get("execution_owner")
+                assigned = record.get("assigned_gpu_uuids")
+                if not isinstance(owner, dict) or not isinstance(assigned, list) or not assigned:
+                    continue
+                if _identity_is_live({"pid": owner.get("guard_pid"), "create_time": owner.get("guard_create_time"),
+                                      "process_scope": owner.get("process_scope")}) is not True:
+                    continue
+                write_db = SessionLocal()
+                try:
+                    decision = adopt_legacy_execution(
+                        write_db, run_id=run_id, worker_instance_id=worker_instance_id,
+                        execution_owner=owner, assigned_gpu_uuids=[str(item) for item in assigned],
+                        cuda_environment_fingerprint=cuda_environment_fingerprint(),
+                        stale_after_seconds=settings.gpu_inventory_stale_after_seconds,
+                    )
+                    registration = None
+                    if decision.allocation:
+                        registration = (
+                            decision.allocation.allocation_id,
+                            dict(decision.allocation.execution_owner or {}),
+                            [str(item) for item in assigned],
+                        )
+                    write_db.commit()
+                    if registration:
+                        from train_platform.platform.runtime.execution_processes import register_execution_process, start_descendant_registration
+                        allocation_id, managed_owner, assigned_uuids = registration
+                        register_execution_process(
+                            settings.training_dir / run_id, run_id=run_id, allocation_id=allocation_id,
+                            execution_owner=managed_owner, pid=int(managed_owner["guard_pid"]), role="supervisor",
+                            assigned_gpu_uuids=assigned_uuids,
+                        )
+                        watch_stop, watch_thread = start_descendant_registration(
+                            settings.training_dir / run_id, run_id=run_id, allocation_id=allocation_id,
+                            execution_owner=managed_owner, supervisor_pid=int(managed_owner["guard_pid"]),
+                            assigned_gpu_uuids=assigned_uuids,
+                        )
+                        existing = self._running_jobs.pop(run_id, None)
+                        if existing is not None:
+                            existing.allocation_id = allocation_id
+                            existing.worker_instance_id = worker_instance_id
+                            existing.execution_owner = managed_owner
+                            existing.cleanup_owner = owner
+                            existing.process_watch_stop = watch_stop
+                            existing.process_watch_thread = watch_thread
+                            self._running_jobs[allocation_id] = existing
+                        break
+                except Exception:
+                    write_db.rollback()
+                finally:
+                    write_db.close()
 
     def _reconcile_stale_claims(self, db: Session) -> None:
         now = _utcnow()
@@ -618,6 +1037,7 @@ class DbQueueWorker:
             .filter(TrainingRun.status == TrainingRunStatus.QUEUED)
             .filter(TrainingRun.queued_at.isnot(None))
             .filter(TrainingRun.worker_id.isnot(None))
+            .filter(TrainingRun.current_allocation_id.is_(None))
             .filter(
                 (TrainingRun.heartbeat_at.is_(None) & (TrainingRun.claimed_at < threshold))
                 | (TrainingRun.heartbeat_at < threshold)
@@ -633,6 +1053,7 @@ class DbQueueWorker:
             db.query(TrainingRun)
             .filter(TrainingRun.status == TrainingRunStatus.RUNNING)
             .filter(TrainingRun.worker_id.isnot(None))
+            .filter(TrainingRun.current_allocation_id.is_(None))
             .filter(
                 (TrainingRun.heartbeat_at.is_(None) & (TrainingRun.started_at < threshold))
                 | (TrainingRun.heartbeat_at < threshold)
@@ -640,6 +1061,8 @@ class DbQueueWorker:
             .all()
         )
         for run in stale_running:
+            if self._managed_scheduling_required():
+                continue
             engine = str(getattr(getattr(run, "architecture", None), "engine", "") or "").strip().lower()
             device = getattr(getattr(run, "parameters", None), "device", "auto")
             if engine == "ultralytics-yolo" and len(extract_selected_gpu_ids(device)) > 1:

@@ -5,7 +5,7 @@ import math
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -33,6 +33,7 @@ class GpuProbeDevice:
     mig_mode: str | None = None
     status: str = "success"
     error: str | None = None
+    process_snapshot: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,53 @@ def _mib(value: Any, *, used: bool = False) -> int | None:
     return math.ceil(number) if used else math.floor(number)
 
 
+def _compute_mode(value: Any) -> str:
+    text = (_text(value) or "").lower().replace("_", " ").replace("-", " ")
+    if text in {"0", "default"}: return "default"
+    if text in {"1", "exclusive thread"}: return "exclusive_thread"
+    if text in {"2", "prohibited"}: return "prohibited"
+    if text in {"3", "exclusive process"}: return "exclusive_process"
+    return "unknown"
+
+
+def _mig_mode(value: Any) -> str:
+    text = (_text(value) or "").lower()
+    if text in {"1", "enabled"}: return "enabled"
+    if text in {"0", "disabled"}: return "disabled"
+    if text in {"n/a", "not supported", "not_supported"}: return "not_supported"
+    return "unknown"
+
+
+def _nvml_process_snapshot(handle) -> dict:
+    rows: dict[int, int | None] = {}
+    errors: list[str] = []
+    attempted = False
+    for names in (("nvmlDeviceGetComputeRunningProcesses_v3", "nvmlDeviceGetComputeRunningProcesses"),
+                  ("nvmlDeviceGetGraphicsRunningProcesses_v3", "nvmlDeviceGetGraphicsRunningProcesses")):
+        name = next((candidate for candidate in names if getattr(pynvml, candidate, None) is not None), None)
+        fn = getattr(pynvml, name, None) if name else None
+        if fn is None:
+            continue
+        attempted = True
+        try:
+            for process in fn(handle) or []:
+                pid = int(process.pid)
+                raw = getattr(process, "usedGpuMemory", None)
+                unavailable = getattr(pynvml, "NVML_VALUE_NOT_AVAILABLE", None)
+                used = _floor_mib_bytes(raw) if isinstance(raw, int) and raw >= 0 and raw != unavailable else None
+                prior = rows.get(pid)
+                rows[pid] = used if prior is None else prior if used is None else max(prior, used)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    return {
+        "processes": [{"driver_pid": pid, "memory_used_mib": rows[pid]} for pid in sorted(rows)],
+        "complete": attempted and not errors,
+        "accounting_status": "verified" if attempted and not errors else "conservative",
+        "pid_view": "driver",
+        "error": "; ".join(errors) or None,
+    }
+
+
 def _nvml_probe(sampled_at: datetime) -> GpuProbeResult:
     if pynvml is None:
         return GpuProbeResult("unavailable", "nvml", sampled_at, error="pynvml is unavailable")
@@ -142,8 +190,12 @@ def _nvml_probe(sampled_at: datetime) -> GpuProbeResult:
             memory = read("memory", lambda: pynvml.nvmlDeviceGetMemoryInfo(handle))
             try:
                 mig = pynvml.nvmlDeviceGetMigMode(handle)[0] if hasattr(pynvml, "nvmlDeviceGetMigMode") else None
-            except Exception:
-                mig = None
+            except Exception as exc:
+                if getattr(exc, "value", None) == getattr(pynvml, "NVML_ERROR_NOT_SUPPORTED", 3):
+                    mig = "not_supported"
+                else:
+                    mig = None
+                    errors.append(f"mig_mode: {exc}")
             util = read("utilization", lambda: pynvml.nvmlDeviceGetUtilizationRates(handle))
             uuid = _text(read("uuid", lambda: pynvml.nvmlDeviceGetUUID(handle)))
             if not uuid or not GPU_UUID_RE.fullmatch(uuid):
@@ -158,8 +210,17 @@ def _nvml_probe(sampled_at: datetime) -> GpuProbeResult:
             memory_used_mib = _ceil_mib_bytes(getattr(memory, "used", None))
             memory_free_mib = _floor_mib_bytes(getattr(memory, "free", None))
             utilization_percent = int(getattr(util, "gpu", 0)) if getattr(util, "gpu", None) is not None else None
-            compute_mode = _text(read("compute_mode", lambda: pynvml.nvmlDeviceGetComputeMode(handle)))
-            mig_mode = "enabled" if mig == 1 else ("disabled" if mig == 0 else None)
+            compute_mode = _compute_mode(read("compute_mode", lambda: pynvml.nvmlDeviceGetComputeMode(handle)))
+            mig_mode = _mig_mode(mig)
+            process_snapshot = _nvml_process_snapshot(handle)
+            process_snapshot.update({
+                "gpu_uuid": uuid,
+                "memory_total_mib": memory_total_mib,
+                "memory_used_mib": memory_used_mib,
+                "memory_free_mib": memory_free_mib,
+                "sampled_at": sampled_at.isoformat(),
+                "source": "nvml",
+            })
             fields = {
                 "name": name,
                 "pci_bus_id": pci_bus_id,
@@ -170,7 +231,7 @@ def _nvml_probe(sampled_at: datetime) -> GpuProbeResult:
                 "compute_mode": compute_mode,
             }
             for label, value in fields.items():
-                if value is None and not any(error.startswith(f"{label}:") for error in errors):
+                if (value is None or label == "compute_mode" and value == "unknown") and not any(error.startswith(f"{label}:") for error in errors):
                     errors.append(f"{label} is unavailable")
             has_actual_information = any(
                 value is not None
@@ -182,7 +243,7 @@ def _nvml_probe(sampled_at: datetime) -> GpuProbeResult:
                     memory_used_mib,
                     memory_free_mib,
                     utilization_percent,
-                    compute_mode,
+                    None if compute_mode == "unknown" else compute_mode,
                 )
             )
             status = "success" if not errors else "partial"
@@ -204,6 +265,7 @@ def _nvml_probe(sampled_at: datetime) -> GpuProbeResult:
                 mig_mode=mig_mode,
                 status=status,
                 error="; ".join(errors) or None,
+                process_snapshot=process_snapshot,
             ))
         valid_devices = [device for device in devices if device.status in {"success", "partial"}]
         if handles_read == 0 or not valid_devices:
@@ -280,8 +342,8 @@ def _smi_probe(sampled_at: datetime) -> GpuProbeResult:
         memory_free_mib = _mib(row[6])
         utilization = _number(row[7])
         utilization_percent = int(utilization) if utilization is not None else None
-        compute_mode = _text(row[8])
-        mig_mode = _text(row[9])
+        compute_mode = _compute_mode(row[8])
+        mig_mode = _mig_mode(row[9])
         fields = {
             "name": name,
             "pci_bus_id": pci_bus_id,
@@ -292,9 +354,9 @@ def _smi_probe(sampled_at: datetime) -> GpuProbeResult:
             "compute_mode": compute_mode,
         }
         for label, value in fields.items():
-            if value is None:
+            if value is None or label == "compute_mode" and value == "unknown":
                 errors.append(f"{label} is unavailable")
-        has_actual_information = any(value is not None for value in (uuid, *fields.values()))
+        has_actual_information = any(value is not None for value in (uuid, name, pci_bus_id, memory_total_mib, memory_used_mib, memory_free_mib, utilization_percent))
         status = "success" if not errors else "partial"
         if not has_actual_information:
             status = "failed"
@@ -316,12 +378,59 @@ def _smi_probe(sampled_at: datetime) -> GpuProbeResult:
                 mig_mode=mig_mode,
                 status=status,
                 error="; ".join(errors) or None,
+                process_snapshot={
+                    "processes": [],
+                    "complete": False,
+                    "accounting_status": "conservative",
+                    "pid_view": "driver",
+                    "error": "nvidia-smi GPU and process queries are not an atomic snapshot",
+                },
             )
         )
     valid_devices = [device for device in devices if device.status in {"success", "partial"}]
     if not valid_devices and proc.stdout.strip():
         error = "; ".join(diagnostic_errors) or "nvidia-smi returned malformed CSV"
         return GpuProbeResult("failed", "nvidia-smi", sampled_at, devices, error=error, complete=False)
+    process_rows: dict[str, dict[int, int | None]] = {}
+    process_error = None
+    try:
+        process_proc = subprocess.run(
+            [executable, "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if process_proc.returncode:
+            process_error = (process_proc.stderr or process_proc.stdout).strip() or "nvidia-smi process query failed"
+        else:
+            for raw in process_proc.stdout.splitlines():
+                row = next(csv.reader([raw], skipinitialspace=True))
+                if len(row) != 3:
+                    process_error = "nvidia-smi returned a malformed process row"
+                    continue
+                uuid = _text(row[0])
+                pid = _number(row[1])
+                memory = _mib(row[2])
+                if uuid and pid is not None:
+                    normalized = "GPU-" + uuid[4:].lower() if GPU_UUID_RE.fullmatch(uuid) else uuid
+                    prior = process_rows.setdefault(normalized, {}).get(int(pid))
+                    process_rows[normalized][int(pid)] = memory if prior is None else prior if memory is None else max(prior, memory)
+    except Exception as exc:
+        process_error = str(exc)
+    devices = [
+        replace(device, process_snapshot={
+            "gpu_uuid": device.gpu_uuid,
+            "memory_total_mib": device.memory_total_mib,
+            "memory_used_mib": device.memory_used_mib,
+            "memory_free_mib": device.memory_free_mib,
+            "sampled_at": sampled_at.isoformat(),
+            "source": "nvidia-smi",
+            "processes": [{"driver_pid": pid, "memory_used_mib": memory} for pid, memory in sorted(process_rows.get(device.gpu_uuid or "", {}).items())],
+            "complete": False,
+            "accounting_status": "conservative",
+            "pid_view": "driver",
+            "error": process_error or "nvidia-smi GPU and process queries are not an atomic snapshot",
+        })
+        for device in devices
+    ]
     return GpuProbeResult("success" if devices else "empty", "nvidia-smi", sampled_at, devices,
                           error=None if complete else "; ".join(diagnostic_errors) or "one or more GPU rows were incomplete",
                           complete=complete)

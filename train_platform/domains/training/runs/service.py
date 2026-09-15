@@ -345,7 +345,7 @@ class TrainingRunService:
         if model_versions and force:
             delete_model_versions_with_dependents(db, model_versions)
         run = self.request_delete(db, str(run.run_id))
-        if run.status != TrainingRunStatus.RUNNING:
+        if run.status != TrainingRunStatus.RUNNING and not run.current_allocation_id:
             remove_tree(settings.training_dir / str(run.run_id), ignore_errors=True)
         return run
 

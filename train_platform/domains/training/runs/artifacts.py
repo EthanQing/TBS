@@ -82,6 +82,8 @@ def register_reported_artifact(
     report: TrainingArtifactReport,
     *,
     expected_pid: int | None = None,
+    allocation_id: str | None = None,
+    expected_create_time: float | None = None,
 ) -> TrainingRunArtifact | None:
     """Validate and persist an artifact reported by a running custom trainer."""
 
@@ -104,8 +106,13 @@ def register_reported_artifact(
     if not candidate.is_file():
         raise ValueError(f"reported artifact is not a regular file: {relative_path}")
 
-    run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
+    from .lifecycle import execution_matches
+
+    run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).with_for_update().first()
     if not run or run.status != TrainingRunStatus.RUNNING:
+        return None
+    if not execution_matches(db, run, allocation_id=allocation_id,
+                             expected_pid=expected_pid, expected_create_time=expected_create_time):
         return None
     if expected_pid is not None and (run.pid is None or int(run.pid) != int(expected_pid)):
         logger.warning(

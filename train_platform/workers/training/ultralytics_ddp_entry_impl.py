@@ -21,6 +21,15 @@ def _load_context(path: Path) -> dict[str, Any]:
     scope_status = process_scope.compare_process_scope(expected_scope, process_scope.get_process_scope())
     if scope_status != "same":
         raise RuntimeError(f"distributed rank process scope is {scope_status}")
+    if value.get("allocation_id"):
+        if owner.get("allocation_id") != value["allocation_id"]:
+            raise ValueError("distributed allocation identity mismatch")
+        if os.environ.get("CUDA_VISIBLE_DEVICES") != mask:
+            raise ValueError("distributed UUID mask changed")
+        from train_platform.platform.runtime.cuda_devices import validate_assigned_devices
+
+        validate_assigned_devices(value.get("assigned_gpu_uuids", []))
+        os.environ["TRAIN_PLATFORM_ALLOCATION_ID"] = value["allocation_id"]
     os.environ["CUDA_VISIBLE_DEVICES"] = mask
     os.environ["PYTHONIOENCODING"] = "utf-8"
     os.environ["PYTHONUTF8"] = "1"
@@ -49,9 +58,18 @@ def main(argv: list[str] | None = None) -> int:
     identity = process_identity(
         os.getpid(), role="rank", rank=rank, local_rank=local_rank,
         run_id=context["run_id"], attempt_id=context["attempt_id"],
+        allocation_id=context.get("allocation_id"),
         execution_owner=context.get("execution_owner", {}),
     )
     register_process(Path(context["processes_dir"]), f"rank-{rank}", **identity)
+    if context.get("allocation_id"):
+        from train_platform.platform.runtime.execution_processes import register_execution_process
+
+        register_execution_process(
+            Path(context["run_root"]), run_id=context["run_id"], allocation_id=context["allocation_id"],
+            execution_owner=context["execution_owner"], pid=os.getpid(), role=f"rank-{rank}",
+            assigned_gpu_uuids=context["assigned_gpu_uuids"],
+        )
     print(
         "[ultralytics-ddp] "
         f"run_id={context['run_id']} rank={rank} local_rank={local_rank} "
@@ -96,13 +114,17 @@ def main(argv: list[str] | None = None) -> int:
                 return
             metrics_file.write(json.dumps({
                 "type": "epoch_metrics", "run_id": context["run_id"],
+                "allocation_id": context.get("allocation_id"),
                 "attempt_id": context["attempt_id"], "epoch": epoch, "metrics": metrics,
             }, ensure_ascii=False) + "\n")
             metrics_file.flush()
 
         _register_epoch_callbacks(model, emit, collect=_collect_metrics)
         train_args = dict(context["train_args"])
-        train_args["device"] = str(context["cuda_visible_devices"])
+        train_args["device"] = (
+            torch.device("cuda", local_rank) if context.get("allocation_id")
+            else str(context["cuda_visible_devices"])
+        )
         try:
             model.train(trainer=trainer_class, **train_args)
             return 0

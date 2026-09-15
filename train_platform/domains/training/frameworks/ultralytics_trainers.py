@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Type
+import os
 
 from ultralytics.models.rtdetr.train import RTDETRTrainer
 from ultralytics.models.yolo.classify import ClassificationTrainer
@@ -13,10 +14,16 @@ from ultralytics.models.yolo.segment import SegmentationTrainer
 class _ExecutionPathsMixin:
     """Restore platform paths after checkpoint args load and before BaseTrainer creates output dirs."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if os.getenv("TRAIN_PLATFORM_ALLOCATION_ID"):
+            self.world_size = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+            self.ddp = self.world_size > 1 and "LOCAL_RANK" not in os.environ
+
     def check_resume(self, overrides: dict[str, Any]) -> None:
         current_paths = {
             key: overrides[key]
-            for key in ("data", "project", "name", "exist_ok", "save_dir", "amp")
+            for key in ("data", "project", "name", "exist_ok", "save_dir", "amp", "device")
             if key in overrides
         }
         super().check_resume(overrides)

@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 import psutil
 
 from train_platform.platform.runtime import process_scope
+from train_platform.platform.runtime.execution_identity import process_identity, process_state as _process_state
 
 
 logger = logging.getLogger(__name__)
@@ -53,26 +54,6 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
-
-
-def process_identity(pid: int, **extra: Any) -> dict[str, Any]:
-    current_scope = process_scope.get_process_scope()
-    owner = extra.get("execution_owner")
-    if isinstance(owner, Mapping):
-        comparison = process_scope.compare_process_scope(owner.get("process_scope"), current_scope)
-        if comparison != "same":
-            raise ValueError(f"execution owner process scope is {comparison}")
-    process = psutil.Process(int(pid))
-    identity: dict[str, Any] = {
-        "pid": int(pid), "create_time": float(process.create_time()),
-        "process_scope": current_scope, **extra,
-    }
-    if os.name != "nt":
-        try:
-            identity["pgid"] = int(os.getpgid(int(pid)))
-        except OSError:
-            pass
-    return identity
 
 
 def register_process(processes_dir: Path, name: str, **identity: Any) -> None:
@@ -146,26 +127,6 @@ def _is_live(process: psutil.Process) -> bool:
         return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
     except psutil.Error:
         return False
-
-
-def _process_state(identity: Mapping[str, Any]) -> tuple[str, psutil.Process | None]:
-    if process_scope.compare_process_scope(
-        process_scope.identity_process_scope(identity), process_scope.get_process_scope()
-    ) != "same":
-        return "unknown", None
-    try:
-        process = psutil.Process(int(identity["pid"]))
-        if float(process.create_time()) != float(identity["create_time"]):
-            return "dead", None
-        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
-            return "dead", None
-        return "live", process
-    except psutil.NoSuchProcess:
-        return "dead", None
-    except (psutil.AccessDenied, OSError):
-        return "unknown", None
-    except (KeyError, TypeError, ValueError):
-        return "unknown", None
 
 
 def _identity_from_process(process: psutil.Process, **extra: Any) -> dict[str, Any]:
@@ -250,7 +211,7 @@ def terminate_registered_processes(
                 execution_owner=owner, survivors=[], cleanup_errors=[error],
             ) from error
         if owner and any(registered_owner.get(key) != value for key, value in owner.items() if value is not None):
-            basic_keys = ("guard_pid", "guard_create_time", "worker_id")
+            basic_keys = ("guard_pid", "guard_create_time", "worker_id", "allocation_id")
             if any(registered_owner.get(key) != owner.get(key) for key in basic_keys):
                 continue
         context_scope_status = process_scope.compare_process_scope(
@@ -411,10 +372,11 @@ def terminate_registered_processes(
 
 
 class MetricsJSONLReader:
-    def __init__(self, path: Path, *, run_id: str, attempt_id: str) -> None:
+    def __init__(self, path: Path, *, run_id: str, attempt_id: str, allocation_id: str | None = None) -> None:
         self.path = Path(path)
         self.run_id = str(run_id)
         self.attempt_id = str(attempt_id)
+        self.allocation_id = allocation_id
         self.offset = 0
         self.pending = b""
 
@@ -443,6 +405,7 @@ class MetricsJSONLReader:
                 event.get("type") != "epoch_metrics"
                 or event.get("run_id") != self.run_id
                 or event.get("attempt_id") != self.attempt_id
+                or event.get("allocation_id") != self.allocation_id
                 or not isinstance(event.get("metrics"), dict)
                 or isinstance(epoch, bool)
                 or not isinstance(epoch, int)
@@ -472,6 +435,8 @@ def run_ultralytics_ddp(
     context_owner = context.get("execution_owner", {})
     if not isinstance(context_owner, Mapping):
         raise ValueError("distributed context execution_owner must be a mapping")
+    if context.get("allocation_id") and context_owner.get("allocation_id") != context["allocation_id"]:
+        raise ValueError("distributed context allocation identity mismatch")
     run_root = Path(str(context["run_root"])).resolve(strict=False)
     attempt_id = uuid.uuid4().hex
     owner_scope_status = process_scope.compare_process_scope(
@@ -514,7 +479,8 @@ def run_ultralytics_ddp(
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         popen_kwargs["start_new_session"] = True
-    reader = MetricsJSONLReader(metrics_path, run_id=str(payload["run_id"]), attempt_id=attempt_id)
+    reader = MetricsJSONLReader(metrics_path, run_id=str(payload["run_id"]), attempt_id=attempt_id,
+                               allocation_id=payload.get("allocation_id"))
     owner = dict(context_owner)
     cancelled = False
     interrupted = False
@@ -623,6 +589,14 @@ def run_ultralytics_ddp(
         launcher = subprocess.Popen(command, **popen_kwargs)
         launcher_process = psutil.Process(launcher.pid)
         known_processes[(launcher_process.pid, launcher_process.create_time())] = launcher_process
+        if payload.get("allocation_id"):
+            from train_platform.platform.runtime.execution_processes import register_execution_process
+
+            register_execution_process(
+                run_root, run_id=payload["run_id"], allocation_id=payload["allocation_id"],
+                execution_owner=owner, pid=launcher.pid, role="torchrun",
+                assigned_gpu_uuids=list(payload["assigned_gpu_uuids"]),
+            )
         register_process(
             processes_dir,
             "launcher",

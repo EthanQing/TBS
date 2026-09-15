@@ -129,7 +129,7 @@ def main() -> None:
                         )
                         inference_proc = _start_inference_worker_if_needed()
                     training_worker.tick()
-                    if getattr(training_worker, "_running", None) is None:
+                    if not training_worker.has_running_jobs():
                         conversion_worker.tick()
                 except Exception as e:
                     print(f"[worker] tick error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)

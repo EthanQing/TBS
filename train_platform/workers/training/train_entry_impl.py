@@ -185,6 +185,18 @@ def _execution_owner_from_record(
     return dict(owner)
 
 
+def _write_execution_record(run_root: Path, run_id: str, owner: Mapping[str, Any]) -> None:
+    runtime_dir = Path(run_root) / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    target = runtime_dir / "execution.json"
+    temporary = runtime_dir / "execution.json.tmp"
+    temporary.write_text(json.dumps({
+        "run_id": str(run_id), "allocation_id": owner.get("allocation_id"),
+        "execution_owner": dict(owner),
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
+
+
 def _materialize_execution_spec(
     run: TrainingRun,
     *,
@@ -313,13 +325,15 @@ def _cancel_requested(run_id: str) -> bool:
         db.close()
 
 
-def _heartbeat_tick(run_id: str, *, expected_pid: int) -> None:
+def _heartbeat_tick(run_id: str, *, expected_pid: int, allocation_id: str | None = None,
+                    expected_create_time: float | None = None) -> None:
     db = SessionLocal()
     try:
         run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
         if not run:
             return
-        touch_heartbeat(db, run_id, expected_pid=expected_pid)
+        touch_heartbeat(db, run_id, expected_pid=expected_pid, allocation_id=allocation_id,
+                        expected_create_time=expected_create_time)
     except Exception:
         db.rollback()
     finally:
@@ -331,18 +345,25 @@ def _heartbeat_loop(
     stop_event: threading.Event,
     *,
     expected_pid: int,
+    allocation_id: str | None = None,
+    expected_create_time: float | None = None,
     interval_sec: float = 5.0,
 ) -> None:
     while not stop_event.wait(max(1.0, float(interval_sec))):
-        _heartbeat_tick(run_id, expected_pid=expected_pid)
+        _heartbeat_tick(run_id, expected_pid=expected_pid, allocation_id=allocation_id,
+                        expected_create_time=expected_create_time)
 
 
 def main(argv: list[str] | None = None) -> int:
     assert_valid_license()
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--allocation-id")
+    parser.add_argument("--worker-instance-id")
     args = parser.parse_args(argv)
     run_id = str(args.run_id)
+    allocation_id = str(args.allocation_id) if args.allocation_id else None
+    worker_instance_id = str(args.worker_instance_id) if args.worker_instance_id else None
     actual_pid = os.getpid()
     execution_guard_pid: int | None = None
 
@@ -355,8 +376,14 @@ def main(argv: list[str] | None = None) -> int:
     heartbeat_thread: threading.Thread | None = None
     vdl_bridge: VisualDLScalarBridge | None = None
     defer_finalization = False
+    process_watch_stop = None
+    process_watch_thread = None
+    managed_owner = None
+    assigned_gpu_uuids: list[str] = []
+    reserved_memory_mib: tuple[int, ...] = ()
+    allocation_sharing: str | None = None
     try:
-        execution_guard_pid = _wait_for_execution_guard_pid(run_id, actual_pid=actual_pid)
+        execution_guard_pid = actual_pid if allocation_id else _wait_for_execution_guard_pid(run_id, actual_pid=actual_pid)
         print(
             "[train_entry] execution ownership "
             f"run_id={run_id} "
@@ -385,6 +412,43 @@ def main(argv: list[str] | None = None) -> int:
             error_message = "Run not found or missing relations"
             return exit_code
 
+        if allocation_id:
+            if not worker_instance_id:
+                raise RuntimeError("managed execution requires worker instance identity")
+            from train_platform.models.v3.gpu_allocation import GpuAllocation
+            from train_platform.domains.training.resources.lifecycle import activate_allocation
+            allocation = db.query(GpuAllocation).filter_by(allocation_id=allocation_id).first()
+            if allocation is None:
+                raise RuntimeError("GPU allocation not found")
+            assigned_gpu_uuids = [item.gpu_uuid for item in sorted(allocation.devices, key=lambda item: item.ordinal)]
+            reserved_memory_mib = tuple(item.reserved_memory_mib for item in sorted(allocation.devices, key=lambda item: item.ordinal))
+            allocation_sharing = allocation.request_snapshot.get("sharing")
+            guard_process = psutil.Process(actual_pid)
+            activated = activate_allocation(
+                db, allocation_id, run_id=run_id, worker_instance_id=worker_instance_id,
+                process_scope=process_scope.get_process_scope(), supervisor_pid=actual_pid,
+                supervisor_create_time=float(guard_process.create_time()),
+                assigned_gpu_uuids=assigned_gpu_uuids,
+            )
+            managed_owner = activated["execution_owner"]
+            os.environ["TRAIN_PLATFORM_EXECUTION_OWNER_JSON"] = json.dumps(managed_owner, separators=(",", ":"))
+            os.environ["TRAIN_PLATFORM_ASSIGNED_GPU_UUIDS"] = ",".join(assigned_gpu_uuids)
+            db.commit()
+            run_dir = settings.training_dir / run_id
+            _write_execution_record(run_dir, run_id, managed_owner)
+            from train_platform.platform.runtime.execution_processes import register_execution_process
+            register_execution_process(
+                settings.training_dir / run_id, run_id=run_id, allocation_id=allocation_id,
+                execution_owner=managed_owner, pid=actual_pid, role="supervisor",
+                assigned_gpu_uuids=assigned_gpu_uuids,
+            )
+            from train_platform.platform.runtime.execution_processes import start_descendant_registration
+            process_watch_stop, process_watch_thread = start_descendant_registration(
+                settings.training_dir / run_id, run_id=run_id, allocation_id=allocation_id,
+                execution_owner=managed_owner, supervisor_pid=actual_pid,
+                assigned_gpu_uuids=assigned_gpu_uuids,
+            )
+
         dataset_path_token = run.standard_dataset.storage_path
         dataset_path = resolve_legacy_dataset_path(dataset_path_token)
         if not dataset_path.exists():
@@ -398,16 +462,22 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 0
             return exit_code
 
-        visible_host_gpu_ids = parse_visible_host_gpu_ids()
-        device_runtime = build_device_runtime(
-            getattr(run.parameters, "device", "auto") or "auto",
-            visible_host_gpu_ids=visible_host_gpu_ids,
-        )
-        requested_device = str(device_runtime.get("requested") or "auto")
-        runtime_device = str(device_runtime.get("runtime_device") or requested_device)
-        visible_devices = device_runtime.get("cuda_visible_devices")
-        if visible_devices is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_devices)
+        if allocation_id:
+            from train_platform.platform.runtime.cuda_devices import validate_assigned_devices
+            validate_assigned_devices(assigned_gpu_uuids)
+            requested_device = str(getattr(run.parameters, "device", "auto") or "auto")
+            runtime_device = ",".join(str(index) for index in range(len(assigned_gpu_uuids)))
+        else:
+            visible_host_gpu_ids = parse_visible_host_gpu_ids()
+            device_runtime = build_device_runtime(
+                getattr(run.parameters, "device", "auto") or "auto",
+                visible_host_gpu_ids=visible_host_gpu_ids,
+            )
+            requested_device = str(device_runtime.get("requested") or "auto")
+            runtime_device = str(device_runtime.get("runtime_device") or requested_device)
+            visible_devices = device_runtime.get("cuda_visible_devices")
+            if visible_devices is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_devices)
         os.environ["TRAIN_PLATFORM_DEVICE_REQUEST"] = requested_device
         os.environ["TRAIN_PLATFORM_DEVICE_RUNTIME"] = runtime_device
         print(
@@ -436,7 +506,9 @@ def main(argv: list[str] | None = None) -> int:
             trainer=trainer,
         )
         selected_gpu_ids = extract_selected_gpu_ids(runtime_device)
-        if engine.strip().lower() == "ultralytics-yolo" and len(selected_gpu_ids) > 1:
+        if managed_owner is not None:
+            execution_owner = managed_owner
+        elif engine.strip().lower() == "ultralytics-yolo" and len(selected_gpu_ids) > 1:
             execution_owner = _execution_owner_from_record(
                 run_dir,
                 run_id=run_id,
@@ -454,6 +526,11 @@ def main(argv: list[str] | None = None) -> int:
         spec = replace(
             spec,
             execution_owner=execution_owner,
+            allocation_id=allocation_id,
+            worker_instance_id=worker_instance_id,
+            assigned_gpu_uuids=tuple(assigned_gpu_uuids),
+            reserved_memory_mib=reserved_memory_mib,
+            sharing=allocation_sharing,
         )
 
         try:
@@ -473,7 +550,9 @@ def main(argv: list[str] | None = None) -> int:
             db.rollback()
 
         def upsert_epoch_metrics(epoch: int, metrics: Dict[str, float]) -> None:
-            persist_epoch_metrics(run_id, epoch, metrics, expected_pid=execution_guard_pid)
+            persist_epoch_metrics(run_id, epoch, metrics, expected_pid=execution_guard_pid,
+                                  allocation_id=allocation_id,
+                                  expected_create_time=execution_owner.get("guard_create_time") if allocation_id else None)
             if mlflow_logger:
                 mlflow_logger.log_metrics(metrics, step=int(epoch))
 
@@ -485,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
                     run_id,
                     report,
                     expected_pid=execution_guard_pid,
+                    allocation_id=allocation_id,
+                    expected_create_time=execution_owner.get("guard_create_time") if allocation_id else None,
                 )
             except Exception:
                 artifact_db.rollback()
@@ -503,7 +584,9 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_thread = threading.Thread(
             target=_heartbeat_loop,
             args=(run_id, heartbeat_stop),
-            kwargs={"expected_pid": execution_guard_pid, "interval_sec": 5.0},
+            kwargs={"expected_pid": execution_guard_pid, "allocation_id": allocation_id,
+                    "expected_create_time": execution_owner.get("guard_create_time") if allocation_id else None,
+                    "interval_sec": 5.0},
             daemon=True,
         )
         heartbeat_thread.start()
@@ -567,13 +650,43 @@ def main(argv: list[str] | None = None) -> int:
         error_message = f"{type(e).__name__}: {e}"
         return exit_code
     finally:
+        if process_watch_stop is not None:
+            process_watch_stop.set()
+        if process_watch_thread is not None:
+            process_watch_thread.join(timeout=2.0)
+        if allocation_id and managed_owner is not None:
+            try:
+                from train_platform.platform.runtime.execution_processes import cleanup_registered_execution
+                cleanup_proof = cleanup_registered_execution(
+                    settings.training_dir / run_id, run_id=run_id,
+                    allocation_id=allocation_id, execution_owner=managed_owner,
+                    exclude_supervisor=True, grace_seconds=2.0,
+                )
+                if not cleanup_proof.get("complete"):
+                    pending = settings.training_dir / run_id / "runtime" / "cleanup-pending.json"
+                    pending.parent.mkdir(parents=True, exist_ok=True)
+                    pending.write_text(json.dumps(cleanup_proof, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+                    print(f"[train_entry] managed cleanup incomplete allocation_id={allocation_id}", file=sys.stderr, flush=True)
+            except Exception as exc:
+                print(f"[train_entry] managed cleanup error allocation_id={allocation_id}: {exc}", file=sys.stderr, flush=True)
         if heartbeat_stop is not None:
             heartbeat_stop.set()
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=2.0)
         if vdl_bridge is not None:
             vdl_bridge.stop()
-        if execution_guard_pid is not None and not defer_finalization:
+        if allocation_id and managed_owner is not None:
+            try:
+                lifecycle_db = SessionLocal()
+                try:
+                    from train_platform.domains.training.resources.lifecycle import record_execution_result
+                    record_execution_result(lifecycle_db, allocation_id, managed_owner, exit_code, error_message)
+                    lifecycle_db.commit()
+                finally:
+                    lifecycle_db.close()
+            except Exception:
+                pass
+        elif not allocation_id and execution_guard_pid is not None and not defer_finalization:
             try:
                 lifecycle_db = SessionLocal()
                 try:

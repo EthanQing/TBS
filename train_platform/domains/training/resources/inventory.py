@@ -5,6 +5,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from train_platform.models.v3.gpu_resource import GpuDevice, GpuWorkerInstance, GpuWorkerObservation
+from train_platform.models.v3.gpu_allocation import GpuCudaBinding, GpuNodeSchedulingState
+from train_platform.platform.runtime.cuda_devices import CudaBindingResult
 from train_platform.platform.runtime.gpu_probe import GpuProbeResult
 
 
@@ -24,7 +26,20 @@ def register_worker_instance(
     nvidia_visible_devices: str | None,
     cuda_visible_devices: str | None,
     started_at: datetime | None = None,
+    max_training_slots: int = 2,
+    accepting_tasks: bool = True,
+    launcher_identity: dict | None = None,
+    scheduling_policy: dict | None = None,
 ) -> GpuWorkerInstance:
+    if node_id and scheduling_policy is not None:
+        node = db.query(GpuNodeSchedulingState).filter_by(node_id=node_id).with_for_update().first()
+        if node is None:
+            db.add(GpuNodeSchedulingState(node_id=node_id, managed=True, accepting_allocations=True,
+                                          **scheduling_policy))
+            db.flush()
+        elif not node.managed:
+            node.managed = True
+            node.accepting_allocations = True
     existing = db.get(GpuWorkerInstance, instance_id)
     if existing is not None:
         return existing
@@ -41,6 +56,10 @@ def register_worker_instance(
         started_at=now,
         heartbeat_at=now,
         inventory_status="pending",
+        cuda_inventory_status="pending",
+        max_training_slots=max_training_slots,
+        accepting_tasks=accepting_tasks,
+        launcher_identity=launcher_identity,
     )
     db.add(item)
     db.flush()
@@ -112,6 +131,7 @@ def save_inventory(db: Session, instance_id: str, result: GpuProbeResult) -> Non
         observation.present = True
         observation.sampled_at = result.sampled_at
         observation.received_at = received
+        observation.process_snapshot = sampled.process_snapshot
     if result.complete:
         missing = db.query(GpuWorkerObservation).filter(
             GpuWorkerObservation.instance_id == instance_id
@@ -122,6 +142,40 @@ def save_inventory(db: Session, instance_id: str, result: GpuProbeResult) -> Non
             {GpuWorkerObservation.present: False},
             synchronize_session=False,
         )
+
+
+def save_cuda_bindings(db: Session, instance_id: str, result: CudaBindingResult) -> None:
+    worker = db.query(GpuWorkerInstance).filter_by(instance_id=instance_id).with_for_update().one()
+    worker.cuda_inventory_status = result.status
+    worker.cuda_inventory_error = result.error
+    worker.cuda_environment_fingerprint = result.environment_fingerprint
+    if result.status not in {"success", "empty"}:
+        return
+    worker.last_successful_cuda_inventory_at = result.sampled_at
+    seen: set[str] = set()
+    for sampled in result.bindings:
+        if not sampled.gpu_uuid or sampled.status not in {"success", "partial"}:
+            continue
+        device = db.get(GpuDevice, sampled.gpu_uuid)
+        if device is None:
+            continue
+        seen.add(sampled.gpu_uuid)
+        binding = db.query(GpuCudaBinding).filter_by(instance_id=instance_id, gpu_uuid=sampled.gpu_uuid).first()
+        if binding is None:
+            binding = GpuCudaBinding(instance_id=instance_id, gpu_uuid=sampled.gpu_uuid)
+            db.add(binding)
+        binding.ordinal = sampled.ordinal
+        binding.pci_bus_id = sampled.pci_bus_id
+        binding.verified_at = result.sampled_at
+        binding.environment_fingerprint = result.environment_fingerprint
+        binding.present = True
+        binding.status = sampled.status
+        binding.error = sampled.error
+    if result.complete:
+        query = db.query(GpuCudaBinding).filter(GpuCudaBinding.instance_id == instance_id)
+        if seen:
+            query = query.filter(GpuCudaBinding.gpu_uuid.notin_(seen))
+        query.update({GpuCudaBinding.present: False}, synchronize_session=False)
 
 
 def mark_worker_stopped(db: Session, instance_id: str, *, at: datetime | None = None) -> None:

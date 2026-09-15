@@ -103,6 +103,24 @@ def test_probe_unavailable_distinct_from_failure(monkeypatch):
     assert "permission denied" in result.error
 
 
+def test_smi_collects_process_memory_without_claiming_atomic_attribution(monkeypatch):
+    monkeypatch.setattr(probe, "pynvml", None)
+    monkeypatch.setattr(probe.shutil, "which", lambda _: "nvidia-smi")
+    outputs = iter([
+        f"0, GPU, {GPU}, 0000:01:00.0, 2048 MiB, 100 MiB, 1948 MiB, 0, Default, Disabled",
+        f"{GPU}, 12, 80 MiB\n{GPU}, 12, 80 MiB\n{GPU}, 13, N/A",
+    ])
+    monkeypatch.setattr(probe.subprocess, "run", lambda *a, **kw: SimpleNamespace(
+        returncode=0, stderr="", stdout=next(outputs)))
+    snapshot = probe.probe_gpus().devices[0].process_snapshot
+    assert snapshot["processes"] == [
+        {"driver_pid": 12, "memory_used_mib": 80},
+        {"driver_pid": 13, "memory_used_mib": None},
+    ]
+    assert snapshot["complete"] is False
+    assert snapshot["accounting_status"] == "conservative"
+
+
 def test_malformed_smi_output_is_not_empty_success(monkeypatch):
     monkeypatch.setattr(probe, "pynvml", None)
     monkeypatch.setattr(probe.shutil, "which", lambda _: "nvidia-smi")
@@ -157,7 +175,7 @@ def test_all_handle_failures_attempt_smi_fallback(monkeypatch, fallback_ok):
 
     monkeypatch.setattr(probe.subprocess, "run", smi)
     result = probe.probe_gpus()
-    assert calls == [1]
+    assert calls == ([1, 1] if fallback_ok else [1])
     if fallback_ok:
         assert result.status == "success" and result.source == "nvidia-smi"
         assert result.devices[0].gpu_uuid == GPU
