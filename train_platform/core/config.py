@@ -109,6 +109,10 @@ class Settings:
     inference_allowed_schemes: Tuple[str, ...] = _csv_env("INFERENCE_ALLOWED_SCHEMES", "http,https")
     inference_allowed_hosts: Tuple[str, ...] = _csv_env("INFERENCE_ALLOWED_HOSTS", "")
     worker_bind_host: str = os.getenv("WORKER_BIND_HOST", "").strip()
+    gpu_inventory_enabled: bool = _bool_env("GPU_INVENTORY_ENABLED", True)
+    gpu_inventory_interval_seconds: int = _int_env("GPU_INVENTORY_INTERVAL_SECONDS", 5, min_value=1)
+    gpu_inventory_stale_after_seconds: int = _int_env("GPU_INVENTORY_STALE_AFTER_SECONDS", 20, min_value=1)
+    gpu_node_id: str | None = os.getenv("GPU_NODE_ID", "").strip() or None
     thumbnail_max_workers: int = _int_env("THUMBNAIL_MAX_WORKERS", 4, min_value=1)
     thumbnail_first_page_prewarm: int = _int_env("THUMBNAIL_FIRST_PAGE_PREWARM", 32, min_value=0)
     thumbnail_size: int = _int_env("THUMBNAIL_SIZE", 200, min_value=1)

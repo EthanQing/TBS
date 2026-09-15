@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
 
@@ -38,11 +38,40 @@ class TrainingRunParametersOut(TrainingRunParametersIn):
     model_config = {"from_attributes": True}
 
 
+class TrainingRunResourceRequestIn(BaseModel):
+    selection: Literal["auto", "manual"] = "auto"
+    gpu_count: int = Field(1, gt=0, strict=True)
+    gpu_uuids: List[str] = Field(default_factory=list)
+    memory_mib_per_gpu: Optional[int] = Field(None, gt=0, strict=True)
+    sharing: Literal["exclusive", "shared"] = "exclusive"
+    node_id: Optional[str] = Field(None, max_length=128)
+
+
+class TrainingRunResourceRequestOut(TrainingRunResourceRequestIn):
+    run_id: str
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
 class TrainingRunCreate(BaseModel):
     project_id: int
     architecture_id: int
     name: Optional[str] = Field(None, max_length=255)
     parameters: TrainingRunParametersIn
+    resource_request: Optional[TrainingRunResourceRequestIn] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_resource_batch_type(cls, value):
+        if not isinstance(value, dict) or value.get("resource_request") is None:
+            return value
+        parameters = value.get("parameters")
+        if not isinstance(parameters, dict):
+            return value
+        batch = parameters.get("batch_size", 16)
+        if isinstance(batch, bool) or not isinstance(batch, int):
+            raise ValueError("resource requests require an integer parameters.batch_size")
+        return value
 
 
 class TrainingAugmentationOptionFieldOut(BaseModel):
@@ -164,6 +193,7 @@ class TrainingRunOut(BaseModel):
     parameters: Optional[TrainingRunParametersOut] = None
     result: Optional[TrainingRunResultOut] = None
     meta: Optional[TrainingRunMetaOut] = None
+    resource_request: Optional[TrainingRunResourceRequestOut] = None
 
     model_config = {"from_attributes": True}
 

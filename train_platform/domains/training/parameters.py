@@ -670,7 +670,7 @@ def build_device_runtime(device_spec: Any, visible_host_gpu_ids: list[int] | Non
     }
 
 
-def validate_training_params_for_engine(engine: str, params: dict[str, Any]) -> dict[str, Any]:
+def validate_training_params_for_engine(engine: str, params: dict[str, Any], *, gpu_count: int | None = None) -> dict[str, Any]:
     """
     Normalize and validate training params for the selected backend engine.
 
@@ -685,8 +685,8 @@ def validate_training_params_for_engine(engine: str, params: dict[str, Any]) -> 
     device = normalize_device_spec(normalized.get("device", "auto"))
 
     engine_key = str(engine or "").strip().lower()
-    gpu_count = selected_gpu_count(device)
-    multi_gpu = gpu_count > 1
+    effective_gpu_count = gpu_count if gpu_count is not None else selected_gpu_count(device)
+    multi_gpu = effective_gpu_count > 1
 
     if batch_size == AUTO_BATCH_SIZE and engine_key != "ultralytics-yolo":
         raise ValueError("batch_size=-1 auto batch is currently only supported by Ultralytics YOLO / RT-DETR")
@@ -700,10 +700,10 @@ def validate_training_params_for_engine(engine: str, params: dict[str, Any]) -> 
     if engine_key == "ultralytics-yolo" and multi_gpu:
         if batch_size == AUTO_BATCH_SIZE:
             raise ValueError("Ultralytics auto batch (batch_size=-1) only supports single-GPU runs")
-        if batch_size % gpu_count != 0:
+        if batch_size % effective_gpu_count != 0:
             raise ValueError(
                 f"For Ultralytics multi-GPU runs, batch_size ({batch_size}) must be divisible by "
-                f"the selected GPU count ({gpu_count})"
+                f"the selected GPU count ({effective_gpu_count})"
             )
 
     normalized["batch_size"] = batch_size

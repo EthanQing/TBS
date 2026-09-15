@@ -13,6 +13,7 @@ from train_platform.core.config import settings
 from train_platform.core.license import assert_valid_license
 from train_platform.workers.model_conversion_queue import ModelConversionQueueWorker
 from train_platform.workers.worker import DbQueueWorker
+from train_platform.workers.worker_impl import worker_shutdown_signals
 
 
 def _inference_worker_enabled() -> bool:
@@ -115,22 +116,26 @@ def main() -> None:
     print(f"[worker] starting worker_id={training_worker.worker_id} engines={engines_text}", flush=True)
     settings.ensure_dirs()
     inference_proc = _start_inference_worker_if_needed()
-
-    while True:
-        try:
-            if inference_proc is not None and inference_proc.poll() is not None:
-                print(
-                    f"[worker] inference sidecar exited rc={inference_proc.returncode}; restarting",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                inference_proc = _start_inference_worker_if_needed()
-            training_worker.tick()
-            if getattr(training_worker, "_running", None) is None:
-                conversion_worker.tick()
-        except Exception as e:
-            print(f"[worker] tick error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        time.sleep(training_worker.poll_interval)
+    training_worker.start_resource_reporter()
+    try:
+        with worker_shutdown_signals():
+            while True:
+                try:
+                    if inference_proc is not None and inference_proc.poll() is not None:
+                        print(
+                            f"[worker] inference sidecar exited rc={inference_proc.returncode}; restarting",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        inference_proc = _start_inference_worker_if_needed()
+                    training_worker.tick()
+                    if getattr(training_worker, "_running", None) is None:
+                        conversion_worker.tick()
+                except Exception as e:
+                    print(f"[worker] tick error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                time.sleep(training_worker.poll_interval)
+    finally:
+        training_worker.stop_resource_reporter()
 
 
 if __name__ == "__main__":

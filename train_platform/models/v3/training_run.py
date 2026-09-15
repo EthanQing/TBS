@@ -86,6 +86,7 @@ class TrainingRun(Base):
     model_versions = relationship("ModelVersion", back_populates="training_run")
     qualified_models = relationship("QualifiedModel", back_populates="training_run")
     meta = relationship("TrainingRunMeta", back_populates="training_run", uselist=False, cascade="all, delete-orphan")
+    resource_request = relationship("TrainingRunResourceRequest", back_populates="training_run", uselist=False, cascade="all, delete-orphan")
 
 
 class TrainingRunParameters(Base):

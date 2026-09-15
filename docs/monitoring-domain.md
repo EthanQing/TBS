@@ -57,9 +57,12 @@ evaluation can also resolve it when the stale condition no longer matches.
 
 ## System metrics
 
-- `metrics/collector.py` samples local CPU and memory and normalizes local GPU
-  metrics. GPU probing tries NVML first and falls back to `nvidia-smi` when NVML
-  is unavailable or yields no devices.
+- `metrics/collector.py` samples local CPU and memory and converts
+  `platform/runtime/gpu_probe.py` results to the existing monitoring fields.
+  GPU probing tries NVML first and falls back to `nvidia-smi` on probe failure
+  or unavailability. A successful empty NVML inventory does not trigger fallback.
+  Persisted Worker GPU inventory is owned separately by Training resources;
+  see [GPU resources](gpu-resources.md).
 - `metrics/history.py` owns bounded retention, time-window reads, and
   downsampling over a locked process-local deque per node.
 - `metrics/service.py` makes orchestration explicit: `collect_current` only

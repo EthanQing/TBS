@@ -1,21 +1,11 @@
 from __future__ import annotations
 
-import csv
-import logging
-import shutil
-import subprocess
 from datetime import datetime, timezone
 from typing import Any
 
 import psutil
 
-try:
-    import pynvml
-except Exception:
-    pynvml = None
-
-
-logger = logging.getLogger(__name__)
+from train_platform.platform.runtime.gpu_probe import probe_gpus
 
 
 def _to_text(value: Any) -> str | None:
@@ -64,122 +54,20 @@ def _build_gpu_metric(
     }
 
 
-def _get_gpu_device_metrics_via_nvml() -> list[dict[str, Any]]:
-    if pynvml is None:
-        return []
-    metrics: list[dict[str, Any]] = []
-    try:
-        pynvml.nvmlInit()
-    except Exception as exc:
-        logger.debug("NVML init failed while fetching GPU metrics: %s", exc)
-        return []
-
-    try:
-        gpu_count = int(pynvml.nvmlDeviceGetCount())
-        for gpu_index in range(gpu_count):
-            try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
-            except Exception as exc:
-                logger.debug("NVML get handle failed for GPU %s: %s", gpu_index, exc)
-                continue
-
-            name = f"GPU {gpu_index}"
-            uuid = None
-            utilization_percent = None
-            memory_used_mb = None
-            memory_total_mb = None
-            try:
-                name = _to_text(pynvml.nvmlDeviceGetName(handle)) or name
-            except Exception:
-                pass
-            try:
-                uuid = _to_text(pynvml.nvmlDeviceGetUUID(handle))
-            except Exception:
-                pass
-            try:
-                utilization_percent = getattr(pynvml.nvmlDeviceGetUtilizationRates(handle), "gpu", None)
-            except Exception:
-                pass
-            try:
-                memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                memory_used_mb = float(memory_info.used) / 1024.0 / 1024.0
-                memory_total_mb = float(memory_info.total) / 1024.0 / 1024.0
-            except Exception:
-                pass
-            metrics.append(
-                _build_gpu_metric(
-                    gpu_index=gpu_index,
-                    name=name,
-                    uuid=uuid,
-                    utilization_percent=utilization_percent,
-                    memory_used_mb=memory_used_mb,
-                    memory_total_mb=memory_total_mb,
-                )
-            )
-    except Exception as exc:
-        logger.debug("NVML metrics collection failed: %s", exc)
-        return []
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
-    return metrics
-
-
-def _get_gpu_device_metrics_via_nvidia_smi() -> list[dict[str, Any]]:
-    nvidia_smi = shutil.which("nvidia-smi")
-    if not nvidia_smi:
-        return []
-    try:
-        proc = subprocess.run(
-            [
-                nvidia_smi,
-                "--query-gpu=index,name,uuid,utilization.gpu,memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception as exc:
-        logger.debug("nvidia-smi execution failed while fetching GPU metrics: %s", exc)
-        return []
-    if proc.returncode != 0:
-        logger.debug("nvidia-smi returned non-zero exit code while fetching GPU metrics: %s", proc.stderr)
-        return []
-
-    metrics: list[dict[str, Any]] = []
-    for line in proc.stdout.splitlines():
-        text = line.strip()
-        if not text:
-            continue
-        try:
-            row = next(csv.reader([text], skipinitialspace=True))
-        except Exception:
-            continue
-        if len(row) < 6:
-            continue
-        metrics.append(
-            _build_gpu_metric(
-                gpu_index=row[0],
-                name=row[1],
-                uuid=row[2],
-                utilization_percent=row[3],
-                memory_used_mb=row[4],
-                memory_total_mb=row[5],
-            )
-        )
-    return metrics
-
-
 def get_gpu_device_metrics() -> list[dict[str, Any]]:
-    for getter in (_get_gpu_device_metrics_via_nvml, _get_gpu_device_metrics_via_nvidia_smi):
-        metrics = getter()
-        if metrics:
-            return metrics
-    return []
+    result = probe_gpus()
+    return [
+        _build_gpu_metric(
+            gpu_index=device.observed_index,
+            name=device.name,
+            uuid=device.gpu_uuid,
+            utilization_percent=device.utilization_percent,
+            memory_used_mb=device.memory_used_mib,
+            memory_total_mb=device.memory_total_mib,
+        )
+        for device in result.devices
+        if device.observed_index is not None
+    ]
 
 
 def collect_system_snapshot(

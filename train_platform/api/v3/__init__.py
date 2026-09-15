@@ -11,6 +11,7 @@ from train_platform.api.v3.dataset_imports import router as dataset_imports_rout
 from train_platform.api.v3.deployment_runs import router as deployment_runs_router
 from train_platform.api.v3.deployments import router as deployments_router
 from train_platform.api.v3.frameworks import router as frameworks_router
+from train_platform.api.v3.gpu_resources import router as gpu_resources_router
 from train_platform.api.v3.illegal_datasets import router as illegal_datasets_router
 from train_platform.api.v3.inference import router as inference_router
 from train_platform.api.v3.inference_jobs import router as inference_jobs_router
@@ -38,6 +39,7 @@ router.include_router(dataset_imports_router)
 router.include_router(projects_router)
 router.include_router(architectures_router)
 router.include_router(frameworks_router)
+router.include_router(gpu_resources_router)
 router.include_router(training_runs_router)
 router.include_router(training_reports_router)
 router.include_router(model_versions_router)

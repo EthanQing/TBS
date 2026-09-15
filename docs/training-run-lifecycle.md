@@ -4,6 +4,11 @@
 The database `TrainingRun` row is authoritative for user intent, execution
 ownership, liveness, progress, and terminal state.
 
+Optional GPU requests are owned by `domains/training/resources` and retained
+across resume. During the inventory-only stage, the Worker candidate query
+excludes these runs before its limit; legacy runs continue through the existing
+single-task execution path. See [GPU resources](gpu-resources.md).
+
 ## Responsibilities
 
 - `service.py` owns run creation, read-only get/list queries, name updates, user

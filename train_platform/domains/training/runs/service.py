@@ -24,6 +24,8 @@ from train_platform.models.v3.training_run import (
     TrainingRunEvent,
     TrainingRunParameters,
 )
+from train_platform.models.v3.gpu_resource import TrainingRunResourceRequest
+from train_platform.domains.training.resources.requests import normalize_resource_request
 from train_platform.platform.filesystem import remove_tree
 from train_platform.domains.datasets.yolo import find_yolo_dataset_yaml
 from train_platform.utils.exceptions import ConflictError, NotFoundError, ValidationError
@@ -52,6 +54,7 @@ class TrainingRunService:
             .options(joinedload(TrainingRun.parameters))
             .options(joinedload(TrainingRun.result))
             .options(joinedload(TrainingRun.meta))
+            .options(joinedload(TrainingRun.resource_request))
             .options(joinedload(TrainingRun.project))
             .options(joinedload(TrainingRun.standard_dataset))
             .options(joinedload(TrainingRun.architecture))
@@ -133,7 +136,17 @@ class TrainingRunService:
             )
 
         try:
-            params = validate_training_params_for_engine(arch_engine, params)
+            resource_request = normalize_resource_request(
+                obj.get("resource_request"),
+                engine=arch_engine,
+                batch_size=params.get("batch_size", 16),
+                device=params.get("device", "auto"),
+            )
+            params = validate_training_params_for_engine(
+                arch_engine,
+                params,
+                gpu_count=resource_request["gpu_count"] if resource_request else None,
+            )
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
         try:
@@ -269,6 +282,8 @@ class TrainingRunService:
                 additional_params=params.get("additional_params"),
             )
         )
+        if resource_request is not None:
+            db.add(TrainingRunResourceRequest(run_id=run_id, **resource_request))
         db.add(TrainingRunEvent(run_id=run_id, level=LogLevel.INFO, event_type="created", message="Run created"))
         if not has_split:
             db.add(

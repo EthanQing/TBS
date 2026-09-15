@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -174,6 +175,28 @@ def _parse_worker_engines(raw: Optional[str]) -> Optional[set[str]]:
     return engines or None
 
 
+@contextmanager
+def worker_shutdown_signals():
+    previous = {}
+
+    def request_shutdown(signum, frame):
+        raise SystemExit(0)
+
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                old_handler = signal.getsignal(sig)
+                signal.signal(sig, request_shutdown)
+                previous[sig] = old_handler
+            except (ValueError, OSError):
+                pass
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
 
 @dataclass
 class RunningJob:
@@ -210,17 +233,46 @@ class DbQueueWorker:
 
         self._running: Optional[RunningJob] = None
         self._last_heartbeat_at: Optional[datetime] = None
+        self._gpu_resource_reporter = None
+
+    def start_resource_reporter(self) -> None:
+        try:
+            if self._gpu_resource_reporter is None:
+                from train_platform.workers.gpu_resource_reporter import GpuResourceReporter
+                allowed_engines = self.allowed_engines
+                if allowed_engines is None:
+                    from train_platform.domains.training.frameworks import list_plugins
+
+                    allowed_engines = {
+                        plugin.plugin_id for plugin in list_plugins() if plugin.implemented
+                    }
+                self._gpu_resource_reporter = GpuResourceReporter(
+                    worker_id=self.worker_id,
+                    allowed_engines=allowed_engines,
+                )
+            self._gpu_resource_reporter.start()
+        except Exception as exc:
+            print(f"[worker] GPU resource reporter start failed: {exc}", file=sys.stderr, flush=True)
+
+    def stop_resource_reporter(self) -> None:
+        if self._gpu_resource_reporter is not None:
+            self._gpu_resource_reporter.stop()
 
     def run_forever(self) -> None:
         engines_text = ",".join(sorted(self.allowed_engines)) if self.allowed_engines else "*"
         print(f"[worker] starting worker_id={self.worker_id} engines={engines_text}", flush=True)
         settings.ensure_dirs()
-        while True:
-            try:
-                self.tick()
-            except Exception as e:
-                print(f"[worker] tick error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-            time.sleep(self.poll_interval)
+        self.start_resource_reporter()
+        try:
+            with worker_shutdown_signals():
+                while True:
+                    try:
+                        self.tick()
+                    except Exception as e:
+                        print(f"[worker] tick error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                    time.sleep(self.poll_interval)
+        finally:
+            self.stop_resource_reporter()
 
     def tick(self) -> None:
         assert_valid_license()
@@ -478,6 +530,7 @@ class DbQueueWorker:
             )
             if self.allowed_engines:
                 q = q.filter(ModelArchitecture.engine.in_(sorted(self.allowed_engines)))
+            q = q.filter(~TrainingRun.resource_request.has())
 
             # Best-effort row locking for multi-worker.
             try:
