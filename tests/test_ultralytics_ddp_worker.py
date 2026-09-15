@@ -75,3 +75,60 @@ def test_worker_does_not_finalize_while_registered_process_survives(monkeypatch)
         instance._tick_running()
     assert events == []
     assert instance._running is not None
+
+
+@pytest.mark.parametrize("outcome", ["survivor", "unknown"])
+def test_worker_retries_cleanup_before_releasing_job(monkeypatch, outcome):
+    instance, job, events, _ = setup_worker(monkeypatch, exited=True)
+    attempts = []
+
+    def cleanup(*args, **kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            if outcome == "unknown":
+                raise worker.UltralyticsDDPCleanupIncomplete(
+                    "unknown process", run_id="run", attempt_id="attempt",
+                    execution_owner=kwargs["owner"], survivors=[],
+                )
+            return [SimpleNamespace(pid=404)]
+        return []
+
+    monkeypatch.setattr(worker, "terminate_registered_processes", cleanup)
+    with pytest.raises(worker.UltralyticsDDPError):
+        instance._tick_running()
+    assert instance._running is job
+    assert not job.stdout_f.closed and not job.stderr_f.closed
+    assert events == []
+    instance._tick_running()
+    assert events == ["finalize"]
+    assert instance._running is None
+    assert job.stdout_f.closed and job.stderr_f.closed
+
+
+@pytest.mark.parametrize("state", ["live", "unknown", "survivor", "clean", "corrupt"])
+def test_stale_ddp_requires_confirmed_cleanup(tmp_path, monkeypatch, state):
+    import json
+
+    instance = worker.DbQueueWorker(worker_id="worker")
+    run = SimpleNamespace(run_id="run", pid=101, worker_id="worker")
+    owner = {"guard_pid": 101, "guard_create_time": 123.5, "worker_id": "worker"}
+    attempt = tmp_path / "run" / "runtime" / "ddp" / "attempt"
+    attempt.mkdir(parents=True)
+    context = {
+        "run_id": "run", "attempt_id": "attempt", "execution_owner": owner,
+        "supervisor": {"pid": 101, "create_time": 123.5},
+    }
+    (attempt / "context.json").write_text("{" if state == "corrupt" else json.dumps(context))
+    monkeypatch.setattr(worker, "settings", SimpleNamespace(training_dir=tmp_path))
+    monkeypatch.setattr(worker, "_identity_is_live", lambda identity: {"live": True, "unknown": None}.get(state, False))
+    calls = []
+
+    def cleanup(*args, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["owner"] == owner
+        assert kwargs["attempt_id"] == "attempt"
+        return [SimpleNamespace(pid=404)] if state == "survivor" else []
+
+    monkeypatch.setattr(worker, "terminate_registered_processes", cleanup)
+    assert instance._cleanup_stale_ddp(run) is (state == "clean")
+    assert len(calls) == (1 if state in {"survivor", "clean"} else 0)

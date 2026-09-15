@@ -25,6 +25,27 @@ class UltralyticsDDPError(RuntimeError):
     pass
 
 
+class UltralyticsDDPCleanupIncomplete(UltralyticsDDPError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        run_id: str,
+        attempt_id: str,
+        execution_owner: Mapping[str, Any],
+        survivors: list[dict[str, Any]],
+        original_error: BaseException | None = None,
+        cleanup_errors: list[BaseException] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.run_id = str(run_id)
+        self.attempt_id = str(attempt_id)
+        self.execution_owner = dict(execution_owner)
+        self.survivors = survivors
+        self.original_error = original_error
+        self.cleanup_errors = list(cleanup_errors or [])
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -58,6 +79,21 @@ def _load_identities(processes_dir: Path) -> list[dict[str, Any]]:
                 identities.append(value)
         except (OSError, ValueError):
             continue
+    return identities
+
+
+def _load_identities_strict(processes_dir: Path) -> list[dict[str, Any]]:
+    if not processes_dir.is_dir():
+        raise ValueError(f"distributed process registration directory is missing: {processes_dir}")
+    identities: list[dict[str, Any]] = []
+    for path in processes_dir.glob("*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"invalid distributed process registration: {path}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"invalid distributed process registration: {path}")
+        identities.append(value)
     return identities
 
 
@@ -97,6 +133,26 @@ def _is_live(process: psutil.Process) -> bool:
         return False
 
 
+def _process_state(identity: Mapping[str, Any]) -> tuple[str, psutil.Process | None]:
+    try:
+        process = psutil.Process(int(identity["pid"]))
+        if float(process.create_time()) != float(identity["create_time"]):
+            return "dead", None
+        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+            return "dead", None
+        return "live", process
+    except psutil.NoSuchProcess:
+        return "dead", None
+    except (psutil.AccessDenied, OSError):
+        return "unknown", None
+    except (KeyError, TypeError, ValueError):
+        return "unknown", None
+
+
+def _identity_from_process(process: psutil.Process, **extra: Any) -> dict[str, Any]:
+    return {"pid": int(process.pid), "create_time": float(process.create_time()), **extra}
+
+
 def terminate_registered_processes(
     run_root: Path,
     *,
@@ -111,22 +167,81 @@ def terminate_registered_processes(
     else:
         attempts = list(ddp_root.glob("*")) if ddp_root.is_dir() else []
     processes: dict[tuple[int, float], psutil.Process] = {}
+    scoped_identities: dict[tuple[int, float], dict[str, Any]] = {}
+    selected_attempts: list[Path] = []
     for attempt in attempts:
         context_path = attempt / "context.json"
         try:
             context = json.loads(context_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+        except (OSError, ValueError) as exc:
+            raise UltralyticsDDPCleanupIncomplete(
+                f"distributed context is unreadable: attempt_id={attempt.name}",
+                run_id=str(run_id), attempt_id=attempt.name,
+                execution_owner=owner, survivors=[], cleanup_errors=[exc],
+            ) from exc
         if not isinstance(context, dict) or context.get("run_id") != str(run_id):
+            if attempt_id is not None:
+                error = ValueError(f"distributed context does not match run: {context_path}")
+                raise UltralyticsDDPCleanupIncomplete(
+                    f"distributed context is invalid: attempt_id={attempt.name}",
+                    run_id=str(run_id), attempt_id=attempt.name,
+                    execution_owner=owner, survivors=[], cleanup_errors=[error],
+                ) from error
             continue
         if context.get("attempt_id") != attempt.name:
-            continue
+            error = ValueError(f"distributed context attempt does not match directory: {context_path}")
+            raise UltralyticsDDPCleanupIncomplete(
+                f"distributed context is invalid: attempt_id={attempt.name}",
+                run_id=str(run_id), attempt_id=attempt.name,
+                execution_owner=owner, survivors=[], cleanup_errors=[error],
+            ) from error
         registered_owner = context.get("execution_owner")
         if not isinstance(registered_owner, Mapping):
-            continue
+            error = ValueError(f"distributed context owner is invalid: {context_path}")
+            raise UltralyticsDDPCleanupIncomplete(
+                f"distributed context is invalid: attempt_id={attempt.name}",
+                run_id=str(run_id), attempt_id=attempt.name,
+                execution_owner=owner, survivors=[], cleanup_errors=[error],
+            ) from error
         if owner and any(registered_owner.get(key) != value for key, value in owner.items() if value is not None):
             continue
-        for identity in _load_identities(attempt / "processes"):
+        selected_attempts.append(attempt)
+        try:
+            identities = _load_identities_strict(attempt / "processes")
+        except (OSError, ValueError) as exc:
+            raise UltralyticsDDPCleanupIncomplete(
+                f"distributed process registrations are unreadable: attempt_id={context['attempt_id']}",
+                run_id=str(run_id), attempt_id=str(context["attempt_id"]),
+                execution_owner=owner, survivors=[], cleanup_errors=[exc],
+            ) from exc
+        pending_path = attempt / "cleanup-pending.json"
+        try:
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+            if not isinstance(pending, dict) or not isinstance(pending.get("survivors"), list):
+                raise ValueError(f"invalid distributed cleanup marker: {pending_path}")
+            if pending.get("run_id") != str(run_id) or pending.get("attempt_id") != str(context["attempt_id"]):
+                raise ValueError(f"distributed cleanup marker scope mismatch: {pending_path}")
+            if any(not isinstance(item, dict) for item in pending["survivors"]):
+                raise ValueError(f"invalid distributed cleanup survivor: {pending_path}")
+            identities.extend(pending["survivors"])
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            raise UltralyticsDDPCleanupIncomplete(
+                f"distributed cleanup marker is unreadable: attempt_id={context['attempt_id']}",
+                run_id=str(run_id),
+                attempt_id=str(context["attempt_id"]),
+                execution_owner=owner,
+                survivors=[],
+            )
+        for identity in identities:
+            if not all(key in identity for key in ("pid", "create_time", "run_id", "attempt_id", "execution_owner")):
+                error = ValueError("distributed process identity is incomplete")
+                raise UltralyticsDDPCleanupIncomplete(
+                    f"distributed process identity is invalid: attempt_id={context['attempt_id']}",
+                    run_id=str(run_id), attempt_id=str(context["attempt_id"]),
+                    execution_owner=owner, survivors=[], cleanup_errors=[error],
+                ) from error
             if not _identity_matches_scope(
                 identity,
                 run_id=str(run_id),
@@ -134,12 +249,35 @@ def terminate_registered_processes(
                 owner=owner,
             ):
                 continue
+            try:
+                identity_key = (int(identity["pid"]), float(identity["create_time"]))
+                scoped_identities[identity_key] = dict(identity)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise UltralyticsDDPCleanupIncomplete(
+                    f"distributed process identity is invalid: attempt_id={context['attempt_id']}",
+                    run_id=str(run_id), attempt_id=str(context["attempt_id"]),
+                    execution_owner=owner, survivors=[], cleanup_errors=[exc],
+                ) from exc
             process = _matching_process(identity)
             if process is not None and process.pid != os.getpid():
                 processes[(process.pid, process.create_time())] = process
                 try:
                     for child in process.children(recursive=True):
                         processes[(child.pid, child.create_time())] = child
+                        child_identity = process_identity(
+                            child.pid,
+                            role="descendant",
+                            run_id=str(run_id),
+                            attempt_id=str(context["attempt_id"]),
+                            execution_owner=dict(owner),
+                        )
+                        scoped_identities[(child.pid, child.create_time())] = child_identity
+                        try:
+                            register_process(attempt / "processes", f"helper-observed-{child.pid}", **child_identity)
+                        except OSError:
+                            # Keep the in-memory identity so this cleanup pass still
+                            # terminates and verifies the child before returning.
+                            pass
                 except psutil.Error:
                     pass
     for process in sorted(processes.values(), key=lambda item: item.pid, reverse=True):
@@ -156,7 +294,40 @@ def terminate_registered_processes(
             pass
     if alive:
         _, alive = psutil.wait_procs(alive, timeout=2.0)
-    return [process for process in alive if _is_live(process)]
+    final_alive: list[psutil.Process] = []
+    survivors: list[dict[str, Any]] = []
+    for identity in scoped_identities.values():
+        state, process = _process_state(identity)
+        if state != "dead":
+            survivors.append(dict(identity, state=state))
+        if state == "live" and process is not None:
+            final_alive.append(process)
+    for attempt in selected_attempts:
+        remaining = [item for item in survivors if item["attempt_id"] == attempt.name]
+        pending_path = attempt / "cleanup-pending.json"
+        if remaining:
+            try:
+                _atomic_json(pending_path, {
+                    "run_id": str(run_id), "attempt_id": attempt.name,
+                    "execution_owner": dict(owner), "survivors": remaining,
+                })
+            except OSError as exc:
+                raise UltralyticsDDPCleanupIncomplete(
+                    f"distributed cleanup identities could not be persisted: attempt_id={attempt.name}",
+                    run_id=str(run_id), attempt_id=attempt.name,
+                    execution_owner=owner, survivors=survivors, cleanup_errors=[exc],
+                ) from exc
+        else:
+            pending_path.unlink(missing_ok=True)
+    if any(item["state"] == "unknown" for item in survivors):
+        selected_attempt = attempt_id or "multiple"
+        raise UltralyticsDDPCleanupIncomplete(
+            f"distributed process state could not be confirmed: attempt_id={selected_attempt}",
+            run_id=str(run_id), attempt_id=selected_attempt,
+            execution_owner=owner, survivors=survivors,
+        )
+    return final_alive
+
 
 
 class MetricsJSONLReader:
@@ -260,7 +431,7 @@ def run_ultralytics_ddp(
     interrupted = False
     return_code: int | None = None
     primary_error: BaseException | None = None
-    cleanup_survivors: list[psutil.Process] = []
+    cleanup_errors: list[BaseException] = []
     previous_handlers: dict[int, Any] = {}
     known_processes: dict[tuple[int, float], psutil.Process] = {}
 
@@ -321,14 +492,14 @@ def run_ultralytics_ddp(
                 process.terminate()
             except psutil.Error:
                 pass
-        _, alive = psutil.wait_procs(candidates, timeout=2.0)
+        _, alive = psutil.wait_procs(candidates, timeout=0.5)
         for process in alive:
             try:
                 process.kill()
             except psutil.Error:
                 pass
         if alive:
-            _, alive = psutil.wait_procs(alive, timeout=1.0)
+            _, alive = psutil.wait_procs(alive, timeout=0.5)
         return [process for process in alive if _is_live(process)]
 
     def stop_launcher() -> None:
@@ -342,7 +513,7 @@ def run_ultralytics_ddp(
             launcher.terminate()
         except OSError:
             pass
-        deadline = time.monotonic() + 4.0
+        deadline = time.monotonic() + 2.0
         while launcher.poll() is None and time.monotonic() < deadline:
             try:
                 observe_descendants()
@@ -398,51 +569,161 @@ def run_ultralytics_ddp(
         primary_error = exc
     finally:
         try:
+            if primary_error is None and not cancelled and not interrupted and return_code not in (None, 0):
+                primary_error = UltralyticsDDPError(
+                    f"torchrun exited with code {return_code}: attempt_id={attempt_id}"
+                )
+            candidate_identities: dict[tuple[int, float], dict[str, Any]] = {}
+            for (pid, create_time) in known_processes:
+                candidate_identities[(pid, create_time)] = {"pid": pid, "create_time": create_time}
+            cleanup_unconfirmed = False
+            try:
+                registered_identities = _load_identities_strict(processes_dir)
+            except BaseException as exc:
+                registered_identities = []
+                cleanup_errors.append(exc)
+            for identity in registered_identities:
+                if not _identity_matches_scope(
+                    identity,
+                    run_id=str(payload["run_id"]),
+                    attempt_id=attempt_id,
+                    owner=owner,
+                ):
+                    continue
+                try:
+                    key = (int(identity["pid"]), float(identity["create_time"]))
+                except (KeyError, TypeError, ValueError):
+                    cleanup_unconfirmed = True
+                    continue
+                candidate_identities[key] = dict(identity)
             try:
                 stop_launcher()
             except BaseException as exc:
-                if primary_error is None:
-                    primary_error = exc
+                cleanup_errors.append(exc)
+            round_survivors: list[psutil.Process] = []
+            cleanup_pass_unconfirmed = False
             try:
-                cleanup_survivors = terminate_registered_processes(
+                round_survivors.extend(terminate_registered_processes(
                     run_root,
                     run_id=str(payload["run_id"]),
                     owner=owner,
                     attempt_id=attempt_id,
-                    grace_seconds=2.0,
-                )
+                    grace_seconds=0.5,
+                ))
+            except UltralyticsDDPCleanupIncomplete as exc:
+                cleanup_errors.append(exc)
+                cleanup_pass_unconfirmed = not bool(exc.survivors)
+                for identity in exc.survivors:
+                    try:
+                        key = (int(identity["pid"]), float(identity["create_time"]))
+                    except (KeyError, TypeError, ValueError):
+                        cleanup_pass_unconfirmed = True
+                        continue
+                    candidate_identities[key] = dict(identity)
             except BaseException as exc:
-                if primary_error is None:
-                    primary_error = exc
-            known_survivors = stop_known_processes()
-            known_survivor_pids = {process.pid for process in cleanup_survivors}
-            cleanup_survivors.extend(
-                process for process in known_survivors if process.pid not in known_survivor_pids
-            )
+                cleanup_errors.append(exc)
+                cleanup_pass_unconfirmed = True
+            try:
+                round_survivors.extend(stop_known_processes())
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            for process in round_survivors:
+                try:
+                    identity = _identity_from_process(process)
+                    candidate_identities[(identity["pid"], identity["create_time"])] = identity
+                except psutil.Error:
+                    continue
             if launcher is not None:
                 try:
                     if launcher.poll() is None:
                         launcher.kill()
                     launcher.wait(timeout=1.0)
                 except (OSError, subprocess.TimeoutExpired) as exc:
-                    if primary_error is None:
-                        primary_error = exc
+                    cleanup_errors.append(exc)
             try:
                 reader.read(upsert_epoch_metrics, final=True)
             except BaseException as exc:
                 if primary_error is None:
                     primary_error = exc
+            for (pid, create_time) in known_processes:
+                candidate_identities.setdefault((pid, create_time), {"pid": pid, "create_time": create_time})
+            try:
+                final_registered = _load_identities_strict(processes_dir)
+            except BaseException as exc:
+                final_registered = []
+                cleanup_errors.append(exc)
+                cleanup_unconfirmed = True
+            else:
+                cleanup_unconfirmed = cleanup_pass_unconfirmed
+            for identity in final_registered:
+                if not _identity_matches_scope(
+                    identity,
+                    run_id=str(payload["run_id"]),
+                    attempt_id=attempt_id,
+                    owner=owner,
+                ):
+                    continue
+                try:
+                    key = (int(identity["pid"]), float(identity["create_time"]))
+                except (KeyError, TypeError, ValueError):
+                    cleanup_unconfirmed = True
+                    continue
+                candidate_identities[key] = dict(identity)
+            final_survivors: list[dict[str, Any]] = []
+            for identity in candidate_identities.values():
+                state, _ = _process_state(identity)
+                if state != "dead":
+                    final_survivors.append(dict(
+                        identity,
+                        state=state,
+                        run_id=str(payload["run_id"]),
+                        attempt_id=attempt_id,
+                        execution_owner=owner,
+                    ))
+            pending_path = attempt_dir / "cleanup-pending.json"
+            if final_survivors:
+                try:
+                    _atomic_json(
+                        pending_path,
+                        {
+                            "run_id": str(payload["run_id"]),
+                            "attempt_id": attempt_id,
+                            "execution_owner": owner,
+                            "survivors": final_survivors,
+                        },
+                    )
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                    cleanup_unconfirmed = True
+            else:
+                try:
+                    pending_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    cleanup_errors.append(exc)
         finally:
             for signum, handler in previous_handlers.items():
                 try:
                     signal.signal(signum, handler)
                 except (ValueError, OSError):
                     pass
+    if final_survivors or cleanup_unconfirmed:
+        survivor_pids = ",".join(str(item.get("pid")) for item in final_survivors)
+        error = UltralyticsDDPCleanupIncomplete(
+            f"distributed process cleanup incomplete: pids={survivor_pids} attempt_id={attempt_id}",
+            run_id=str(payload["run_id"]),
+            attempt_id=attempt_id,
+            execution_owner=owner,
+            survivors=final_survivors,
+            original_error=primary_error,
+            cleanup_errors=cleanup_errors,
+        )
+        if primary_error is not None:
+            raise error from primary_error
+        if cleanup_errors:
+            raise error from cleanup_errors[0]
+        raise error
     if primary_error is not None:
         raise primary_error
-    if cleanup_survivors:
-        survivor_pids = ",".join(str(process.pid) for process in cleanup_survivors)
-        raise UltralyticsDDPError(f"distributed processes did not exit: pids={survivor_pids} attempt_id={attempt_id}")
     if cancelled:
         raise UltralyticsDDPCancelled(f"distributed training cancelled: attempt_id={attempt_id}")
     if interrupted:
@@ -451,4 +732,4 @@ def run_ultralytics_ddp(
         raise UltralyticsDDPError(f"torchrun exited with code {return_code}: attempt_id={attempt_id}")
 
 
-__all__ = ["MetricsJSONLReader", "UltralyticsDDPCancelled", "UltralyticsDDPError", "process_identity", "register_process", "run_ultralytics_ddp", "terminate_registered_processes"]
+__all__ = ["MetricsJSONLReader", "UltralyticsDDPCancelled", "UltralyticsDDPCleanupIncomplete", "UltralyticsDDPError", "process_identity", "register_process", "run_ultralytics_ddp", "terminate_registered_processes"]

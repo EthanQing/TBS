@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from train_platform.core.config import settings
+from train_platform.domains.training.execution_paths import resolve_ultralytics_checkpoint
 from train_platform.models.v3.architecture import ModelArchitecture
 from train_platform.models.v3.enums import TrainingRunStatus
 from train_platform.models.v3.standard_dataset import StandardDataset
@@ -289,19 +291,30 @@ def _ensure_report_metric_snapshots(db: Session, run: TrainingRun) -> TrainingRu
 def _ensure_report_artifacts(db: Session, run: TrainingRun) -> TrainingRunResult | None:
     result = run.result
     needs_index = result is None
+    outdated_weights = False
     if result is not None:
         needs_index = any(
             value is None
             for value in (result.best_weights_path, result.last_weights_path, result.model_size_mb)
         )
+        if str(getattr(run.architecture, "engine", "") or "").strip().lower() == "ultralytics-yolo":
+            base = settings.training_dir.resolve()
+            for kind in ("best", "last"):
+                current = resolve_ultralytics_checkpoint(base / str(run.run_id), kind)
+                expected = current.relative_to(base).as_posix() if current is not None else None
+                if getattr(result, f"{kind}_weights_path") != expected:
+                    needs_index = True
+                    outdated_weights = True
     if needs_index:
         try:
             index_completion_artifacts(db, str(run.run_id))
             db.commit()
             db.refresh(run)
             result = run.result
-        except Exception:
+        except Exception as exc:
             db.rollback()
+            if outdated_weights:
+                raise ValidationError("Current training output artifacts are unavailable") from exc
             result = run.result
 
     benchmark = TrainingRunBenchmarkService()

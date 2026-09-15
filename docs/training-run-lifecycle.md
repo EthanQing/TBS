@@ -151,16 +151,25 @@ New Ultralytics executions place platform configuration in
 `logs/train.stdout.log` and `logs/train.stderr.log`, and all framework output
 in `output/`. The version 1 manifest records engine `ultralytics-yolo` and the
 relative `output_dir`. Execution preparation creates directories and writes
-the manifest atomically; path reads do not create directories. Ultralytics
-DDP cleanup therefore affects `output/` without removing platform runtime
-configuration or open worker logs.
+the manifest atomically; path reads do not create directories. Fresh
+Ultralytics execution preparation resets only `output/`, including weights, exports,
+CSV, and plots. Required model inputs stored inside output are first copied to
+`runtime/inputs/<id>/`, and the prepared model/pretrained paths point there.
+The reset rejects redirected output directories and preserves runtime and logs.
+Ranks never initialize or reset the output directory.
 
 A recorded layout is authoritative for artifact discovery, including weights,
 configuration, CSV, and plots. Unrecorded historical tasks use the original
-root layout. Resume checkpoint discovery alone also checks root-level
-`weights/last.pt` after the effective output directory. The adapter resolves
-the source checkpoint before preparing the current layout. Both same-task
-and cross-task resume retain framework checkpoint state while applying the
+root layout. Historical layouts without execution metadata retain the root-level
+`weights/last.pt` resume fallback. New preparation records an `execution` object
+with `mode`, `reset_state`, and the explicitly selected `resume_checkpoint`.
+A fresh boundary is recorded before output removal; incomplete initialization
+blocks reads and resume. Once fresh initialization succeeds, resume uses only
+that execution's output checkpoint, returning no checkpoint if none exists.
+The adapter resolves the source checkpoint before preparing the current layout.
+Resume records that source so it remains usable until the resumed execution
+writes its own checkpoint, without an unconditional legacy-directory fallback.
+Both same-task and cross-task resume retain framework checkpoint state while applying the
 current task's data, project, name, and save directory after framework resume
 argument handling. The source checkpoint is not relocated.
 
@@ -185,7 +194,10 @@ different task.
 Indexed artifact paths remain relative to `settings.training_dir`, for example
 `run_id/output/weights/best.pt`, and semantic weight roles update the result
 projection. ONNX export writes beside its selected PT source; ONNX downloads
-prefer an indexed export path and otherwise resolve the task layout.
+accept indexed exports only within the effective output layout and otherwise
+resolve that layout directly. Reports refresh stale weight projections against
+the effective layout before benchmark enrichment; failed refreshes cannot reuse
+old weight paths.
 PaddleDetection retains its native layout, and custom-source retains reported
 semantic artifacts. Deletion removes the whole task root.
 
@@ -203,7 +215,7 @@ CSV carryover once. `PreparedUltralyticsExecution` contains only serializable
 paths, model type (`yolo` or `rtdetr`), arguments, settings, and ownership.
 The CPU model used during preparation is released before launching Rank
 processes. Temporary pretrained weights remain available through the entire
-supervised execution. Fresh CSV initialization happens before Rank startup;
+supervised execution. Fresh output initialization happens before Rank startup;
 checkpoint state restoration remains owned by the native Trainer. Platform
 Trainer subclasses reapply current execution paths and AMP after check_resume.
 
@@ -245,6 +257,19 @@ The Worker grants 15 seconds for cooperative multi-GPU cancellation before its
 outer fallback. On supervisor exit it checks matching registrations even when
 the root process is already gone, and does not finish Worker cleanup while
 registered processes remain alive. Old execution identities are excluded.
+
+Cleanup round survivors are candidates, not the final result. After launcher
+reaping and registered/observed process cleanup, PID and creation time are
+revalidated and exited, zombie, or reused identities are removed. An unresolved
+process state raises `UltralyticsDDPCleanupIncomplete`, preserving the original
+training error and cleanup errors. `cleanup-pending.json` carries remaining
+observed identities across the supervisor-to-Worker handoff. train_entry exits
+nonzero and skips lifecycle finalization for this exception, retaining the claim.
+The Worker retries cleanup with the same execution identity and keeps its
+RunningJob and log handles until cleanup succeeds, then finalizes with the
+original exit code and authoritative cancel/delete intent. Stale DDP claims
+likewise require a stopped supervisor and confirmed child cleanup before terminal
+finalization; an expired heartbeat alone is insufficient.
 
 
 ## Custom-source runtime v1

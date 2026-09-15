@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import signal
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Any, Mapping, Optional, TextIO
 
 import psutil
 from sqlalchemy.orm import Session
@@ -27,7 +28,11 @@ from train_platform.domains.training.parameters import (
     parse_visible_host_gpu_ids,
     worker_can_run_device,
 )
-from train_platform.platform.runtime.ultralytics_ddp import UltralyticsDDPError, terminate_registered_processes
+from train_platform.platform.runtime.ultralytics_ddp import (
+    UltralyticsDDPCleanupIncomplete,
+    UltralyticsDDPError,
+    terminate_registered_processes,
+)
 
 
 CUSTOM_CANCEL_FALLBACK_SECONDS = 10.0
@@ -46,6 +51,18 @@ def _safe_remove_dir(path: Path) -> None:
             shutil.rmtree(path, ignore_errors=True)
     except Exception:
         pass
+
+
+def _identity_is_live(identity: Mapping[str, Any]) -> bool | None:
+    try:
+        process = psutil.Process(int(identity["pid"]))
+        if float(process.create_time()) != float(identity["create_time"]):
+            return False
+        return bool(process.is_running() and process.status() != psutil.STATUS_ZOMBIE)
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.AccessDenied, OSError, KeyError, TypeError, ValueError):
+        return None
 
 
 def _spawn_training_subprocess(run_id: str, *, stdout_f: TextIO, stderr_f: TextIO) -> subprocess.Popen:
@@ -279,6 +296,72 @@ class DbQueueWorker:
             pids = ",".join(str(process.pid) for process in survivors)
             raise UltralyticsDDPError(f"Registered training processes are still alive: run_id={self._running.run_id} pids={pids}")
 
+    def _cleanup_stale_ddp(self, run: TrainingRun) -> bool:
+        run_id = str(run.run_id)
+        run_root = settings.training_dir / run_id
+        ddp_root = run_root / "runtime" / "ddp"
+        matching: list[tuple[str, dict[str, Any]]] = []
+        corrupt_corresponding = False
+        for attempt in ddp_root.glob("*") if ddp_root.is_dir() else []:
+            context_path = attempt / "context.json"
+            try:
+                context = json.loads(context_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # An unreadable attempt cannot prove that its execution has exited.
+                return False
+            if not isinstance(context, dict):
+                return False
+            if context.get("run_id") != run_id:
+                continue
+            owner = context.get("execution_owner")
+            if not isinstance(owner, dict):
+                corrupt_corresponding = True
+                continue
+            if owner.get("worker_id") != str(run.worker_id or "") or owner.get("guard_pid") != run.pid:
+                continue
+            if context.get("attempt_id") != attempt.name:
+                corrupt_corresponding = True
+                continue
+            matching.append((attempt.name, context))
+        if corrupt_corresponding:
+            return False
+        if not matching:
+            if run.pid is None:
+                return True
+            try:
+                return not psutil.Process(int(run.pid)).is_running()
+            except psutil.NoSuchProcess:
+                return True
+            except (psutil.AccessDenied, OSError, ValueError):
+                return False
+
+        for attempt_id, context in matching:
+            owner = context["execution_owner"]
+            guard_identity = {
+                "pid": owner.get("guard_pid"),
+                "create_time": owner.get("guard_create_time"),
+            }
+            supervisor = context.get("supervisor")
+            for identity in (guard_identity, supervisor):
+                if not isinstance(identity, Mapping):
+                    continue
+                live = _identity_is_live(identity)
+                if live is not False:
+                    return False
+            try:
+                survivors = terminate_registered_processes(
+                    run_root,
+                    run_id=run_id,
+                    owner=owner,
+                    attempt_id=attempt_id,
+                    grace_seconds=2.0,
+                )
+            except (UltralyticsDDPCleanupIncomplete, OSError, ValueError):
+                return False
+            if survivors:
+                return False
+        return True
+
     def _try_start_next_run(self) -> None:
         db = SessionLocal()
         try:
@@ -391,6 +474,11 @@ class DbQueueWorker:
             .all()
         )
         for run in stale_running:
+            engine = str(getattr(getattr(run, "architecture", None), "engine", "") or "").strip().lower()
+            device = getattr(getattr(run, "parameters", None), "device", "auto")
+            if engine == "ultralytics-yolo" and len(extract_selected_gpu_ids(device)) > 1:
+                if not self._cleanup_stale_ddp(run):
+                    continue
             result = finalize_execution(
                 db,
                 str(run.run_id),

@@ -116,3 +116,26 @@ def test_download_export_prefers_indexed_onnx_artifact(export_db):
 
     assert result.path == indexed.resolve()
     assert result.path.read_bytes() == b"indexed"
+
+
+@pytest.mark.parametrize("current_exists", [False, True])
+def test_download_never_uses_indexed_legacy_export_after_layout_change(export_db, current_exists):
+    db, training_dir = export_db
+    run_root = training_dir / "run-1"
+    paths = prepare_ultralytics_execution(run_root)
+    legacy = run_root / "weights/best.onnx"
+    legacy.parent.mkdir()
+    legacy.write_bytes(b"legacy export")
+    db.add(TrainingRunArtifact(
+        run_id="run-1", kind="export", name="best.onnx", path="run-1/weights/best.onnx",
+    ))
+    db.commit()
+    if current_exists:
+        current = paths.weights_dir / "best.onnx"
+        current.parent.mkdir()
+        current.write_bytes(b"current export")
+        assert exports.download_export(db, "run-1", format="onnx").path == current
+    else:
+        with pytest.raises(exports.NotFoundError):
+            exports.download_export(db, "run-1", format="onnx")
+    assert legacy.read_bytes() == b"legacy export"

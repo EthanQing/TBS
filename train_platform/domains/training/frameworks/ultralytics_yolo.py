@@ -20,7 +20,9 @@ from train_platform.domains.datasets.yolo import find_yolo_dataset_yaml
 from train_platform.domains.training.execution_paths import (
     prepare_ultralytics_execution,
     prepare_ultralytics_resume_output,
+    reset_ultralytics_output,
     resolve_ultralytics_resume_checkpoint,
+    stage_ultralytics_input,
 )
 from train_platform.platform.filesystem.locations import resolve_pretrain_path, resolve_temp_path
 from train_platform.domains.training.parameters import (
@@ -277,9 +279,8 @@ class UltralyticsYOLOTrainer:
             if spec.resume_job_id and str(spec.resume_job_id) != str(spec.run_id):
                 source_root = settings.training_dir / str(spec.resume_job_id)
             checkpoint_path = resolve_ultralytics_resume_checkpoint(source_root)
-            if checkpoint_path is None and source_root != run_root:
-                raise ValueError(f"resume weights not found for run: {spec.resume_job_id}")
-            resume = checkpoint_path is not None
+            if checkpoint_path is None:
+                raise ValueError(f"resume weights not found for run: {spec.resume_job_id or spec.run_id}")
             if checkpoint_path:
                 model_path = str(checkpoint_path.resolve())
         if not model_path and spec.use_pretrained:
@@ -335,7 +336,29 @@ class UltralyticsYOLOTrainer:
         if callable(getattr(module, "cpu", None)):
             module.cpu()
 
-        paths = prepare_ultralytics_execution(run_root)
+        if checkpoint_path:
+            paths = prepare_ultralytics_execution(
+                run_root,
+                mode="resume",
+                resume_checkpoint=checkpoint_path,
+                reset_state="ready",
+            )
+        else:
+            model_file = Path(model_path)
+            original_model = model_file.resolve(strict=False)
+            if model_file.is_file():
+                staged_model = stage_ultralytics_input(run_root, model_file)
+                if staged_model != model_file.resolve():
+                    model_path = str(staged_model)
+            if resolved_pretrain is not None:
+                staged_pretrain = (
+                    Path(model_path)
+                    if resolved_pretrain.resolve(strict=False) == original_model
+                    else stage_ultralytics_input(run_root, resolved_pretrain)
+                )
+                if staged_pretrain != resolved_pretrain.resolve():
+                    resolved_pretrain = staged_pretrain
+            paths = reset_ultralytics_output(run_root)
         if checkpoint_path and epoch is not None:
             prepare_ultralytics_resume_output(
                 checkpoint_path.parent.parent,
@@ -343,9 +366,6 @@ class UltralyticsYOLOTrainer:
                 checkpoint_epoch=epoch,
                 train_results=train_results,
             )
-        else:
-            # Each Rank's BaseTrainer checks this file; initialize old history once.
-            (paths.output_dir / "results.csv").unlink(missing_ok=True)
         data_yaml = find_yolo_dataset_yaml(spec.dataset_path, dataset_name=spec.dataset_name)
         if data_yaml is None:
             raise ValueError(f"Dataset YAML not found under: {spec.dataset_path}")

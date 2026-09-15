@@ -39,7 +39,10 @@ from train_platform.domains.training.integrations.mlflow import (
 )
 from train_platform.domains.training.parameters import build_device_runtime, parse_visible_host_gpu_ids
 from train_platform.platform.runtime.custom_training import CustomTrainingCancelled
-from train_platform.platform.runtime.ultralytics_ddp import UltralyticsDDPCancelled
+from train_platform.platform.runtime.ultralytics_ddp import (
+    UltralyticsDDPCancelled,
+    UltralyticsDDPCleanupIncomplete,
+)
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
 
@@ -295,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     heartbeat_stop: threading.Event | None = None
     heartbeat_thread: threading.Thread | None = None
     vdl_bridge: VisualDLScalarBridge | None = None
+    defer_finalization = False
     try:
         execution_guard_pid = _wait_for_execution_guard_pid(run_id, actual_pid=actual_pid)
         print(
@@ -459,6 +463,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[train_entry] completed run_id={run_id}", flush=True)
         exit_code = 0
         return exit_code
+    except UltralyticsDDPCleanupIncomplete as e:
+        defer_finalization = True
+        mlflow_status = "FAILED"
+        exit_code = 1
+        error_message = f"{type(e).__name__}: {e}"
+        print(f"[train_entry] DDP cleanup deferred run_id={run_id}: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        return exit_code
     except (CustomTrainingCancelled, UltralyticsDDPCancelled):
         mlflow_status = "KILLED"
         error_message = None
@@ -494,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat_thread.join(timeout=2.0)
         if vdl_bridge is not None:
             vdl_bridge.stop()
-        if execution_guard_pid is not None:
+        if execution_guard_pid is not None and not defer_finalization:
             try:
                 lifecycle_db = SessionLocal()
                 try:

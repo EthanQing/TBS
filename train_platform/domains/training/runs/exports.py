@@ -61,6 +61,9 @@ def _safe_indexed_artifact_path(run_id: str, stored_path: str) -> Path:
     path = (base / str(stored_path)).resolve(strict=False)
     if run_root not in path.parents:
         raise ValidationError("Unsafe artifact path")
+    output_dir = read_ultralytics_paths(run_root).output_dir
+    if output_dir not in path.parents:
+        raise NotFoundError("Indexed export does not belong to the current output layout")
     return path
 
 
@@ -155,11 +158,13 @@ def download_export(
             .order_by(TrainingRunArtifact.artifact_id.desc())
             .first()
         )
-        path = (
-            _safe_indexed_artifact_path(str(run.run_id), str(artifact.path))
-            if artifact is not None
-            else _safe_run_path(str(run.run_id), f"{weights_key}.{extension}")
-        )
+        path = _safe_run_path(str(run.run_id), f"{weights_key}.{extension}")
+        if artifact is not None:
+            try:
+                path = _safe_indexed_artifact_path(str(run.run_id), str(artifact.path))
+            except NotFoundError:
+                # A migrated task can still have a legacy index; only its active layout is eligible.
+                pass
     else:
         path = _safe_run_path(str(run.run_id), f"{weights_key}.{extension}")
     if not path.exists() or not path.is_file():

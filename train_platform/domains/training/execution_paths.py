@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import shutil
+import stat
 import tempfile
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -106,19 +108,56 @@ def read_ultralytics_paths(run_root: Path) -> TrainingExecutionPaths:
         raise ValueError(f"unsupported training layout version: {layout.get('version')!r}")
     if layout.get("engine") != ULTRALYTICS_ENGINE:
         raise ValueError(f"unexpected training layout engine: {layout.get('engine')!r}")
+    execution = layout.get("execution")
+    if isinstance(execution, dict) and execution.get("reset_state") == "in_progress":
+        raise ValueError("Ultralytics output initialization is incomplete")
     return _base_paths(root, _layout_output_dir(root, layout.get("output_dir")))
 
 
-def prepare_ultralytics_execution(run_root: Path) -> TrainingExecutionPaths:
+def _read_layout_value(manifest: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("invalid Ultralytics execution layout")
+    return value
+
+
+def prepare_ultralytics_execution(
+    run_root: Path,
+    *,
+    mode: str | None = None,
+    resume_checkpoint: Path | None = None,
+    reset_state: str | None = None,
+) -> TrainingExecutionPaths:
     paths = new_ultralytics_paths(run_root)
     paths.runtime_dir.mkdir(parents=True, exist_ok=True)
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
     paths.output_dir.mkdir(parents=True, exist_ok=True)
     manifest = paths.layout_manifest
     temporary = paths.runtime_dir / "layout.json.tmp"
+    value: dict[str, object] = {
+        "version": LAYOUT_VERSION,
+        "engine": ULTRALYTICS_ENGINE,
+        "output_dir": ULTRALYTICS_OUTPUT_DIR,
+    }
+    existing = _read_layout_value(manifest)
+    if isinstance(existing, dict) and isinstance(existing.get("execution"), dict):
+        value["execution"] = existing["execution"]
+    if mode is not None:
+        if mode not in {"fresh", "resume"}:
+            raise ValueError("Ultralytics execution mode must be 'fresh' or 'resume'")
+        execution: dict[str, object] = {
+            "mode": mode,
+            "resume_checkpoint": str(Path(resume_checkpoint).resolve()) if resume_checkpoint else None,
+        }
+        if reset_state is not None:
+            execution["reset_state"] = reset_state
+        value["execution"] = execution
     temporary.write_text(
         json.dumps(
-            {"version": LAYOUT_VERSION, "engine": ULTRALYTICS_ENGINE, "output_dir": ULTRALYTICS_OUTPUT_DIR},
+            value,
             ensure_ascii=False,
             indent=2,
         )
@@ -127,6 +166,32 @@ def prepare_ultralytics_execution(run_root: Path) -> TrainingExecutionPaths:
     )
     temporary.replace(manifest)
     return paths
+
+
+def stage_ultralytics_input(run_root: Path, source: Path) -> Path:
+    paths = new_ultralytics_paths(run_root)
+    source_path = Path(source).resolve(strict=True)
+    output = paths.output_dir.resolve(strict=False)
+    if source_path != output and output not in source_path.parents:
+        return source_path
+    target = paths.runtime_dir / "inputs" / uuid.uuid4().hex / source_path.name
+    _copy_file_atomic(source_path, target)
+    return target.resolve()
+
+
+def reset_ultralytics_output(run_root: Path) -> TrainingExecutionPaths:
+    root = Path(run_root).resolve(strict=False)
+    expected = root / ULTRALYTICS_OUTPUT_DIR
+    if expected.exists() or expected.is_symlink():
+        attributes = getattr(expected.lstat(), "st_file_attributes", 0)
+        redirected = expected.is_symlink() or bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+        if redirected or expected.resolve(strict=True) != expected:
+            raise ValueError("Ultralytics output reset target must not be redirected")
+    prepare_ultralytics_execution(run_root, mode="fresh", reset_state="in_progress")
+    if expected.exists():
+        shutil.rmtree(expected)
+    expected.mkdir(parents=True, exist_ok=False)
+    return prepare_ultralytics_execution(run_root, mode="fresh", reset_state="ready")
 
 
 def _epoch_column(header: list[str]) -> int | None:
@@ -324,8 +389,24 @@ def resolve_ultralytics_checkpoint(run_root: Path, kind: str = "last") -> Path |
 
 
 def resolve_ultralytics_resume_checkpoint(run_root: Path) -> Path | None:
-    paths = read_ultralytics_paths(run_root)
-    candidates = [paths.weights_dir / "last.pt"]
+    root = Path(run_root).resolve(strict=False)
+    layout = _read_layout_value(root / "runtime" / "layout.json")
+    execution = layout.get("execution") if isinstance(layout, dict) else None
+    if isinstance(execution, dict) and execution.get("reset_state") != "ready":
+        return None
+    paths = read_ultralytics_paths(root)
+    output_checkpoint = paths.weights_dir / "last.pt"
+    if isinstance(execution, dict):
+        if output_checkpoint.is_file():
+            return output_checkpoint
+        if execution.get("mode") == "fresh":
+            return None
+        selected = execution.get("resume_checkpoint")
+        if isinstance(selected, str) and selected:
+            candidate = Path(selected)
+            return candidate if candidate.is_file() else None
+        return None
+    candidates = [output_checkpoint]
     legacy = paths.run_root / "weights" / "last.pt"
     if legacy != candidates[0]:
         candidates.append(legacy)
@@ -337,7 +418,9 @@ __all__ = [
     "new_ultralytics_paths",
     "prepare_ultralytics_execution",
     "prepare_ultralytics_resume_output",
+    "reset_ultralytics_output",
     "read_ultralytics_paths",
     "resolve_ultralytics_checkpoint",
     "resolve_ultralytics_resume_checkpoint",
+    "stage_ultralytics_input",
 ]
