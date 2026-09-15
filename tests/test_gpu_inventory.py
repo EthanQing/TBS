@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -170,3 +171,62 @@ def test_freshness_describes_observation_even_when_memory_unknown(db):
     summary, = queries.list_gpu_resources(db)
     assert summary["freshness_status"] == "fresh"
     assert summary["memory_total_mib"] is None
+
+
+def test_actual_dual_probe_failure_preserves_inventory(db, monkeypatch):
+    from train_platform.platform.runtime import gpu_probe
+
+    register(db)
+    old = NOW - timedelta(minutes=1)
+    inventory.save_inventory(db, "instance-a", sample(at=old))
+    db.commit()
+
+    def fail_handle(index):
+        raise RuntimeError("NVML handle unavailable")
+
+    monkeypatch.setattr(gpu_probe, "pynvml", SimpleNamespace(
+        nvmlInit=lambda: None, nvmlShutdown=lambda: None,
+        nvmlDeviceGetCount=lambda: 1, nvmlDeviceGetHandleByIndex=fail_handle,
+    ))
+    monkeypatch.setattr(gpu_probe.shutil, "which", lambda _: "nvidia-smi")
+    monkeypatch.setattr(gpu_probe.subprocess, "run", lambda *a, **kw: SimpleNamespace(
+        returncode=1, stdout="", stderr="smi cannot read devices"))
+    result = gpu_probe.probe_gpus()
+    inventory.save_inventory(db, "instance-a", result)
+    db.commit()
+    db.expire_all()
+    worker = db.get(GpuWorkerInstance, "instance-a")
+    observation = db.query(GpuWorkerObservation).one()
+    assert worker.inventory_status == "failed"
+    assert "NVML handle unavailable" in worker.inventory_error
+    assert "smi cannot read devices" in worker.inventory_error
+    assert worker.heartbeat_at.replace(tzinfo=timezone.utc) == NOW
+    assert worker.last_successful_inventory_at.replace(tzinfo=timezone.utc) == old
+    assert observation.sampled_at.replace(tzinfo=timezone.utc) == old
+    assert observation.present
+    assert (observation.memory_total_mib, observation.memory_used_mib, observation.memory_free_mib) == (1000, 100, 900)
+
+
+def test_partial_inventory_updates_good_card_without_hiding_old_card(db):
+    register(db)
+    old = NOW - timedelta(minutes=1)
+    inventory.save_inventory(db, "instance-a", sample(at=old))
+    db.commit()
+    second_gpu = "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    result = GpuProbeResult("success", "nvml", NOW, [
+        GpuProbeDevice(None, "GPU 0", observed_index=0, status="failed", error="handle failed"),
+        GpuProbeDevice(second_gpu, "Second GPU", observed_index=1, memory_total_mib=1000,
+                       memory_used_mib=200, memory_free_mib=800),
+        GpuProbeDevice(None, "Unidentified GPU", observed_index=2, memory_total_mib=1000,
+                       status="partial", error="full GPU UUID unavailable"),
+    ], error="GPU 0 handle failed", complete=False)
+    inventory.save_inventory(db, "instance-a", result)
+    db.commit()
+    db.expire_all()
+    observations = {item.gpu_uuid: item for item in db.query(GpuWorkerObservation)}
+    assert set(observations) == {GPU, second_gpu}
+    assert observations[GPU].present and observations[GPU].sampled_at.replace(tzinfo=timezone.utc) == old
+    assert observations[second_gpu].memory_used_mib == 200
+    assert observations[second_gpu].sampled_at.replace(tzinfo=timezone.utc) == NOW
+    error = db.get(GpuWorkerInstance, "instance-a").inventory_error
+    assert "GPU 0 handle failed" in error and "UUID" in error

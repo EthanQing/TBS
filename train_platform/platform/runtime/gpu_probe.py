@@ -22,7 +22,7 @@ GPU_UUID_RE = re.compile(r"^GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-
 @dataclass(frozen=True)
 class GpuProbeDevice:
     gpu_uuid: str | None
-    name: str
+    name: str | None
     pci_bus_id: str | None = None
     observed_index: int | None = None
     memory_total_mib: int | None = None
@@ -107,20 +107,38 @@ def _nvml_probe(sampled_at: datetime) -> GpuProbeResult:
     complete = True
     try:
         count = int(pynvml.nvmlDeviceGetCount())
+        if count == 0:
+            return GpuProbeResult("empty", "nvml", sampled_at, complete=True)
+
+        handles_read = 0
+        diagnostic_errors: list[str] = []
         for index in range(count):
             errors: list[str] = []
             try:
                 handle = pynvml.nvmlDeviceGetHandleByIndex(index)
             except Exception as exc:
-                devices.append(GpuProbeDevice(None, f"GPU {index}", observed_index=index, status="failed", error=str(exc)))
+                error = f"GPU {index} handle: {exc}"
+                diagnostic_errors.append(error)
+                devices.append(
+                    GpuProbeDevice(
+                        gpu_uuid=None,
+                        name=f"GPU {index}",
+                        observed_index=index,
+                        status="failed",
+                        error=error,
+                    )
+                )
                 complete = False
                 continue
+            handles_read += 1
+
             def read(label: str, fn):
                 try:
                     return fn()
                 except Exception as exc:
                     errors.append(f"{label}: {exc}")
                     return None
+
             memory = read("memory", lambda: pynvml.nvmlDeviceGetMemoryInfo(handle))
             try:
                 mig = pynvml.nvmlDeviceGetMigMode(handle)[0] if hasattr(pynvml, "nvmlDeviceGetMigMode") else None
@@ -131,23 +149,80 @@ def _nvml_probe(sampled_at: datetime) -> GpuProbeResult:
             if not uuid or not GPU_UUID_RE.fullmatch(uuid):
                 errors.append("full physical GPU UUID is unavailable")
                 complete = False
+                uuid = None
             else:
                 uuid = "GPU-" + uuid[4:].lower()
+            name = _text(read("name", lambda: pynvml.nvmlDeviceGetName(handle)))
+            pci_bus_id = _text(read("pci_bus_id", lambda: pynvml.nvmlDeviceGetPciInfo(handle).busId))
+            memory_total_mib = _floor_mib_bytes(getattr(memory, "total", None))
+            memory_used_mib = _ceil_mib_bytes(getattr(memory, "used", None))
+            memory_free_mib = _floor_mib_bytes(getattr(memory, "free", None))
+            utilization_percent = int(getattr(util, "gpu", 0)) if getattr(util, "gpu", None) is not None else None
+            compute_mode = _text(read("compute_mode", lambda: pynvml.nvmlDeviceGetComputeMode(handle)))
+            mig_mode = "enabled" if mig == 1 else ("disabled" if mig == 0 else None)
+            fields = {
+                "name": name,
+                "pci_bus_id": pci_bus_id,
+                "memory_total": memory_total_mib,
+                "memory_used": memory_used_mib,
+                "memory_free": memory_free_mib,
+                "utilization": utilization_percent,
+                "compute_mode": compute_mode,
+            }
+            for label, value in fields.items():
+                if value is None and not any(error.startswith(f"{label}:") for error in errors):
+                    errors.append(f"{label} is unavailable")
+            has_actual_information = any(
+                value is not None
+                for value in (
+                    uuid,
+                    name,
+                    pci_bus_id,
+                    memory_total_mib,
+                    memory_used_mib,
+                    memory_free_mib,
+                    utilization_percent,
+                    compute_mode,
+                )
+            )
+            status = "success" if not errors else "partial"
+            if not has_actual_information:
+                status = "failed"
+                errors.append("no GPU device information could be read")
+                diagnostic_errors.append(f"GPU {index}: {'; '.join(errors)}")
+                complete = False
             devices.append(GpuProbeDevice(
                 gpu_uuid=uuid if uuid and GPU_UUID_RE.fullmatch(uuid) else None,
-                name=_text(read("name", lambda: pynvml.nvmlDeviceGetName(handle))) or f"GPU {index}",
-                pci_bus_id=_text(read("pci_bus_id", lambda: pynvml.nvmlDeviceGetPciInfo(handle).busId)),
+                name=name,
+                pci_bus_id=pci_bus_id,
                 observed_index=index,
-                memory_total_mib=_floor_mib_bytes(getattr(memory, "total", None)),
-                memory_used_mib=_ceil_mib_bytes(getattr(memory, "used", None)),
-                memory_free_mib=_floor_mib_bytes(getattr(memory, "free", None)),
-                utilization_percent=int(getattr(util, "gpu", 0)) if getattr(util, "gpu", None) is not None else None,
-                compute_mode=_text(read("compute_mode", lambda: pynvml.nvmlDeviceGetComputeMode(handle))),
-                mig_mode="enabled" if mig == 1 else ("disabled" if mig == 0 else None),
-                status="success" if not errors else "partial",
+                memory_total_mib=memory_total_mib,
+                memory_used_mib=memory_used_mib,
+                memory_free_mib=memory_free_mib,
+                utilization_percent=utilization_percent,
+                compute_mode=compute_mode,
+                mig_mode=mig_mode,
+                status=status,
                 error="; ".join(errors) or None,
             ))
-        return GpuProbeResult("success" if devices else "empty", "nvml", sampled_at, devices, complete=complete)
+        valid_devices = [device for device in devices if device.status in {"success", "partial"}]
+        if handles_read == 0 or not valid_devices:
+            return GpuProbeResult(
+                "failed",
+                "nvml",
+                sampled_at,
+                devices,
+                "; ".join(diagnostic_errors) or "NVML could not read any enumerated GPU",
+                False,
+            )
+        return GpuProbeResult(
+            "success",
+            "nvml",
+            sampled_at,
+            devices,
+            error="; ".join(diagnostic_errors) or None,
+            complete=complete,
+        )
     except Exception as exc:
         return GpuProbeResult("failed", "nvml", sampled_at, devices, str(exc), False)
     finally:
@@ -178,30 +253,78 @@ def _smi_probe(sampled_at: datetime) -> GpuProbeResult:
         return GpuProbeResult(status, "nvidia-smi", sampled_at, error=error)
     devices: list[GpuProbeDevice] = []
     complete = True
+    diagnostic_errors: list[str] = []
     for raw in proc.stdout.splitlines():
         if not raw.strip():
             continue
         row = next(csv.reader([raw], skipinitialspace=True))
         if len(row) != 10:
             complete = False
+            diagnostic_errors.append("nvidia-smi returned a malformed GPU row")
             continue
+        errors: list[str] = []
         uuid = _text(row[2])
-        error = None
         if not uuid or not GPU_UUID_RE.fullmatch(uuid):
             uuid = None
-            error = "full physical GPU UUID is unavailable"
+            errors.append("full physical GPU UUID is unavailable")
             complete = False
         else:
             uuid = "GPU-" + uuid[4:].lower()
         index_number = _number(row[0])
+        if index_number is None:
+            errors.append("index is unavailable")
+        name = _text(row[1])
+        pci_bus_id = _text(row[3])
+        memory_total_mib = _mib(row[4])
+        memory_used_mib = _mib(row[5], used=True)
+        memory_free_mib = _mib(row[6])
         utilization = _number(row[7])
-        devices.append(GpuProbeDevice(uuid, _text(row[1]) or "GPU", _text(row[3]), int(index_number) if index_number is not None else None,
-            _mib(row[4]), _mib(row[5], used=True), _mib(row[6]), int(utilization) if utilization is not None else None,
-            _text(row[8]), _text(row[9]), "success" if not error else "failed", error))
-    if not devices and proc.stdout.strip():
-        return GpuProbeResult("failed", "nvidia-smi", sampled_at, error="nvidia-smi returned malformed CSV")
+        utilization_percent = int(utilization) if utilization is not None else None
+        compute_mode = _text(row[8])
+        mig_mode = _text(row[9])
+        fields = {
+            "name": name,
+            "pci_bus_id": pci_bus_id,
+            "memory_total": memory_total_mib,
+            "memory_used": memory_used_mib,
+            "memory_free": memory_free_mib,
+            "utilization": utilization_percent,
+            "compute_mode": compute_mode,
+        }
+        for label, value in fields.items():
+            if value is None:
+                errors.append(f"{label} is unavailable")
+        has_actual_information = any(value is not None for value in (uuid, *fields.values()))
+        status = "success" if not errors else "partial"
+        if not has_actual_information:
+            status = "failed"
+            error = f"GPU row {row[0].strip() or '?'}: no GPU device information could be read"
+            errors.append("no GPU device information could be read")
+            diagnostic_errors.append(error)
+            complete = False
+        devices.append(
+            GpuProbeDevice(
+                gpu_uuid=uuid,
+                name=name,
+                pci_bus_id=pci_bus_id,
+                observed_index=int(index_number) if index_number is not None else None,
+                memory_total_mib=memory_total_mib,
+                memory_used_mib=memory_used_mib,
+                memory_free_mib=memory_free_mib,
+                utilization_percent=utilization_percent,
+                compute_mode=compute_mode,
+                mig_mode=mig_mode,
+                status=status,
+                error="; ".join(errors) or None,
+            )
+        )
+    valid_devices = [device for device in devices if device.status in {"success", "partial"}]
+    if not valid_devices and proc.stdout.strip():
+        error = "; ".join(diagnostic_errors) or "nvidia-smi returned malformed CSV"
+        return GpuProbeResult("failed", "nvidia-smi", sampled_at, devices, error=error, complete=False)
     return GpuProbeResult("success" if devices else "empty", "nvidia-smi", sampled_at, devices,
-                          error=None if complete else "one or more GPU rows were incomplete", complete=complete)
+                          error=None if complete else "; ".join(diagnostic_errors) or "one or more GPU rows were incomplete",
+                          complete=complete)
 
 
 def probe_gpus() -> GpuProbeResult:

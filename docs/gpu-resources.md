@@ -31,6 +31,13 @@ uses integer MiB (1,048,576 bytes): total/free round down and used rounds up.
 Unknown fields remain null. Successful empty inventories, unavailable probing,
 and probe failures have distinct statuses.
 
+NVML success requires an actual readable observation, not merely a nonempty
+diagnostic list. If all enumerated GPU handles fail, probing falls back to
+`nvidia-smi`. Mixed results retain readable cards but make the inventory
+incomplete. Failed diagnostic entries are excluded from monitoring counts;
+partial observations can still be displayed without a UUID, but cannot be
+registered as physical resources until a complete UUID is available.
+
 `workers/gpu_resource_reporter.py` runs periodic reports independently of task
 execution. Each database transaction has its own Session. Inventory services
 mutate the caller's transaction; they do not claim or finalize Training Runs.

@@ -66,7 +66,9 @@ def save_inventory(db: Session, instance_id: str, result: GpuProbeResult) -> Non
     worker.last_successful_inventory_at = result.sampled_at
     device_errors = [device.error for device in result.devices if not device.gpu_uuid and device.error]
     if device_errors:
-        worker.inventory_error = "; ".join(device_errors)
+        worker.inventory_error = "; ".join(
+            error for error in [result.error, *device_errors] if error
+        )
     seen: set[str] = set()
     for sampled in result.devices:
         if not sampled.gpu_uuid:
@@ -74,7 +76,12 @@ def save_inventory(db: Session, instance_id: str, result: GpuProbeResult) -> Non
         seen.add(sampled.gpu_uuid)
         device = db.query(GpuDevice).filter(GpuDevice.gpu_uuid == sampled.gpu_uuid).with_for_update().first()
         if device is None:
-            device = GpuDevice(gpu_uuid=sampled.gpu_uuid, name=sampled.name, pci_bus_id=sampled.pci_bus_id, node_id=worker.node_id)
+            device = GpuDevice(
+                gpu_uuid=sampled.gpu_uuid,
+                name=sampled.name or "GPU",
+                pci_bus_id=sampled.pci_bus_id,
+                node_id=worker.node_id,
+            )
             try:
                 with db.begin_nested():
                     db.add(device)

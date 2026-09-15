@@ -31,7 +31,7 @@ def _to_float(value: Any) -> float | None:
 def _build_gpu_metric(
     *,
     gpu_index: int,
-    name: str,
+    name: str | None,
     uuid: str | None = None,
     utilization_percent: Any = None,
     memory_used_mb: Any = None,
@@ -66,7 +66,7 @@ def get_gpu_device_metrics() -> list[dict[str, Any]]:
             memory_total_mb=device.memory_total_mib,
         )
         for device in result.devices
-        if device.observed_index is not None
+        if device.observed_index is not None and device.status in {"success", "partial"}
     ]
 
 

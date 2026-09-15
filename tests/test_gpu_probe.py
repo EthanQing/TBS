@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import datetime, timezone
 
 import pytest
 
@@ -129,3 +130,122 @@ def test_monitoring_can_display_gpu_without_registerable_uuid(monkeypatch):
     assert metric["gpu_index"] == 0
     assert metric["uuid"] is None
     assert metric["memory_total_mb"] == 10
+
+
+def test_all_nvml_handles_failed_is_failed_not_empty_or_success(monkeypatch):
+    monkeypatch.setattr(probe, "pynvml", nvml(
+        nvmlDeviceGetCount=lambda: 2, nvmlDeviceGetHandleByIndex=fail))
+    result = probe._nvml_probe(datetime.now(timezone.utc))
+    assert result.status == "failed" and not result.complete
+    assert "permission denied" in result.error
+    assert all(device.status == "failed" for device in result.devices)
+
+
+@pytest.mark.parametrize("fallback_ok", [True, False])
+def test_all_handle_failures_attempt_smi_fallback(monkeypatch, fallback_ok):
+    monkeypatch.setattr(probe, "pynvml", nvml(nvmlDeviceGetHandleByIndex=fail))
+    monkeypatch.setattr(probe.shutil, "which", lambda _: "nvidia-smi")
+    calls = []
+
+    def smi(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(
+            returncode=0 if fallback_ok else 1,
+            stderr="" if fallback_ok else "smi failed",
+            stdout=f"0, Test GPU, {GPU}, 0000:01:00.0, 10 MiB, 2 MiB, 8 MiB, 12, Default, Disabled",
+        )
+
+    monkeypatch.setattr(probe.subprocess, "run", smi)
+    result = probe.probe_gpus()
+    assert calls == [1]
+    if fallback_ok:
+        assert result.status == "success" and result.source == "nvidia-smi"
+        assert result.devices[0].gpu_uuid == GPU
+    else:
+        assert result.status == "failed" and not result.complete
+        assert "permission denied" in result.error and "smi failed" in result.error
+        assert not any(device.status in {"success", "partial"} for device in result.devices)
+
+
+def test_mixed_nvml_handles_keep_good_card_and_diagnostics(monkeypatch):
+    from train_platform.domains.monitoring.metrics import collector
+
+    def handle(index):
+        if index == 1:
+            raise RuntimeError("GPU 1 inaccessible")
+        return "handle"
+
+    monkeypatch.setattr(probe, "pynvml", nvml(
+        nvmlDeviceGetCount=lambda: 2, nvmlDeviceGetHandleByIndex=handle))
+    monkeypatch.setattr(probe, "_smi_probe", lambda _: pytest.fail("partial NVML must be retained"))
+    result = probe.probe_gpus()
+    assert result.status == "success" and not result.complete
+    assert "GPU 1 inaccessible" in result.error
+    assert [device.gpu_uuid for device in result.devices if device.status == "success"] == [GPU]
+    monkeypatch.setattr(collector, "probe_gpus", lambda: result)
+    snapshot = collector.collect_system_snapshot()
+    assert snapshot["gpu_count"] == 1 and snapshot["gpu_available"] is True
+
+
+def test_monitoring_excludes_handle_failure_placeholders(monkeypatch):
+    from train_platform.domains.monitoring.metrics import collector
+
+    monkeypatch.setattr(probe, "pynvml", nvml(nvmlDeviceGetHandleByIndex=fail))
+    result = probe._nvml_probe(datetime.now(timezone.utc))
+    monkeypatch.setattr(collector, "probe_gpus", lambda: result)
+    assert collector.get_gpu_device_metrics() == []
+    snapshot = collector.collect_system_snapshot()
+    assert snapshot["gpu_count"] == 0 and snapshot["gpu_available"] is False
+
+
+@pytest.mark.parametrize("uuid", ["N/A", "GPU-short"])
+def test_smi_missing_uuid_is_displayable_partial_observation(monkeypatch, uuid):
+    from train_platform.domains.monitoring.metrics import collector
+
+    monkeypatch.setattr(probe, "pynvml", None)
+    monkeypatch.setattr(probe.shutil, "which", lambda _: "nvidia-smi")
+    monkeypatch.setattr(probe.subprocess, "run", lambda *a, **kw: SimpleNamespace(
+        returncode=0, stderr="", stdout=f"0, Test GPU, {uuid}, N/A, 10 MiB, N/A, 8 MiB, N/A, Default, N/A"))
+    result = probe.probe_gpus()
+    assert result.status == "success" and not result.complete
+    device, = result.devices
+    assert device.status == "partial" and device.gpu_uuid is None
+    assert device.error and device.memory_used_mib is None
+    monkeypatch.setattr(collector, "probe_gpus", lambda: result)
+    metric, = collector.get_gpu_device_metrics()
+    assert metric["uuid"] is None and metric["memory_total_mb"] == 10
+    assert metric["memory_used_mb"] is None
+
+
+def test_smi_index_alone_is_not_an_observation(monkeypatch):
+    monkeypatch.setattr(probe, "pynvml", None)
+    monkeypatch.setattr(probe.shutil, "which", lambda _: "nvidia-smi")
+    monkeypatch.setattr(probe.subprocess, "run", lambda *a, **kw: SimpleNamespace(
+        returncode=0, stderr="", stdout="0, N/A, N/A, N/A, N/A, N/A, N/A, N/A, N/A, N/A"))
+    result = probe.probe_gpus()
+    assert result.status == "failed" and not result.complete and result.error
+    assert not any(device.status in {"success", "partial"} for device in result.devices)
+
+
+def test_handle_without_readable_fields_is_failed(monkeypatch):
+    monkeypatch.setattr(probe, "pynvml", nvml(
+        nvmlDeviceGetName=fail, nvmlDeviceGetUUID=lambda _: "GPU-short",
+        nvmlDeviceGetMemoryInfo=fail, nvmlDeviceGetPciInfo=fail,
+        nvmlDeviceGetUtilizationRates=fail, nvmlDeviceGetComputeMode=fail,
+        nvmlDeviceGetMigMode=fail,
+    ))
+    result = probe._nvml_probe(datetime.now(timezone.utc))
+    assert result.status == "failed" and not result.complete
+    assert result.devices[0].status == "failed"
+    assert result.devices[0].gpu_uuid is None
+
+
+@pytest.mark.parametrize("missing_name", [None, "N/A"])
+def test_nvml_missing_name_is_null_partial_but_other_fields_survive(monkeypatch, missing_name):
+    monkeypatch.setattr(probe, "pynvml", nvml(nvmlDeviceGetName=lambda _: missing_name))
+    result = probe.probe_gpus()
+    assert result.status == "success" and result.complete
+    device, = result.devices
+    assert device.name is None and device.status == "partial"
+    assert "name" in device.error
+    assert device.gpu_uuid == GPU and device.memory_total_mib == 10
