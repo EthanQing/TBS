@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -37,12 +38,17 @@ from train_platform.domains.training.integrations.mlflow import (
     initialize_mlflow_logger,
     set_mlflow_binding,
 )
-from train_platform.domains.training.parameters import build_device_runtime, parse_visible_host_gpu_ids
+from train_platform.domains.training.parameters import (
+    build_device_runtime,
+    extract_selected_gpu_ids,
+    parse_visible_host_gpu_ids,
+)
 from train_platform.platform.runtime.custom_training import CustomTrainingCancelled
 from train_platform.platform.runtime.ultralytics_ddp import (
     UltralyticsDDPCancelled,
     UltralyticsDDPCleanupIncomplete,
 )
+from train_platform.platform.runtime import process_scope
 from train_platform.workers.training.vdl_bridge import VisualDLScalarBridge
 
 
@@ -127,6 +133,56 @@ def _optional_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _execution_owner_from_record(
+    run_root: Path,
+    *,
+    run_id: str,
+    guard_pid: int,
+    worker_id: str,
+) -> dict[str, object]:
+    path = Path(run_root) / "runtime" / "execution.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UltralyticsDDPCleanupIncomplete(
+            f"DDP execution record is unavailable: {path}", run_id=run_id,
+            attempt_id="not-started", execution_owner={}, survivors=[], cleanup_errors=[exc],
+        ) from exc
+    owner = record.get("execution_owner") if isinstance(record, dict) else None
+    if (
+        not isinstance(owner, dict)
+        or record.get("run_id") != run_id
+        or owner.get("guard_pid") != guard_pid
+        or owner.get("worker_id") != worker_id
+    ):
+        raise UltralyticsDDPCleanupIncomplete(
+            "DDP execution record does not match the database claim", run_id=run_id,
+            attempt_id="not-started", execution_owner=owner if isinstance(owner, dict) else {}, survivors=[],
+        )
+    scope_status = process_scope.compare_process_scope(
+        owner.get("process_scope"), process_scope.get_process_scope()
+    )
+    if scope_status != "same":
+        raise UltralyticsDDPCleanupIncomplete(
+            f"DDP execution process scope is {scope_status}", run_id=run_id,
+            attempt_id="not-started", execution_owner=owner, survivors=[],
+        )
+    try:
+        actual_create_time = float(psutil.Process(guard_pid).create_time())
+        recorded_create_time = float(owner["guard_create_time"])
+    except (psutil.Error, KeyError, TypeError, ValueError) as exc:
+        raise UltralyticsDDPCleanupIncomplete(
+            "DDP execution guard identity cannot be verified", run_id=run_id,
+            attempt_id="not-started", execution_owner=owner, survivors=[], cleanup_errors=[exc],
+        ) from exc
+    if actual_create_time != recorded_create_time:
+        raise UltralyticsDDPCleanupIncomplete(
+            "DDP execution guard identity no longer matches", run_id=run_id,
+            attempt_id="not-started", execution_owner=owner, survivors=[],
+        )
+    return dict(owner)
 
 
 def _materialize_execution_spec(
@@ -379,14 +435,25 @@ def main(argv: list[str] | None = None) -> int:
             runtime_device=runtime_device,
             trainer=trainer,
         )
-        guard_process = psutil.Process(execution_guard_pid)
-        spec = replace(
-            spec,
-            execution_owner={
+        selected_gpu_ids = extract_selected_gpu_ids(runtime_device)
+        if engine.strip().lower() == "ultralytics-yolo" and len(selected_gpu_ids) > 1:
+            execution_owner = _execution_owner_from_record(
+                run_dir,
+                run_id=run_id,
+                guard_pid=execution_guard_pid,
+                worker_id=str(getattr(run, "worker_id", "") or ""),
+            )
+        else:
+            guard_process = psutil.Process(execution_guard_pid)
+            execution_owner = {
                 "guard_pid": int(execution_guard_pid),
                 "guard_create_time": float(guard_process.create_time()),
                 "worker_id": str(getattr(run, "worker_id", "") or ""),
-            },
+                "process_scope": process_scope.get_process_scope(),
+            }
+        spec = replace(
+            spec,
+            execution_owner=execution_owner,
         )
 
         try:

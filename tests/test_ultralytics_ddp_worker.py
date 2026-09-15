@@ -8,6 +8,15 @@ import pytest
 from train_platform.workers import worker_impl as worker
 
 
+LOCAL_SCOPE = {"boot_id": "test-boot", "pid_namespace": {"device": 1, "inode": 2}}
+
+
+@pytest.fixture(autouse=True)
+def local_process_scope(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker.process_scope, "get_process_scope", lambda: LOCAL_SCOPE)
+    monkeypatch.setattr(worker, "settings", SimpleNamespace(training_dir=tmp_path))
+
+
 def setup_worker(monkeypatch, *, exited=False):
     now = datetime.now(timezone.utc)
     process = SimpleNamespace(pid=101, returncode=0 if exited else None)
@@ -17,6 +26,7 @@ def setup_worker(monkeypatch, *, exited=False):
         stdout_path=Path("stdout"), stderr_path=Path("stderr"),
         stdout_f=StringIO(), stderr_f=StringIO(),
         guard_create_time=123.5, ultralytics_ddp=True,
+        execution_owner={"guard_pid": 101, "guard_create_time": 123.5, "worker_id": "worker", "process_scope": LOCAL_SCOPE},
     )
     instance = worker.DbQueueWorker(worker_id="worker")
     instance._running = job
@@ -36,7 +46,7 @@ def setup_worker(monkeypatch, *, exited=False):
         proc.returncode = -15
 
     def cleanup(*args, **kwargs):
-        assert kwargs["owner"] == {"guard_pid": 101, "guard_create_time": 123.5, "worker_id": "worker"}
+        assert kwargs["owner"] == {"guard_pid": 101, "guard_create_time": 123.5, "worker_id": "worker", "process_scope": LOCAL_SCOPE}
         events.append("cleanup")
         return []
 
@@ -111,7 +121,7 @@ def test_stale_ddp_requires_confirmed_cleanup(tmp_path, monkeypatch, state):
 
     instance = worker.DbQueueWorker(worker_id="worker")
     run = SimpleNamespace(run_id="run", pid=101, worker_id="worker")
-    owner = {"guard_pid": 101, "guard_create_time": 123.5, "worker_id": "worker"}
+    owner = {"guard_pid": 101, "guard_create_time": 123.5, "worker_id": "worker", "process_scope": LOCAL_SCOPE}
     attempt = tmp_path / "run" / "runtime" / "ddp" / "attempt"
     attempt.mkdir(parents=True)
     context = {

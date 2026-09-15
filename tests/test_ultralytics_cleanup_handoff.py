@@ -4,7 +4,16 @@ from types import SimpleNamespace
 import pytest
 
 from train_platform.platform.runtime import ultralytics_ddp as ddp
+from train_platform.platform.runtime import process_scope
 from train_platform.workers.training import train_entry_impl as entry
+
+
+LOCAL_SCOPE = {"boot_id": "test-boot", "pid_namespace": {"device": 1, "inode": 2}}
+
+
+@pytest.fixture(autouse=True)
+def local_process_scope(monkeypatch):
+    monkeypatch.setattr(process_scope, "get_process_scope", lambda: LOCAL_SCOPE)
 
 
 @pytest.mark.parametrize("outcome", ["incomplete", "failed", "cancelled"])
@@ -14,7 +23,7 @@ def test_entry_defers_finalization_only_for_unfinished_cleanup(monkeypatch, outc
         ddp.UltralyticsDDPCleanupIncomplete(
             "cleanup incomplete",
             run_id="run", attempt_id="attempt",
-            execution_owner={"guard_pid": 123, "guard_create_time": 12.0, "worker_id": "worker"},
+            execution_owner={"guard_pid": 123, "guard_create_time": 12.0, "worker_id": "worker", "process_scope": LOCAL_SCOPE},
             survivors=[{"pid": 456, "create_time": 34.0}], original_error=original,
         )
         if outcome == "incomplete"
@@ -93,7 +102,7 @@ def test_runtime_rechecks_candidates_after_later_cleanup_round(monkeypatch, tmp_
     monkeypatch.setattr(ddp.psutil, "wait_procs", wait)
     context = {
         "run_id": "run", "run_root": str(tmp_path), "world_size": 2,
-        "cuda_visible_devices": "0,1", "execution_owner": {"guard_pid": os.getpid()},
+        "cuda_visible_devices": "0,1", "execution_owner": {"guard_pid": os.getpid(), "process_scope": LOCAL_SCOPE},
     }
 
     def execute():
@@ -128,7 +137,7 @@ def test_registered_cleanup_cannot_succeed_with_unreadable_identity(tmp_path, br
     attempt = tmp_path / "runtime" / "ddp" / "attempt"
     registrations = attempt / "processes"
     registrations.mkdir(parents=True)
-    context = {"run_id": "run", "attempt_id": "attempt", "execution_owner": {"guard_pid": 123}}
+    context = {"run_id": "run", "attempt_id": "attempt", "execution_owner": {"guard_pid": 123, "process_scope": LOCAL_SCOPE}}
     (attempt / "context.json").write_text(json.dumps(context))
     target = {
         "context": attempt / "context.json",
@@ -137,7 +146,7 @@ def test_registered_cleanup_cannot_succeed_with_unreadable_identity(tmp_path, br
     }[broken]
     target.write_text("{")
     with pytest.raises(ddp.UltralyticsDDPCleanupIncomplete):
-        ddp.terminate_registered_processes(tmp_path, run_id="run", owner={"guard_pid": 123})
+        ddp.terminate_registered_processes(tmp_path, run_id="run", owner={"guard_pid": 123, "process_scope": LOCAL_SCOPE})
 
 
 def test_unknown_process_is_preserved_for_worker_retry(tmp_path, monkeypatch):
@@ -146,7 +155,7 @@ def test_unknown_process_is_preserved_for_worker_retry(tmp_path, monkeypatch):
     attempt = tmp_path / "runtime" / "ddp" / "attempt"
     registrations = attempt / "processes"
     registrations.mkdir(parents=True)
-    scope = {"run_id": "run", "attempt_id": "attempt", "execution_owner": {"guard_pid": 123}}
+    scope = {"run_id": "run", "attempt_id": "attempt", "execution_owner": {"guard_pid": 123, "process_scope": LOCAL_SCOPE}}
     (attempt / "context.json").write_text(json.dumps(scope))
     (registrations / "rank-0.json").write_text(json.dumps({**scope, "pid": 404, "create_time": 10.0}))
     monkeypatch.setattr(ddp.psutil, "Process", lambda pid: (_ for _ in ()).throw(ddp.psutil.AccessDenied(pid)))

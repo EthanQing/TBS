@@ -10,13 +10,30 @@ import sys
 import tempfile
 import time
 import unittest
+import types
 from contextlib import ExitStack
 from unittest.mock import patch
 
 import psutil
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "train_platform/platform/runtime/ultralytics_ddp.py"
+RUNTIME_DIR = Path(__file__).resolve().parents[1] / "train_platform/platform/runtime"
+MODULE_PATH = RUNTIME_DIR / "ultralytics_ddp.py"
+SCOPE_PATH = RUNTIME_DIR / "process_scope.py"
+try:
+    from train_platform.platform.runtime import process_scope
+except ImportError:
+    train_platform_package = sys.modules.setdefault("train_platform", types.ModuleType("train_platform"))
+    platform_package = sys.modules.setdefault("train_platform.platform", types.ModuleType("train_platform.platform"))
+    runtime_package = sys.modules.setdefault("train_platform.platform.runtime", types.ModuleType("train_platform.platform.runtime"))
+    train_platform_package.__path__ = []
+    platform_package.__path__ = []
+    runtime_package.__path__ = []
+    scope_spec = importlib.util.spec_from_file_location("train_platform.platform.runtime.process_scope", SCOPE_PATH)
+    process_scope = importlib.util.module_from_spec(scope_spec)
+    sys.modules[scope_spec.name] = process_scope
+    scope_spec.loader.exec_module(process_scope)
+    runtime_package.process_scope = process_scope
 SPEC = importlib.util.spec_from_file_location("ddp_process_test_runtime", MODULE_PATH)
 runtime = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runtime
@@ -64,6 +81,7 @@ class DistributedProcessTests(unittest.TestCase):
             "guard_pid": os.getpid(),
             "guard_create_time": psutil.Process().create_time(),
             "worker_id": "process-test",
+            "process_scope": process_scope.get_process_scope(),
         }
         context = {
             "run_id": "process-test", "run_root": str(root),
@@ -164,15 +182,16 @@ class DistributedProcessTests(unittest.TestCase):
             try:
                 attempt = root / "runtime/ddp/attempt"
                 attempt.mkdir(parents=True)
-                context = {"run_id": "run", "attempt_id": "attempt", "execution_owner": {"guard_pid": 11}}
+                local_scope = process_scope.get_process_scope()
+                context = {"run_id": "run", "attempt_id": "attempt", "execution_owner": {"guard_pid": 11, "process_scope": local_scope}}
                 (attempt / "context.json").write_text(json.dumps(context))
                 identity = runtime.process_identity(process.pid, **context)
                 runtime.register_process(attempt / "processes", "rank-0", **identity)
-                runtime.terminate_registered_processes(root, run_id="run", owner={"guard_pid": 22}, grace_seconds=0)
+                runtime.terminate_registered_processes(root, run_id="run", owner={"guard_pid": 22, "process_scope": local_scope}, grace_seconds=0)
                 self.assertIsNone(process.poll())
                 self.assertIsNone(runtime._matching_process({**identity, "create_time": identity["create_time"] - 1}))
                 runtime.register_process(attempt / "processes", "rank-0", **{**identity, "attempt_id": "old"})
-                runtime.terminate_registered_processes(root, run_id="run", owner={"guard_pid": 11}, grace_seconds=0)
+                runtime.terminate_registered_processes(root, run_id="run", owner={"guard_pid": 11, "process_scope": local_scope}, grace_seconds=0)
                 self.assertIsNone(process.poll())
             finally:
                 process.kill()

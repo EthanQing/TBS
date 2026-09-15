@@ -14,6 +14,13 @@ def _load_context(path: Path) -> dict[str, Any]:
     mask = str(value.get("cuda_visible_devices") or "").strip()
     if not mask:
         raise ValueError("distributed context is missing CUDA_VISIBLE_DEVICES")
+    from train_platform.platform.runtime import process_scope
+
+    owner = value.get("execution_owner")
+    expected_scope = owner.get("process_scope") if isinstance(owner, dict) else None
+    scope_status = process_scope.compare_process_scope(expected_scope, process_scope.get_process_scope())
+    if scope_status != "same":
+        raise RuntimeError(f"distributed rank process scope is {scope_status}")
     os.environ["CUDA_VISIBLE_DEVICES"] = mask
     os.environ["PYTHONIOENCODING"] = "utf-8"
     os.environ["PYTHONUTF8"] = "1"

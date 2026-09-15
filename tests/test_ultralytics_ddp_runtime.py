@@ -5,6 +5,15 @@ import pytest
 
 from train_platform.domains.training.frameworks.ultralytics_yolo import _collect_metrics, _register_epoch_callbacks
 from train_platform.platform.runtime.ultralytics_ddp import MetricsJSONLReader
+from train_platform.platform.runtime import process_scope
+
+
+LOCAL_SCOPE = {"boot_id": "test-boot", "pid_namespace": {"device": 1, "inode": 2}}
+
+
+@pytest.fixture(autouse=True)
+def local_process_scope(monkeypatch):
+    monkeypatch.setattr(process_scope, "get_process_scope", lambda: LOCAL_SCOPE)
 
 
 def test_metrics_reader_keeps_partial_line_and_filters_attempt(tmp_path):
@@ -56,7 +65,7 @@ def test_rank_uses_frozen_mask_and_only_rank_zero_emits(tmp_path, monkeypatch, m
     metrics = tmp_path / "metrics.jsonl"
     metrics.touch()
     context = {
-        "run_id": "run", "attempt_id": "attempt", "execution_owner": {},
+        "run_id": "run", "attempt_id": "attempt", "execution_owner": {"process_scope": LOCAL_SCOPE},
         "world_size": 2, "cuda_visible_devices": mask, "requested_device": "2,5",
         "pin_memory": False, "model_type": model_type, "model_path": "prepared.pt",
         "processes_dir": str(tmp_path / "processes"), "metrics_path": str(metrics),

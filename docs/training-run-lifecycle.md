@@ -207,8 +207,19 @@ Explicit selection of multiple GPUs uses one queue claim and one `RunningJob`:
 `DbQueueWorker -> train_entry -> torch.distributed.run -> Rank processes`.
 `TrainingRun.pid` remains the existing train_entry execution guard PID.
 `TrainingExecutionSpec.execution_owner` carries that PID, its process creation
-time, and worker ID; it contains no database objects. Single-GPU and CPU
+time, worker ID, and process scope; it contains no database objects. Single-GPU and CPU
 executions continue training and extra validation inside train_entry.
+
+`platform/runtime/process_scope.py` owns scope acquisition and comparison.
+Linux scope combines `/proc/sys/kernel/random/boot_id` with the device and inode
+of `/proc/self/ns/pid`. Worker identity is independent of this process scope.
+The Worker records `run_id` and the complete execution owner atomically in
+`runtime/execution.json` after spawning the supervisor and before publishing
+the RUNNING claim. This identifies preparation-stage executions even before
+any DDP attempt exists. train_entry validates the record against its database
+claim and actual guard identity; Rank entry validates its actual scope before
+process registration. Context, process registrations, and pending cleanup
+identities retain the same scope through execution and cleanup handoff.
 
 The adapter prepares the layout, runtime dataset YAML, resume best weight and
 CSV carryover once. `PreparedUltralyticsExecution` contains only serializable
@@ -270,6 +281,22 @@ RunningJob and log handles until cleanup succeeds, then finalizes with the
 original exit code and authoritative cancel/delete intent. Stale DDP claims
 likewise require a stopped supervisor and confirmed child cleanup before terminal
 finalization; an expired heartbeat alone is insufficient.
+
+PID queries and cleanup first require the recorded scope to match the current
+environment. Only within that scope can a missing PID, changed creation time,
+or zombie status establish that the old process has exited. Another scope or
+an unreadable/missing scope remains unconfirmed and raises cleanup-incomplete
+at the cleanup boundary. It never means an empty, successfully cleaned process
+set. Handoff preserves the original scope of unconfirmed identities.
+
+Stale recovery first matches the startup execution record to the current
+database claim, or uses an unambiguous scoped attempt record when the startup
+record is absent. No verifiable record means deferred recovery; it does not
+fall back to checking the database PID in the local container. Historical
+records without scope are never assigned the current scope. A restarted Worker
+in the same scope can recover a verified dead execution; a Worker in another
+scope logs the reason and leaves the claim intact. No host PID namespace or
+cross-node scheduling service is required by this flow.
 
 
 ## Custom-source runtime v1

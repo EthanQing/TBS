@@ -13,6 +13,8 @@ from typing import Any, Callable, Mapping
 
 import psutil
 
+from train_platform.platform.runtime import process_scope
+
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +56,17 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def process_identity(pid: int, **extra: Any) -> dict[str, Any]:
+    current_scope = process_scope.get_process_scope()
+    owner = extra.get("execution_owner")
+    if isinstance(owner, Mapping):
+        comparison = process_scope.compare_process_scope(owner.get("process_scope"), current_scope)
+        if comparison != "same":
+            raise ValueError(f"execution owner process scope is {comparison}")
     process = psutil.Process(int(pid))
-    identity: dict[str, Any] = {"pid": int(pid), "create_time": float(process.create_time()), **extra}
+    identity: dict[str, Any] = {
+        "pid": int(pid), "create_time": float(process.create_time()),
+        "process_scope": current_scope, **extra,
+    }
     if os.name != "nt":
         try:
             identity["pgid"] = int(os.getpgid(int(pid)))
@@ -98,6 +109,10 @@ def _load_identities_strict(processes_dir: Path) -> list[dict[str, Any]]:
 
 
 def _matching_process(identity: Mapping[str, Any]) -> psutil.Process | None:
+    if process_scope.compare_process_scope(
+        process_scope.identity_process_scope(identity), process_scope.get_process_scope()
+    ) != "same":
+        return None
     try:
         process = psutil.Process(int(identity["pid"]))
         if float(process.create_time()) != float(identity["create_time"]):
@@ -134,6 +149,10 @@ def _is_live(process: psutil.Process) -> bool:
 
 
 def _process_state(identity: Mapping[str, Any]) -> tuple[str, psutil.Process | None]:
+    if process_scope.compare_process_scope(
+        process_scope.identity_process_scope(identity), process_scope.get_process_scope()
+    ) != "same":
+        return "unknown", None
     try:
         process = psutil.Process(int(identity["pid"]))
         if float(process.create_time()) != float(identity["create_time"]):
@@ -150,7 +169,25 @@ def _process_state(identity: Mapping[str, Any]) -> tuple[str, psutil.Process | N
 
 
 def _identity_from_process(process: psutil.Process, **extra: Any) -> dict[str, Any]:
-    return {"pid": int(process.pid), "create_time": float(process.create_time()), **extra}
+    return {
+        "pid": int(process.pid), "create_time": float(process.create_time()),
+        "process_scope": process_scope.get_process_scope(), **extra,
+    }
+
+
+def _candidate_identity_key(identity: Mapping[str, Any]) -> tuple[int, float, str]:
+    pid = int(identity["pid"])
+    create_time = float(identity["create_time"])
+    extracted = process_scope.identity_process_scope(identity)
+    if extracted is not None:
+        scope_value: object = extracted
+    else:
+        owner = identity.get("execution_owner")
+        scope_value = {
+            "direct": identity.get("process_scope"),
+            "owner": owner.get("process_scope") if isinstance(owner, Mapping) else None,
+        }
+    return pid, create_time, json.dumps(scope_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def terminate_registered_processes(
@@ -161,6 +198,15 @@ def terminate_registered_processes(
     attempt_id: str | None = None,
     grace_seconds: float = 5.0,
 ) -> list[psutil.Process]:
+    owner_scope_status = process_scope.compare_process_scope(
+        owner.get("process_scope"), process_scope.get_process_scope()
+    )
+    if owner_scope_status != "same":
+        raise UltralyticsDDPCleanupIncomplete(
+            f"execution owner process scope is {owner_scope_status}",
+            run_id=str(run_id), attempt_id=str(attempt_id or "unknown"),
+            execution_owner=owner, survivors=[],
+        )
     ddp_root = Path(run_root) / "runtime" / "ddp"
     if attempt_id is not None:
         attempts = [ddp_root / attempt_id]
@@ -204,7 +250,18 @@ def terminate_registered_processes(
                 execution_owner=owner, survivors=[], cleanup_errors=[error],
             ) from error
         if owner and any(registered_owner.get(key) != value for key, value in owner.items() if value is not None):
-            continue
+            basic_keys = ("guard_pid", "guard_create_time", "worker_id")
+            if any(registered_owner.get(key) != owner.get(key) for key in basic_keys):
+                continue
+        context_scope_status = process_scope.compare_process_scope(
+            registered_owner.get("process_scope"), process_scope.get_process_scope()
+        )
+        if context_scope_status != "same":
+            raise UltralyticsDDPCleanupIncomplete(
+                f"distributed context process scope is {context_scope_status}: attempt_id={attempt.name}",
+                run_id=str(run_id), attempt_id=attempt.name,
+                execution_owner=owner, survivors=[],
+            )
         selected_attempts.append(attempt)
         try:
             identities = _load_identities_strict(attempt / "processes")
@@ -221,6 +278,20 @@ def terminate_registered_processes(
                 raise ValueError(f"invalid distributed cleanup marker: {pending_path}")
             if pending.get("run_id") != str(run_id) or pending.get("attempt_id") != str(context["attempt_id"]):
                 raise ValueError(f"distributed cleanup marker scope mismatch: {pending_path}")
+            pending_owner = pending.get("execution_owner")
+            if not isinstance(pending_owner, Mapping):
+                raise ValueError(f"distributed cleanup marker owner is invalid: {pending_path}")
+            if any(pending_owner.get(key) != owner.get(key) for key in ("guard_pid", "guard_create_time", "worker_id")):
+                raise ValueError(f"distributed cleanup marker owner mismatch: {pending_path}")
+            pending_scope_status = process_scope.compare_process_scope(
+                pending_owner.get("process_scope"), process_scope.get_process_scope()
+            )
+            if pending_scope_status != "same":
+                raise UltralyticsDDPCleanupIncomplete(
+                    f"distributed cleanup marker process scope is {pending_scope_status}: attempt_id={context['attempt_id']}",
+                    run_id=str(run_id), attempt_id=str(context["attempt_id"]),
+                    execution_owner=owner, survivors=[],
+                )
             if any(not isinstance(item, dict) for item in pending["survivors"]):
                 raise ValueError(f"invalid distributed cleanup survivor: {pending_path}")
             identities.extend(pending["survivors"])
@@ -242,6 +313,15 @@ def terminate_registered_processes(
                     run_id=str(run_id), attempt_id=str(context["attempt_id"]),
                     execution_owner=owner, survivors=[], cleanup_errors=[error],
                 ) from error
+            identity_scope_status = process_scope.compare_process_scope(
+                process_scope.identity_process_scope(identity), process_scope.get_process_scope()
+            )
+            if identity_scope_status != "same":
+                raise UltralyticsDDPCleanupIncomplete(
+                    f"distributed process scope is {identity_scope_status}: attempt_id={context['attempt_id']}",
+                    run_id=str(run_id), attempt_id=str(context["attempt_id"]),
+                    execution_owner=owner, survivors=[dict(identity, state="unknown")],
+                )
             if not _identity_matches_scope(
                 identity,
                 run_id=str(run_id),
@@ -394,6 +474,15 @@ def run_ultralytics_ddp(
         raise ValueError("distributed context execution_owner must be a mapping")
     run_root = Path(str(context["run_root"])).resolve(strict=False)
     attempt_id = uuid.uuid4().hex
+    owner_scope_status = process_scope.compare_process_scope(
+        context_owner.get("process_scope"), process_scope.get_process_scope()
+    )
+    if owner_scope_status != "same":
+        raise UltralyticsDDPCleanupIncomplete(
+            f"distributed supervisor process scope is {owner_scope_status}",
+            run_id=str(context["run_id"]), attempt_id=attempt_id,
+            execution_owner=context_owner, survivors=[],
+        )
     attempt_dir = run_root / "runtime" / "ddp" / attempt_id
     processes_dir = attempt_dir / "processes"
     metrics_path = attempt_dir / "metrics.jsonl"
@@ -573,9 +662,15 @@ def run_ultralytics_ddp(
                 primary_error = UltralyticsDDPError(
                     f"torchrun exited with code {return_code}: attempt_id={attempt_id}"
                 )
-            candidate_identities: dict[tuple[int, float], dict[str, Any]] = {}
+            candidate_identities: dict[tuple[int, float, str], dict[str, Any]] = {}
             for (pid, create_time) in known_processes:
-                candidate_identities[(pid, create_time)] = {"pid": pid, "create_time": create_time}
+                identity = {
+                    "pid": pid, "create_time": create_time,
+                    "process_scope": owner["process_scope"],
+                    "run_id": str(payload["run_id"]), "attempt_id": attempt_id,
+                    "execution_owner": owner,
+                }
+                candidate_identities[_candidate_identity_key(identity)] = identity
             cleanup_unconfirmed = False
             try:
                 registered_identities = _load_identities_strict(processes_dir)
@@ -591,7 +686,7 @@ def run_ultralytics_ddp(
                 ):
                     continue
                 try:
-                    key = (int(identity["pid"]), float(identity["create_time"]))
+                    key = _candidate_identity_key(identity)
                 except (KeyError, TypeError, ValueError):
                     cleanup_unconfirmed = True
                     continue
@@ -615,7 +710,7 @@ def run_ultralytics_ddp(
                 cleanup_pass_unconfirmed = not bool(exc.survivors)
                 for identity in exc.survivors:
                     try:
-                        key = (int(identity["pid"]), float(identity["create_time"]))
+                        key = _candidate_identity_key(identity)
                     except (KeyError, TypeError, ValueError):
                         cleanup_pass_unconfirmed = True
                         continue
@@ -629,8 +724,13 @@ def run_ultralytics_ddp(
                 cleanup_errors.append(exc)
             for process in round_survivors:
                 try:
-                    identity = _identity_from_process(process)
-                    candidate_identities[(identity["pid"], identity["create_time"])] = identity
+                    identity = _identity_from_process(
+                        process,
+                        process_scope=owner["process_scope"],
+                        run_id=str(payload["run_id"]), attempt_id=attempt_id,
+                        execution_owner=owner,
+                    )
+                    candidate_identities[_candidate_identity_key(identity)] = identity
                 except psutil.Error:
                     continue
             if launcher is not None:
@@ -646,7 +746,13 @@ def run_ultralytics_ddp(
                 if primary_error is None:
                     primary_error = exc
             for (pid, create_time) in known_processes:
-                candidate_identities.setdefault((pid, create_time), {"pid": pid, "create_time": create_time})
+                identity = {
+                    "pid": pid, "create_time": create_time,
+                    "process_scope": owner["process_scope"],
+                    "run_id": str(payload["run_id"]), "attempt_id": attempt_id,
+                    "execution_owner": owner,
+                }
+                candidate_identities.setdefault(_candidate_identity_key(identity), identity)
             try:
                 final_registered = _load_identities_strict(processes_dir)
             except BaseException as exc:
@@ -664,7 +770,7 @@ def run_ultralytics_ddp(
                 ):
                     continue
                 try:
-                    key = (int(identity["pid"]), float(identity["create_time"]))
+                    key = _candidate_identity_key(identity)
                 except (KeyError, TypeError, ValueError):
                     cleanup_unconfirmed = True
                     continue
@@ -673,13 +779,7 @@ def run_ultralytics_ddp(
             for identity in candidate_identities.values():
                 state, _ = _process_state(identity)
                 if state != "dead":
-                    final_survivors.append(dict(
-                        identity,
-                        state=state,
-                        run_id=str(payload["run_id"]),
-                        attempt_id=attempt_id,
-                        execution_owner=owner,
-                    ))
+                    final_survivors.append(dict(identity, state=state))
             pending_path = attempt_dir / "cleanup-pending.json"
             if final_survivors:
                 try:

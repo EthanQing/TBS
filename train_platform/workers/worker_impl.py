@@ -33,6 +33,7 @@ from train_platform.platform.runtime.ultralytics_ddp import (
     UltralyticsDDPError,
     terminate_registered_processes,
 )
+from train_platform.platform.runtime import process_scope
 
 
 CUSTOM_CANCEL_FALLBACK_SECONDS = 10.0
@@ -53,7 +54,36 @@ def _safe_remove_dir(path: Path) -> None:
         pass
 
 
+def _write_execution_record(run_root: Path, run_id: str, owner: Mapping[str, Any]) -> None:
+    runtime_dir = Path(run_root) / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    target = runtime_dir / "execution.json"
+    temporary = runtime_dir / "execution.json.tmp"
+    temporary.write_text(
+        json.dumps({"run_id": str(run_id), "execution_owner": dict(owner)}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+
+
+def _read_execution_record(run_root: Path) -> dict[str, Any] | None:
+    path = Path(run_root) / "runtime" / "execution.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"invalid execution record: {path}") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("execution_owner"), dict):
+        raise ValueError(f"invalid execution record: {path}")
+    return value
+
+
 def _identity_is_live(identity: Mapping[str, Any]) -> bool | None:
+    if process_scope.compare_process_scope(
+        process_scope.identity_process_scope(identity), process_scope.get_process_scope()
+    ) != "same":
+        return None
     try:
         process = psutil.Process(int(identity["pid"]))
         if float(process.create_time()) != float(identity["create_time"]):
@@ -157,6 +187,7 @@ class RunningJob:
     cancel_seen_at: Optional[datetime] = None
     guard_create_time: float = 0.0
     ultralytics_ddp: bool = False
+    execution_owner: dict[str, Any] | None = None
 
 
 class DbQueueWorker:
@@ -208,6 +239,7 @@ class DbQueueWorker:
         try:
             run = db.query(TrainingRun).filter(TrainingRun.run_id == run_id).first()
             if not run:
+                self._validate_running_ddp_scope()
                 _terminate_process_tree(self._running.proc)
                 self._cleanup_registered_ddp()
                 should_cleanup = True
@@ -235,6 +267,7 @@ class DbQueueWorker:
                     if self._running.cancel_seen_at is None:
                         self._running.cancel_seen_at = now
                     elif (now - self._running.cancel_seen_at).total_seconds() >= grace_seconds:
+                        self._validate_running_ddp_scope()
                         _terminate_process_tree(self._running.proc)
                         self._cleanup_registered_ddp()
                         registered_cleanup_done = True
@@ -279,17 +312,40 @@ class DbQueueWorker:
         self._running = None
         self._last_heartbeat_at = None
 
+    def _validate_running_ddp_scope(self) -> None:
+        if self._running is None or not self._running.ultralytics_ddp:
+            return
+        owner = self._running.execution_owner
+        if not isinstance(owner, dict):
+            raise UltralyticsDDPCleanupIncomplete(
+                "running DDP job has no execution owner",
+                run_id=self._running.run_id, attempt_id="unknown",
+                execution_owner={}, survivors=[],
+            )
+        scope_status = process_scope.compare_process_scope(
+            owner.get("process_scope"), process_scope.get_process_scope()
+        )
+        if scope_status != "same":
+            raise UltralyticsDDPCleanupIncomplete(
+                f"running DDP execution process scope is {scope_status}",
+                run_id=self._running.run_id, attempt_id="unknown",
+                execution_owner=owner, survivors=[],
+            )
+        run_root = settings.training_dir / self._running.run_id
+        record = _read_execution_record(run_root)
+        if record is None:
+            _write_execution_record(run_root, self._running.run_id, owner)
+
     def _cleanup_registered_ddp(self) -> None:
         if self._running is None or not self._running.ultralytics_ddp:
             return
+        self._validate_running_ddp_scope()
+        owner = self._running.execution_owner
+        assert isinstance(owner, dict)
         survivors = terminate_registered_processes(
             settings.training_dir / self._running.run_id,
             run_id=self._running.run_id,
-            owner={
-                "guard_pid": int(self._running.proc.pid),
-                "guard_create_time": float(self._running.guard_create_time),
-                "worker_id": self.worker_id,
-            },
+            owner=owner,
             grace_seconds=2.0,
         )
         if survivors:
@@ -300,54 +356,95 @@ class DbQueueWorker:
         run_id = str(run.run_id)
         run_root = settings.training_dir / run_id
         ddp_root = run_root / "runtime" / "ddp"
-        matching: list[tuple[str, dict[str, Any]]] = []
-        corrupt_corresponding = False
+        try:
+            execution = _read_execution_record(run_root)
+        except ValueError as exc:
+            print(f"[worker] stale DDP cleanup deferred run_id={run_id}: {exc}", file=sys.stderr, flush=True)
+            return False
+
+        owner: dict[str, Any] | None = None
+        if execution is not None:
+            candidate = execution["execution_owner"]
+            if (
+                execution.get("run_id") != run_id
+                or candidate.get("guard_pid") != run.pid
+                or candidate.get("worker_id") != str(run.worker_id or "")
+            ):
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: execution record does not match claim", file=sys.stderr, flush=True)
+                return False
+            owner = dict(candidate)
+
+        contexts: list[tuple[str, dict[str, Any]]] = []
         for attempt in ddp_root.glob("*") if ddp_root.is_dir() else []:
             context_path = attempt / "context.json"
             try:
                 context = json.loads(context_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 # An unreadable attempt cannot prove that its execution has exited.
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: unreadable context {context_path}", file=sys.stderr, flush=True)
                 return False
             if not isinstance(context, dict):
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: invalid context {context_path}", file=sys.stderr, flush=True)
                 return False
             if context.get("run_id") != run_id:
                 continue
-            owner = context.get("execution_owner")
-            if not isinstance(owner, dict):
-                corrupt_corresponding = True
-                continue
-            if owner.get("worker_id") != str(run.worker_id or "") or owner.get("guard_pid") != run.pid:
+            context_owner = context.get("execution_owner")
+            if not isinstance(context_owner, dict):
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: context owner missing", file=sys.stderr, flush=True)
+                return False
+            if context_owner.get("worker_id") != str(run.worker_id or "") or context_owner.get("guard_pid") != run.pid:
                 continue
             if context.get("attempt_id") != attempt.name:
-                corrupt_corresponding = True
-                continue
-            matching.append((attempt.name, context))
-        if corrupt_corresponding:
-            return False
-        if not matching:
-            if run.pid is None:
-                return True
-            try:
-                return not psutil.Process(int(run.pid)).is_running()
-            except psutil.NoSuchProcess:
-                return True
-            except (psutil.AccessDenied, OSError, ValueError):
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: context attempt mismatch", file=sys.stderr, flush=True)
                 return False
+            contexts.append((attempt.name, context))
 
-        for attempt_id, context in matching:
-            owner = context["execution_owner"]
-            guard_identity = {
-                "pid": owner.get("guard_pid"),
-                "create_time": owner.get("guard_create_time"),
+        if owner is None:
+            owners = {
+                json.dumps(context["execution_owner"], sort_keys=True): context["execution_owner"]
+                for _, context in contexts
             }
+            if len(owners) != 1:
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: execution scope unavailable", file=sys.stderr, flush=True)
+                return False
+            owner = dict(next(iter(owners.values())))
+
+        scope_status = process_scope.compare_process_scope(
+            owner.get("process_scope"), process_scope.get_process_scope()
+        )
+        if scope_status != "same":
+            print(f"[worker] stale DDP cleanup deferred run_id={run_id}: process scope {scope_status}", file=sys.stderr, flush=True)
+            return False
+
+        guard_identity = {"pid": owner.get("guard_pid"), "create_time": owner.get("guard_create_time"), "process_scope": owner.get("process_scope")}
+        guard_live = _identity_is_live(guard_identity)
+        if guard_live is not False:
+            print(f"[worker] stale DDP cleanup deferred run_id={run_id}: guard state {'live' if guard_live else 'unknown'}", file=sys.stderr, flush=True)
+            return False
+        matching = [
+            (attempt_id, context)
+            for attempt_id, context in contexts
+            if all(
+                context["execution_owner"].get(key) == owner.get(key)
+                for key in ("guard_pid", "guard_create_time", "worker_id")
+            )
+        ]
+        for _, context in matching:
+            context_scope_status = process_scope.compare_process_scope(
+                context["execution_owner"].get("process_scope"), process_scope.get_process_scope()
+            )
+            if context_scope_status != "same":
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: context process scope {context_scope_status}", file=sys.stderr, flush=True)
+                return False
+        if execution is None and not matching:
+            print(f"[worker] stale DDP cleanup deferred run_id={run_id}: no matching scoped attempt", file=sys.stderr, flush=True)
+            return False
+        for attempt_id, context in matching:
             supervisor = context.get("supervisor")
-            for identity in (guard_identity, supervisor):
-                if not isinstance(identity, Mapping):
-                    continue
-                live = _identity_is_live(identity)
-                if live is not False:
-                    return False
+            supervisor_live = _identity_is_live(supervisor) if isinstance(supervisor, Mapping) else None
+            if supervisor_live is not False:
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: supervisor state {'live' if supervisor_live else 'unknown'}", file=sys.stderr, flush=True)
+                return False
             try:
                 survivors = terminate_registered_processes(
                     run_root,
@@ -356,9 +453,11 @@ class DbQueueWorker:
                     attempt_id=attempt_id,
                     grace_seconds=2.0,
                 )
-            except (UltralyticsDDPCleanupIncomplete, OSError, ValueError):
+            except (UltralyticsDDPCleanupIncomplete, OSError, ValueError) as exc:
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: {exc}", file=sys.stderr, flush=True)
                 return False
             if survivors:
+                print(f"[worker] stale DDP cleanup deferred run_id={run_id}: registered processes remain", file=sys.stderr, flush=True)
                 return False
         return True
 
@@ -395,6 +494,15 @@ class DbQueueWorker:
             if not run:
                 return
 
+            engine = str(getattr(run.architecture, "engine", "") or "").strip().lower()
+            ultralytics_ddp = (
+                engine == "ultralytics-yolo"
+                and len(extract_selected_gpu_ids(getattr(run.parameters, "device", "auto"))) > 1
+            )
+            current_scope = process_scope.get_process_scope()
+            if ultralytics_ddp and current_scope is None:
+                raise RuntimeError("Ultralytics DDP requires a verifiable process scope")
+
             # Prepare log files
             run_dir = settings.training_dir / run.run_id
             logs_dir = run_dir / "logs"
@@ -410,6 +518,13 @@ class DbQueueWorker:
 
             try:
                 guard_create_time = float(psutil.Process(proc.pid).create_time())
+                execution_owner = {
+                    "guard_pid": int(proc.pid),
+                    "guard_create_time": guard_create_time,
+                    "worker_id": self.worker_id,
+                    "process_scope": current_scope,
+                }
+                _write_execution_record(run_dir, str(run.run_id), execution_owner)
                 started = mark_started(
                     db,
                     run.run_id,
@@ -426,17 +541,15 @@ class DbQueueWorker:
 
             self._running = RunningJob(
                 run_id=run.run_id,
-                engine=str(getattr(run.architecture, "engine", "") or "").strip().lower(),
+                engine=engine,
                 proc=proc,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
                 stdout_f=stdout_f,
                 stderr_f=stderr_f,
                 guard_create_time=guard_create_time,
-                ultralytics_ddp=(
-                    str(getattr(run.architecture, "engine", "") or "").strip().lower() == "ultralytics-yolo"
-                    and len(extract_selected_gpu_ids(getattr(run.parameters, "device", "auto"))) > 1
-                ),
+                ultralytics_ddp=ultralytics_ddp,
+                execution_owner=execution_owner,
             )
             self._last_heartbeat_at = now
 
