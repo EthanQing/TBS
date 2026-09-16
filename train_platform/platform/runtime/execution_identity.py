@@ -19,11 +19,15 @@ def process_identity(pid: int, **extra: Any) -> dict[str, Any]:
     identity = {"pid": int(pid), "create_time": float(process.create_time()),
                 "process_scope": current_scope, **extra}
     if os.name != "nt":
-        try:
-            identity["pgid"] = int(os.getpgid(int(pid)))
-            identity["sid"] = int(os.getsid(int(pid)))
-        except OSError:
-            pass
+        for field, getter in (("sid", os.getsid), ("pgid", os.getpgid)):
+            try:
+                identity[field] = int(getter(int(pid)))
+            except OSError:
+                identity[field] = None
+    # SID/PGID reads use the PID, so bracket them with the original creation
+    # time to avoid attaching a replacement process's session to this identity.
+    if float(psutil.Process(int(pid)).create_time()) != identity["create_time"]:
+        raise ValueError("process identity changed while capturing session")
     return identity
 
 

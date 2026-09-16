@@ -668,7 +668,7 @@ class DbQueueWorker:
             pending_reason = "registration_temporarily_failed"
             if proof.get("survivors"):
                 pending_reason = "processes_still_alive"
-            elif proof.get("unknown"):
+            elif proof.get("unknown") or proof.get("unconfirmed_sessions"):
                 pending_reason = "process_scope_unconfirmed"
             elif any(item.get("stage") == "registration_io_error"
                      for item in proof.get("registration_errors", [])):
@@ -683,7 +683,8 @@ class DbQueueWorker:
                 value = {
                     "stage": item.get("stage"), "error": item.get("error"),
                     "target": {key: (item.get("target") or {}).get(key)
-                               for key in ("pid", "create_time", "process_scope")
+                               for key in ("run_id", "allocation_id", "execution_owner", "pid", "create_time",
+                                           "process_scope", "sid", "pgid", "assigned_gpu_uuids")
                                if (item.get("target") or {}).get(key) is not None},
                 }
                 unresolved_by_key[json.dumps(value, sort_keys=True, default=str)] = value
@@ -691,6 +692,7 @@ class DbQueueWorker:
                 "cleanup_status": pending_reason,
                 "survivors": proof.get("survivors", []),
                 "unknown": proof.get("unknown", []),
+                "unconfirmed_sessions": proof.get("unconfirmed_sessions", []),
                 "error": proof.get("error"),
                 "recovered_registration": bool(proof.get("recovered_registration")),
                 "unresolved_errors": [unresolved_by_key[key] for key in sorted(unresolved_by_key)],

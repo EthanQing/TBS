@@ -251,6 +251,7 @@ def test_outer_worker_retains_budget_until_cleanup_proof(db, monkeypatch, tmp_pa
     monkeypatch.setattr(worker_impl, "SessionLocal", sessionmaker(bind=db.bind, autoflush=False))
     monkeypatch.setattr(worker_impl, "settings", SimpleNamespace(training_dir=tmp_path))
     complete = False
+    pending = {"survivors": [], "unknown": [], "unconfirmed_sessions": []}
     cleanup_calls = 0
 
     def cleanup(*args, **kwargs):
@@ -263,7 +264,7 @@ def test_outer_worker_retains_budget_until_cleanup_proof(db, monkeypatch, tmp_pa
                    "error": "scan failed", "target": {"pid": 9, "create_time": 2.0, "process_scope": SCOPE}},
                   {"id": "new-b", "stage": "descendant_scan", "error": "scan failed",
                    "target": {"pid": 9, "create_time": 2.0, "process_scope": SCOPE}}]
-        return {"complete": complete, "allocation_id": allocation_id,
+        return {**pending, "complete": complete, "allocation_id": allocation_id,
                 "execution_owner": owner, "process_scope": SCOPE, "supervisor_excluded": False,
                 "registration_errors": [] if complete else list(reversed(errors))}
 
@@ -288,6 +289,17 @@ def test_outer_worker_retains_budget_until_cleanup_proof(db, monkeypatch, tmp_pa
     db.expire_all()
     assert db.get(GpuAllocation, allocation_id).active_run_id == "a"
     assert db.query(TrainingRunEvent).filter_by(run_id="a", event_type="cleanup_pending").count() == 1
+    for evidence, reason in [({"survivors": [303]}, "processes_still_alive"),
+                             ({"survivors": [], "unconfirmed_sessions": [
+                                 {"sid": 202, "reason": "session leader PID was reused"}]},
+                              "process_scope_unconfirmed")]:
+        pending.update(evidence)
+        assert worker._finish_managed_job(job, 1)[0] is False
+        db.expire_all()
+        allocation = db.get(GpuAllocation, allocation_id)
+        assert allocation.state == "releasing" and allocation.active_run_id == "a"
+        assert db.get(TrainingRun, "a").resource_wait_details["cleanup_status"] == reason
+    pending.update(survivors=[], unconfirmed_sessions=[])
     complete = True
     result = worker._finish_managed_job(job, 1)
     assert result[0] is True

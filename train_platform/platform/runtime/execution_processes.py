@@ -91,7 +91,8 @@ def register_execution_process(
         }
     if expected_identity is not None and any(
         identity.get(field) != expected_identity.get(field)
-        for field in ("pid", "create_time", "process_scope")
+        for field in ("pid", "create_time", "process_scope", "sid", "pgid")
+        if field in expected_identity
     ):
         raise ValueError("process identity changed before registration")
     if role == "supervisor" and any((
@@ -100,20 +101,20 @@ def register_execution_process(
         process_scope.compare_process_scope(identity.get("process_scope"), execution_owner.get("process_scope")) != "same",
     )):
         raise ValueError("supervisor identity does not match execution owner")
-    if os.name != "nt":
-        stat = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
-        close = stat.rfind(")")
-        identity["start_ticks"] = int(stat[close + 2:].split()[19])
-        identity["clock_ticks_per_second"] = int(os.sysconf("SC_CLK_TCK"))
-        identity["boot_time"] = float(psutil.boot_time())
-    identity_state = process_state(identity)[0]
-    if identity_state == "dead":
-        raise psutil.NoSuchProcess(pid)
-    if identity_state != "live":
-        raise RuntimeError("process identity cannot be confirmed")
     try:
+        if os.name != "nt":
+            stat = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
+            close = stat.rfind(")")
+            identity["start_ticks"] = int(stat[close + 2:].split()[19])
+            identity["clock_ticks_per_second"] = int(os.sysconf("SC_CLK_TCK"))
+            identity["boot_time"] = float(psutil.boot_time())
+        identity_state = process_state(identity)[0]
+        if identity_state == "dead":
+            raise psutil.NoSuchProcess(pid)
+        if identity_state != "live":
+            raise RuntimeError("process identity cannot be confirmed")
         _atomic_json(execution_root(training_root, allocation_id) / "processes" / f"{role}-{pid}.json", identity)
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError, psutil.Error) as exc:
         try:
             _record_registration_error(
                 training_root, allocation_id, execution_owner,
@@ -135,6 +136,9 @@ def start_descendant_registration(
         "pid": int(execution_owner.get("guard_pid", supervisor_pid)),
         "create_time": execution_owner.get("guard_create_time"),
         "process_scope": execution_owner.get("process_scope"),
+        "run_id": run_id, "allocation_id": allocation_id,
+        "execution_owner": dict(execution_owner),
+        "assigned_gpu_uuids": list(assigned_gpu_uuids or []),
     }
 
     def watch() -> None:
@@ -159,6 +163,13 @@ def start_descendant_registration(
             except OSError:
                 pass
             return
+        if os.name != "nt":
+            for field, getter in (("sid", os.getsid), ("pgid", os.getpgid)):
+                if supervisor_identity.get(field) is None:
+                    try:
+                        supervisor_identity[field] = int(getter(supervisor_pid))
+                    except OSError:
+                        pass
         try:
             children = supervisor_process.children(recursive=True)
         except psutil.NoSuchProcess:
@@ -171,17 +182,25 @@ def start_descendant_registration(
                 pass
             children = []
         for child in children:
-            target = {"pid": child.pid, "process_scope": execution_owner.get("process_scope")}
+            target = {"pid": child.pid, "process_scope": execution_owner.get("process_scope"),
+                      "run_id": run_id, "allocation_id": allocation_id,
+                      "execution_owner": dict(execution_owner),
+                      "assigned_gpu_uuids": list(assigned_gpu_uuids or [])}
             try:
                 target["create_time"] = child.create_time()
+                captured = process_identity(child.pid, run_id=run_id, allocation_id=allocation_id,
+                                            execution_owner=dict(execution_owner), role="descendant",
+                                            assigned_gpu_uuids=list(assigned_gpu_uuids or []))
+                if any(captured.get(field) != target.get(field)
+                       for field in ("pid", "create_time", "process_scope")):
+                    raise ValueError("enumerated descendant identity changed before capture")
+                target = captured
                 register_execution_process(
                     training_root, run_id=run_id, allocation_id=allocation_id,
                     execution_owner=execution_owner, pid=child.pid, role="descendant",
                     assigned_gpu_uuids=assigned_gpu_uuids,
                     expected_identity=target,
                 )
-            except (psutil.NoSuchProcess, FileNotFoundError):
-                continue
             except (OSError, RuntimeError, ValueError, psutil.Error):
                 try:
                     _record_registration_error(
@@ -260,20 +279,22 @@ def cleanup_registered_execution(
         target = item.get("target")
         if item.get("id") == "legacy":
             continue
-        if item.get("stage") in {"registration_read", "journal_read", "registration_io_error"}:
+        if item.get("stage") in {"registration_read", "journal_read"}:
             continue
-        trusted = item.get("allocation_id") == allocation_id and item.get("execution_owner") == dict(execution_owner)
+        trusted = (isinstance(target, dict) and item.get("allocation_id") == allocation_id
+                   and item.get("execution_owner") == dict(execution_owner))
         if isinstance(target, dict):
             trusted = trusted and process_scope.compare_process_scope(
                 target.get("process_scope"), execution_owner.get("process_scope")) == "same"
             for field, expected_value in (("run_id", run_id), ("allocation_id", allocation_id),
                                           ("execution_owner", dict(execution_owner))):
-                if field in target and target.get(field) != expected_value:
+                if target.get(field) != expected_value:
                     trusted = False
         item["trusted"] = trusted
         if not trusted:
             item["stage"] = "registration_ownership_mismatch"
             item["error"] = "registration error identity is not owned by this execution"
+            item["resolved"] = False
     supervisor = [
         item for item in identities
         if item.get("role") == "supervisor"
@@ -342,31 +363,50 @@ def cleanup_registered_execution(
     if supervisor and supervisor[0] not in identities:
         identities.append(supervisor[0])
 
-    # Retry exact identities captured by failed writes. This never recaptures a
-    # PID: expected_identity requires the original creation time and scope.
+    # Error targets are durable evidence, including after a previous resolution.
+    # Persist the original identity; never recapture an exited/reused PID.
     for error in registration_errors:
-        if error.get("resolved") or not error.get("trusted") or not (error.get("stage") == "descendant_registration"
-                                         or str(error.get("stage", "")).endswith("_registration_write")):
-            continue
         target = error.get("target")
-        if not isinstance(target, dict) or target.get("create_time") is None:
+        if not error.get("trusted") or not isinstance(target, dict):
             continue
+        if not isinstance(target.get("pid"), int) or not isinstance(target.get("create_time"), (int, float)):
+            error["resolved"] = False
+            continue
+        identities.append(dict(target))
         state, _ = process_state(target)
         error["last_checked_at"] = checked_at
         error["last_check"] = state
+        error["target_exited"] = state == "dead"
         if state == "live":
             try:
-                recovered = register_execution_process(
-                    training_root, run_id=run_id, allocation_id=allocation_id,
-                    execution_owner=execution_owner, pid=int(target["pid"]), role="recovered",
-                    assigned_gpu_uuids=assigned_gpu_uuids, expected_identity=target,
-                )
-                identities.append(recovered)
-                error["resolved"] = True
-            except (OSError, RuntimeError, ValueError, psutil.Error):
-                pass
+                _atomic_json(processes_dir / f"recovered-{target['pid']}.json", target)
+                error["identity_recovered"] = True
+                if error.get("stage") == "descendant_registration" or str(error.get("stage", "")).endswith("_registration_write"):
+                    error["resolved"] = True
+                    error["resolution"] = "original_identity_registered"
+            except OSError as exc:
+                error["resolved"] = False
+                error["recovery_error"] = str(exc)
+    identity_by_key = {}
+    conflicting_keys = set()
+    for identity in identities:
+        key = (identity["pid"], identity["create_time"])
+        previous = identity_by_key.get(key)
+        if previous is not None and any(
+            previous.get(field) is not None and identity.get(field) is not None
+            and previous[field] != identity[field] for field in ("sid", "pgid", "assigned_gpu_uuids")
+        ):
+            conflicting_keys.add(key)
+        # Only merge evidence for the same validated identity. Keep known
+        # fields when another record could not capture them.
+        identity_by_key[key] = {**(previous or {}), **{
+            field: value for field, value in identity.items() if value is not None}}
+    identities = [identity for key, identity in identity_by_key.items() if key not in conflicting_keys]
     processes: dict[tuple[int, float], psutil.Process] = {}
-    unknown = []
+    unknown = [key[0] for key in conflicting_keys]
+    for key in conflicting_keys:
+        registration_errors.append({"stage": "identity_conflict", "resolved": False,
+                                    "target": identity_by_key[key], "error": "conflicting original process identities"})
     for identity in identities:
         if exclude_supervisor and identity.get("pid") == execution_owner.get("guard_pid"):
             continue
@@ -379,7 +419,39 @@ def cleanup_registered_execution(
     # session remains owned while its original session leader identity matches,
     # or the leader PID no longer exists. Never claim a reused session leader.
     sessions = {}
-    if os.name != "nt" and process_scope.compare_process_scope(execution_owner.get("process_scope"), process_scope.get_process_scope()) == "same":
+    unconfirmed_sessions = []
+
+    def unconfirmed_session(identity, reason):
+        value = {"sid": identity.get("sid"), "target": dict(identity), "reason": reason}
+        if value not in unconfirmed_sessions:
+            unconfirmed_sessions.append(value)
+
+    def session_candidates():
+        try:
+            yield from psutil.process_iter()
+        except (psutil.Error, OSError) as exc:
+            for identity in sessions.values():
+                unconfirmed_session(identity, f"session enumeration failed: {exc}")
+
+    if os.name != "nt":
+        for identity in identities:
+            if not isinstance(identity.get("sid"), int):
+                unconfirmed_session(identity, "original session identity is unavailable")
+        for error in registration_errors:
+            target = error.get("target")
+            if error.get("trusted") and isinstance(target, dict):
+                evidence = identity_by_key.get((target.get("pid"), target.get("create_time")), target)
+                if not isinstance(evidence.get("sid"), int):
+                    error["resolved"] = False
+                    unconfirmed_session(target, "original session identity is unavailable")
+
+    session_scope_matches = process_scope.compare_process_scope(
+        execution_owner.get("process_scope"), process_scope.get_process_scope()) == "same"
+    if os.name != "nt" and not session_scope_matches:
+        for identity in identities:
+            if identity.get("sid") == identity.get("pid"):
+                unconfirmed_session(identity, "session process scope cannot be confirmed")
+    if os.name != "nt" and session_scope_matches:
         for identity in identities:
             sid = identity.get("sid")
             if sid is None or sid != identity.get("pid"):
@@ -387,31 +459,48 @@ def cleanup_registered_execution(
             state, _ = process_state(identity)
             if state == "unknown":
                 unknown.append(sid)
+                unconfirmed_session(identity, "session leader identity cannot be confirmed")
                 continue
             try:
                 if psutil.Process(sid).create_time() != identity["create_time"]:
+                    unconfirmed_session(identity, "session leader PID was reused")
+                    continue
+                if os.getsid(sid) != sid:
+                    unconfirmed_session(identity, "session leader changed session")
                     continue
             except psutil.NoSuchProcess:
                 pass
-            except psutil.Error:
+            except (psutil.Error, OSError):
                 unknown.append(sid)
+                unconfirmed_session(identity, "session ownership cannot be confirmed")
                 continue
             sessions[sid] = identity
-        for candidate in psutil.process_iter():
+        for error in registration_errors:
+            target = error.get("target")
+            if error.get("trusted") and isinstance(target, dict):
+                evidence = identity_by_key.get((target.get("pid"), target.get("create_time")), target)
+                if evidence.get("sid") is not None and evidence["sid"] not in sessions:
+                    unconfirmed_session(evidence, "no confirmed original session leader")
+        for candidate in session_candidates():
             sid = None
             try:
                 sid = os.getsid(candidate.pid)
                 if sid not in sessions or (exclude_supervisor and candidate.pid == execution_owner.get("guard_pid")):
                     continue
+                if (candidate.pid, candidate.create_time()) in conflicting_keys:
+                    unknown.append(candidate.pid)
+                    continue
                 if candidate.create_time() < sessions[sid]["create_time"]:
                     unknown.append(candidate.pid)
                     continue
+                if not candidate.is_running() or candidate.status() == psutil.STATUS_ZOMBIE:
+                    continue
                 candidate_identity = {"pid": candidate.pid, "create_time": candidate.create_time(),
-                                      "process_scope": execution_owner.get("process_scope")}
+                                      "process_scope": execution_owner.get("process_scope"), "sid": sid}
                 item = register_execution_process(
                     training_root, run_id=run_id, allocation_id=allocation_id,
                     execution_owner=execution_owner, pid=candidate.pid, role="session-member",
-                    assigned_gpu_uuids=supervisor[0].get("assigned_gpu_uuids", []) if supervisor else [],
+                    assigned_gpu_uuids=sessions[sid].get("assigned_gpu_uuids", []),
                     expected_identity=candidate_identity,
                 )
                 state, process = process_state(item)
@@ -425,6 +514,10 @@ def cleanup_registered_execution(
                 # No ownership is inferred for unrelated inaccessible processes.
                 if sid in sessions:
                     unknown.append(candidate.pid)
+                    unconfirmed_session(sessions[sid], f"member {candidate.pid} cannot be confirmed")
+                elif sid is None:
+                    for identity in sessions.values():
+                        unconfirmed_session(identity, f"session of process {candidate.pid} cannot be read")
     if terminate:
         for process in sorted(processes.values(), key=lambda item: item.pid, reverse=True):
             try: process.terminate()
@@ -442,7 +535,17 @@ def cleanup_registered_execution(
         except psutil.Error:
             unknown.append(process.pid)
     if sessions:
-        for candidate in psutil.process_iter():
+        # Recheck the leader before accepting the final enumeration as proof.
+        for sid, identity in sessions.items():
+            try:
+                leader = psutil.Process(sid)
+                if leader.create_time() != identity["create_time"] or os.getsid(sid) != sid:
+                    unconfirmed_session(identity, "session ownership changed during cleanup")
+            except psutil.NoSuchProcess:
+                pass
+            except (psutil.Error, OSError):
+                unconfirmed_session(identity, "session ownership cannot be confirmed after cleanup")
+        for candidate in session_candidates():
             sid = None
             try:
                 sid = os.getsid(candidate.pid)
@@ -455,30 +558,29 @@ def cleanup_registered_execution(
             except (psutil.Error, OSError):
                 if sid in sessions:
                     unknown.append(candidate.pid)
+                    unconfirmed_session(sessions[sid], f"member {candidate.pid} cannot be confirmed")
+                elif sid is None:
+                    for identity in sessions.values():
+                        unconfirmed_session(identity, f"session of process {candidate.pid} cannot be read")
     hard_read_error = any(item.get("stage") in {"registration_read", "journal_read", "registration_io_error"}
                           for item in registration_errors if not item.get("resolved"))
-    complete_session_scan = bool(sessions) and execution_owner.get("guard_pid") in sessions and not survivors and not unknown and not hard_read_error
+    complete_session_scan = bool(sessions) and execution_owner.get("guard_pid") in sessions and not survivors and not unknown and not unconfirmed_sessions and not hard_read_error
     unresolved_errors = []
     for item in registration_errors:
         if item.get("resolved"):
             continue
         target = item.get("target")
         item["last_checked_at"] = checked_at
-        if (item.get("trusted") and isinstance(target, dict)
-                and target.get("pid") is not None and target.get("create_time") is not None):
-            state, _ = process_state(target)
-            item["last_check"] = state
-            if state == "dead" and item.get("stage") not in {
-                "descendant_scan", "supervisor_check", "legacy", "journal_read",
-                "registration_io_error", "registration_read", "base_registration",
-            }:
+        if item.get("trusted") and isinstance(target, dict):
+            evidence = identity_by_key.get((target.get("pid"), target.get("create_time")), target)
+            sid = evidence.get("sid")
+            if (sid in sessions and not survivors and not unknown
+                    and not unconfirmed_sessions and not hard_read_error):
+                item["session_checked"] = True
+                item["last_check"] = "session_complete"
+                item["resolution"] = "owned_session_checked"
                 item["resolved"] = True
                 continue
-        elif (item.get("trusted") and isinstance(target, dict)
-              and target.get("sid") in sessions and complete_session_scan):
-            item["last_check"] = "session_complete"
-            item["resolved"] = True
-            continue
         if item.get("stage") in {"legacy", "descendant_scan", "supervisor_check"} and complete_session_scan:
             item["last_check"] = "session_complete"
             item["resolved"] = True
@@ -509,10 +611,11 @@ def cleanup_registered_execution(
                                       "paths": sorted(new_error_paths)})
     recovered_registration = recovered_base or any(item.get("resolved") and item.get("last_check") == "live"
                                                     for item in registration_errors)
-    return {"complete": not survivors and not unknown and not unresolved_errors, "allocation_id": allocation_id,
+    return {"complete": not survivors and not unknown and not unconfirmed_sessions and not unresolved_errors, "allocation_id": allocation_id,
             "supervisor_excluded": exclude_supervisor,
             "execution_owner": dict(execution_owner), "process_scope": process_scope.get_process_scope(),
             "checked_at": checked_at, "survivors": sorted(set(survivors)), "unknown": sorted(set(x for x in unknown if x is not None)),
+            "unconfirmed_sessions": unconfirmed_sessions,
             "registration_errors": unresolved_errors,
             "recovered_registration": recovered_registration,
             "error": unresolved_errors[0].get("error") if unresolved_errors else None}
