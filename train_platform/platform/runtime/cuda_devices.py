@@ -43,7 +43,7 @@ def probe_cuda_devices(*, timeout_seconds: int = 10, env: dict[str, str] | None 
     fingerprint = cuda_environment_fingerprint(child_env)
     try:
         process = subprocess.run(
-            [sys.executable, "-m", "train_platform.workers.cuda_probe"],
+            [sys.executable, "-m", "train_platform.platform.runtime.cuda_probe"],
             env=child_env,
             capture_output=True,
             text=True,

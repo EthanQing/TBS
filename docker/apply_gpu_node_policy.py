@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from sqlalchemy.exc import SQLAlchemyError
 
 from train_platform.db.session import SessionLocal
-from train_platform.models.v3.gpu_allocation import GpuAllocation, GpuNodeSchedulingState
+from train_platform.domains.training.resources.policy import apply_node_policy
 
 
 def read_policy(environment: Mapping[str, str]) -> dict:
@@ -46,23 +46,8 @@ def read_policy(environment: Mapping[str, str]) -> dict:
 
 def apply_policy(policy: dict, session_factory=SessionLocal) -> dict:
     with session_factory() as db, db.begin():
-        node = db.query(GpuNodeSchedulingState).filter_by(
-            node_id=policy["node_id"]
-        ).with_for_update().first()
-        # This must be the first consistent read after acquiring the node lock.
-        # Locking allocations here would reverse the allocator's lock order.
-        active = db.query(GpuAllocation.allocation_id).filter(
-            GpuAllocation.node_id == policy["node_id"],
-            GpuAllocation.state != "released",
-        ).first()
-        if active is not None:
-            raise ValueError("Target node has unfinished allocations; policy was not changed")
-        if node is None:
-            node = GpuNodeSchedulingState(node_id=policy["node_id"])
-            db.add(node)
-        for name, value in policy.items():
-            setattr(node, name, value)
-    return dict(policy)
+        result = apply_node_policy(db, policy)
+    return result
 
 
 def main() -> int:

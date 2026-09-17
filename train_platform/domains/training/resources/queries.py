@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 
@@ -12,6 +13,8 @@ from train_platform.models.v3.gpu_resource import (
 )
 from train_platform.models.v3.gpu_allocation import GpuAllocation, GpuAllocationDevice, GpuCudaBinding, GpuNodeSchedulingState
 from train_platform.domains.training.resources.accounting import ActiveCommitment, calculate_gpu_accounting
+from train_platform.models.v3.training_run import TrainingRun
+from train_platform.utils.exceptions import NotFoundError
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -266,7 +269,7 @@ def get_training_run_resources(db: Session, run) -> dict:
     history = db.query(GpuAllocation).filter_by(run_id=run.run_id).order_by(GpuAllocation.reserved_at.desc()).all()
     request = run.resource_request
     user_request = None if request is None else {
-        "selection": request.selection, "gpu_count": request.gpu_count, "gpu_uuids": request.gpu_uuids,
+        "run_id": request.run_id, "selection": request.selection, "gpu_count": request.gpu_count, "gpu_uuids": request.gpu_uuids,
         "memory_mib_per_gpu": request.memory_mib_per_gpu, "sharing": request.sharing,
         "node_id": request.node_id, "created_at": request.created_at,
     }
@@ -279,3 +282,60 @@ def get_training_run_resources(db: Session, run) -> dict:
         "reason_code": "cleanup_pending" if current and current["state"] == "releasing" else run.resource_wait_reason,
         "reason_details": run.resource_wait_details,
     }
+
+
+def get_gpu_resources_overview(
+    db: Session, *, node_id: str | None = None, gpu_uuid: str | None = None,
+    stale_after_seconds: int = 20,
+) -> dict:
+    items = list_gpu_resources(db, node_id=node_id, gpu_uuid=gpu_uuid,
+                               stale_after_seconds=stale_after_seconds)
+    return {
+        "scheduler_stage": "managed_allocation" if any(item["scheduling_mode"] == "managed" for item in items) else "inventory_only",
+        "allocation_enabled": any(item["allocation_enabled"] for item in items),
+        "shared_execution_enabled": any(item["shared_execution_enabled"] for item in items),
+        "items": items,
+    }
+
+
+def get_gpu_workers_overview(db: Session, *, stale_after_seconds: int = 20) -> dict:
+    items = list_gpu_workers(db, stale_after_seconds=stale_after_seconds)
+    return {
+        "scheduler_stage": "managed_allocation" if any(item["scheduling_mode"] == "managed" for item in items) else "inventory_only",
+        "allocation_enabled": any(item["accepting_tasks"] for item in items),
+        "items": items,
+    }
+
+
+def get_training_run_resource_status(db: Session, run_id: str) -> dict:
+    run = db.query(TrainingRun).filter(TrainingRun.run_id == str(run_id)).first()
+    if run is None:
+        raise NotFoundError("Training run not found")
+    payload = get_training_run_resources(db, run)
+    request = run.resource_request
+    nodes = db.query(GpuNodeSchedulingState).filter(GpuNodeSchedulingState.managed.is_(True))
+    target_node = request.node_id if request else None
+    if payload["allocation"]:
+        target_node = payload["allocation"]["node_id"]
+    if target_node:
+        nodes = nodes.filter(GpuNodeSchedulingState.node_id == target_node)
+    managed_nodes = nodes.all()
+    enabled = any(node.accepting_allocations for node in managed_nodes)
+    if payload["reason_code"] is None and not enabled and request is not None:
+        payload["reason_code"] = "scheduler_disabled"
+    return {
+        "scheduler_stage": "managed_allocation" if managed_nodes else "inventory_only",
+        "allocation_enabled": enabled,
+        **payload,
+    }
+
+
+def get_active_allocation_ownership_snapshot(db: Session, *, node_id: str) -> list[dict]:
+    allocations = db.query(GpuAllocation).filter(
+        GpuAllocation.node_id == node_id, GpuAllocation.state != "released",
+    ).all()
+    return [
+        {"allocation_id": item.allocation_id, "run_id": item.run_id,
+         "execution_owner": deepcopy(item.execution_owner)}
+        for item in allocations if item.execution_owner
+    ]

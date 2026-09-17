@@ -2,8 +2,49 @@ from concurrent.futures import Future
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
 
 from train_platform.workers import worker_impl as worker
+
+
+@pytest.mark.parametrize("matched", [True, False])
+def test_cleanup_report_delegates_and_keeps_transaction_boundary(monkeypatch, matched):
+    from train_platform.domains.training.resources import lifecycle
+
+    db = Mock()
+    mark = Mock(return_value=matched)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(lifecycle, "mark_cleanup_pending", mark)
+    instance = worker.DbQueueWorker.__new__(worker.DbQueueWorker)
+    owner = {"guard_pid": 123}
+    instance._record_cleanup_pending(dict(run_id="run", allocation_id="allocation", owner=owner),
+                                     "unconfirmed", "unknown process")
+    mark.assert_called_once_with(db, run_id="run", allocation_id="allocation",
+        execution_owner=owner, reason="unconfirmed", error="unknown process")
+    assert db.commit.call_count == int(matched)
+    assert db.rollback.call_count == int(not matched)
+    db.close.assert_called_once()
+    db.query.assert_not_called()
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_running_count_delegates_observed_jobs_by_instance(monkeypatch, exists):
+    from train_platform.domains.training.resources import inventory
+
+    db = Mock()
+    update = Mock(return_value=exists)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(inventory, "update_worker_running_task_count", update)
+    instance = worker.DbQueueWorker.__new__(worker.DbQueueWorker)
+    instance._gpu_resource_reporter = SimpleNamespace(instance_id="new-instance")
+    instance._running_jobs = {"one-ddp-job": object(), "other-job": object()}
+    instance._publish_running_task_count()
+    update.assert_called_once_with(db, "new-instance", 2)
+    assert db.commit.call_count == int(exists)
+    db.close.assert_called_once()
+    db.get.assert_not_called()
 
 
 def test_one_job_failure_does_not_skip_other_jobs(monkeypatch):

@@ -160,10 +160,70 @@ def test_resource_reads_do_not_write_or_probe(db, monkeypatch):
     db.commit()
     monkeypatch.setattr(gpu_probe, "probe_gpus", lambda: pytest.fail("query probed GPU"))
     monkeypatch.setattr(db, "commit", lambda: pytest.fail("query committed"))
-    assert queries.list_gpu_resources(db)
-    workers = queries.list_gpu_workers(db)
+    assert queries.get_gpu_resources_overview(db)["items"]
+    workers = queries.get_gpu_workers_overview(db)["items"]
     assert workers[0]["observations"][0]["gpu_uuid"] == GPU
     assert not db.dirty and not db.new and not db.deleted
+
+
+def test_overviews_preserve_managed_flags_and_filters(db):
+    register(db, scheduling_policy=dict(shared_execution_enabled=True,
+        max_shared_tasks_per_device=2, memory_safety_mib=4096))
+    inventory.save_inventory(db, "instance-a", sample())
+    db.commit()
+    resources = queries.get_gpu_resources_overview(db, node_id="node-a", gpu_uuid=GPU)
+    assert resources["scheduler_stage"] == "managed_allocation"
+    assert resources["allocation_enabled"] and resources["shared_execution_enabled"]
+    assert [item["gpu_uuid"] for item in resources["items"]] == [GPU]
+    assert queries.get_gpu_resources_overview(db, node_id="other") == {
+        "scheduler_stage": "inventory_only", "allocation_enabled": False,
+        "shared_execution_enabled": False, "items": [],
+    }
+    assert queries.get_gpu_workers_overview(db)["allocation_enabled"]
+    inventory.mark_worker_stopped(db, "instance-a")
+    db.commit()
+    assert not queries.get_gpu_workers_overview(db)["allocation_enabled"]
+
+
+def test_running_count_is_instance_scoped_and_caller_owns_transaction(db, monkeypatch):
+    first = register(db)
+    second = register(db, "instance-b")
+    db.commit()
+    heartbeat = first.heartbeat_at
+    monkeypatch.setattr(db, "commit", lambda: pytest.fail("domain committed"))
+    assert inventory.update_worker_running_task_count(db, "instance-a", 3)
+    assert first.running_task_count == 3 and second.running_task_count == 0
+    assert first.heartbeat_at == heartbeat and first.stopped_at is None
+    assert first.accepting_tasks and first.max_training_slots == 2
+    assert not inventory.update_worker_running_task_count(db, "missing", 9)
+    db.rollback()
+    assert first.running_task_count == 0
+
+
+def test_ownership_snapshot_filters_and_detaches_nested_json(db):
+    from train_platform.models.v3.gpu_allocation import GpuAllocation
+
+    owner = {"process_scope": {"pid_namespace": {"inode": 2}}, "guard_pid": 1}
+    for allocation_id, node_id, state, execution_owner in [
+        ("active", "node-a", "releasing", owner),
+        ("unknown", "node-a", "unknown", owner),
+        ("released", "node-a", "released", owner),
+        ("other", "node-b", "running", owner),
+        ("unowned", "node-a", "starting", None),
+    ]:
+        db.add(GpuAllocation(allocation_id=allocation_id, run_id="run",
+            worker_instance_id="instance-a", worker_id="worker", node_id=node_id,
+            state=state, execution_owner=execution_owner, request_snapshot={},
+            reserved_at=NOW, launch_deadline_at=NOW))
+    db.commit()
+    allocation = db.get(GpuAllocation, "active")
+    snapshot = queries.get_active_allocation_ownership_snapshot(db, node_id="node-a")
+    assert {item["allocation_id"] for item in snapshot} == {"active", "unknown"}
+    active = next(item for item in snapshot if item["allocation_id"] == "active")
+    active["execution_owner"]["process_scope"]["pid_namespace"]["inode"] = 99
+    assert allocation.execution_owner["process_scope"]["pid_namespace"]["inode"] == 2
+    db.expunge_all()
+    assert active["run_id"] == "run"
 
 
 def test_worker_response_preserves_unavailable_process_scope(db):

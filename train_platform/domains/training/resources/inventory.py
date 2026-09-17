@@ -72,6 +72,14 @@ def update_worker_heartbeat(db: Session, instance_id: str, *, at: datetime | Non
         item.heartbeat_at = at or utcnow()
 
 
+def update_worker_running_task_count(db: Session, instance_id: str, running_task_count: int) -> bool:
+    worker = db.get(GpuWorkerInstance, instance_id)
+    if worker is None:
+        return False
+    worker.running_task_count = running_task_count
+    return True
+
+
 def save_inventory(db: Session, instance_id: str, result: GpuProbeResult) -> None:
     worker = db.get(GpuWorkerInstance, instance_id)
     if not worker:

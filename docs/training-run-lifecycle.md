@@ -9,6 +9,13 @@ across resume. During the inventory-only stage, the Worker candidate query
 excludes these runs before its limit; legacy runs continue through the existing
 single-task execution path. See [GPU resources](gpu-resources.md).
 
+For managed execution, the Worker reports pending-cleanup facts through
+`resources/lifecycle.mark_cleanup_pending` in its independent transaction.
+That capability locks the run and allocation, checks execution ownership and
+the current allocation, and persists only cleanup wait details and deduplicated
+events. It neither releases the allocation nor changes `TrainingRun.status`;
+terminal state transitions continue to belong to `runs/lifecycle.py`.
+
 ## Responsibilities
 
 - `service.py` owns run creation, read-only get/list queries, name updates, user

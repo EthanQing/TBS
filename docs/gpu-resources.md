@@ -9,6 +9,15 @@ the legacy single-task Worker behavior.
 An enabled Worker latches its node into managed mode during registration,
 even without queued tasks. Later registrations preserve the database policy.
 
+Explicit deployment policy changes belong to `resources/policy.py`:
+`apply_node_policy` validates a complete policy, locks the target node, checks
+for any allocation whose state is not `released`, and creates or updates the
+policy in the caller's transaction. Even an identical policy is rejected while
+that node has unfinished allocations. `docker/apply_gpu_node_policy.py` owns
+environment parsing, the Session and transaction, output, and error/exit-code
+adaptation, including stdin execution. Applying policy remains an explicit
+deployment operation; periodic reports do not overwrite database policy.
+
 ## Identity and ownership
 
 - `GpuDevice.gpu_uuid` identifies a whole physical GPU by its complete UUID.
@@ -53,6 +62,13 @@ execution. Each database transaction has its own Session. Inventory services
 mutate the caller's transaction; they do not claim or finalize Training Runs.
 Defaults are enabled, five-second reports, and twenty-second staleness.
 
+For process attribution, `resources/queries.py` returns a detached ownership
+snapshot (including nested execution identity data) in a short transaction.
+The reporter closes that transaction before loading execution registrations
+and calling the platform process-attribution implementation. Sample persistence
+uses a separate transaction; filesystem reads and GPU/process probes stay
+outside database transactions.
+
 Heartbeat and last successful inventory timestamps serve different purposes.
 A failed probe preserves prior observations and their sampling timestamps.
 Only a complete successful inventory marks missing observations absent, and
@@ -67,6 +83,11 @@ probing the API container or changing training lifecycle state. A GPU summary
 uses one fresh valid observation; observations from different Workers are
 never summed or combined into synthetic memory values. Driver free memory is
 sampling data, not schedulable quota.
+
+The API routes only adapt query parameters and serialize response schemas.
+`resources/queries.py` owns the complete overview and run-resource payloads,
+including scheduler flags, target-node selection, waiting reasons, and the full
+resource request. These queries do not probe, initialize policy, or commit.
 
 `resources/requests.py` normalizes requests and validates them jointly with
 engine, batch size, and the compatibility device field. New requests keep
@@ -99,13 +120,19 @@ Node policy is initialized from `GPU_SCHEDULER_ENABLED`,
 initialization. Managed mode is persistent; a local disabled scheduler stops
 new claims while existing execution and cleanup continue.
 
-`workers.cuda_probe` runs CUDA Driver API enumeration in a separate process
+`platform.runtime.cuda_probe` runs CUDA Driver API enumeration in a separate process
 with the Worker's GPU environment. Binding UUIDs and local ordinals are stored
 separately from NVML observation indices, with an environment fingerprint and
 verification timestamp. Shared admission requires normal compute mode and a
 whole GPU without active MIG. Ultralytics supports shared single-card and
 exclusive multi-card execution; Paddle/custom-source use exclusive single-card
 execution. Unsupported sharing remains queued.
+
+The probe's thin `-m` entry delegates to `platform/runtime/cuda_probe_impl.py`.
+Both are covered by the protected platform tree in pyc builds. Cython keeps
+the entry as Python so `-m` can execute it while compiling the implementation.
+No Worker probe entry is retained; the platform caller starts the platform
+module directly, with the inherited GPU environment and timeout unchanged.
 
 Allocation transactions lock the run, node, Worker and sorted physical UUIDs
 before reading active commitments. MySQL Worker allocation transactions use
@@ -185,6 +212,14 @@ registration alone never proves process exit. Worker retries retain the job and
 allocation budget, expose cleanup reasons through resource `reason_details`,
 and deduplicate unchanged cleanup events. Final release clears cleanup waiting
 state in the same transaction as the run's terminal state.
+The Worker reports cleanup facts to `resources/lifecycle.mark_cleanup_pending`,
+which locks and rechecks the run and allocation owner before persisting wait
+details and deduplicated events. It does not change run status or release the
+allocation. The Worker also sends its observed job count to
+`resources/inventory.update_worker_running_task_count`, keyed by instance ID;
+this is distinct from the active allocation count. Both use caller-owned
+Sessions and preserve the Worker's transaction boundaries. TrainingRun state
+transitions remain in `domains/training/runs/lifecycle.py`.
 DDP cleanup failures still allow the common registry recovery to run, but both
 cleanup paths must confirm completion before the allocation can be released.
 

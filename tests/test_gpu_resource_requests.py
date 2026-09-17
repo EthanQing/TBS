@@ -168,7 +168,7 @@ def test_worker_excludes_resource_requests_before_candidate_limit(resource_db, m
     assert candidates == ["auto"]
 
 
-def test_resource_get_endpoints_are_inventory_only(resource_db):
+def test_resource_get_endpoints_are_inventory_only(resource_db, monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from train_platform.api.v3.gpu_resources import router
@@ -185,7 +185,9 @@ def test_resource_get_endpoints_are_inventory_only(resource_db):
 
     def override_db():
         with resource_db() as db:
+            monkeypatch.setattr(db, "commit", lambda: pytest.fail("GET committed"))
             yield db
+            assert not db.new and not db.dirty and not db.deleted
 
     app.dependency_overrides[get_db] = override_db
     with TestClient(app) as client:
@@ -202,9 +204,63 @@ def test_resource_get_endpoints_are_inventory_only(resource_db):
             else:
                 assert data["reason_code"] == "scheduler_disabled"
                 assert data["resource_request"]["memory_mib_per_gpu"] == 18432
+                assert data["resource_request"]["run_id"] == run_id
+                assert data["resource_request"]["created_at"]
         for path in ["gpu-resources", "gpu-workers"]:
             response = client.get(f"/api/v3/{path}")
             assert response.status_code == 200, response.text
             assert response.json()["scheduler_stage"] == "inventory_only"
             assert response.json()["allocation_enabled"] is False
             assert "reserved_mib" not in response.text
+
+
+@pytest.mark.parametrize(('target', 'allocation_node', 'state', 'reason', 'enabled', 'expected_reason'), [
+    (None, None, None, None, True, None),
+    ('disabled', None, None, None, False, 'scheduler_disabled'),
+    ('disabled', 'enabled', 'running', None, True, None),
+    ('enabled', 'disabled', 'running', None, False, 'scheduler_disabled'),
+    ('disabled', None, None, 'gpu_exclusive_busy', False, 'gpu_exclusive_busy'),
+    ('disabled', 'disabled', 'releasing', 'gpu_exclusive_busy', False, 'cleanup_pending'),
+])
+def test_resource_status_node_and_reason_precedence(
+    resource_db, target, allocation_node, state, reason, enabled, expected_reason,
+):
+    from train_platform.api.v3.gpu_resources import get_training_run_resources
+    from train_platform.models.v3.gpu_allocation import GpuAllocation, GpuNodeSchedulingState
+
+    with resource_db() as db:
+        run = service.TrainingRunService().create_run(db, obj=payload({'node_id': target}))
+        run.hidden = True  # Resource status historically includes hidden runs.
+        run.resource_wait_reason = reason
+        run.resource_wait_details = {'message': 'retained'}
+        db.add_all([
+            GpuNodeSchedulingState(node_id='enabled', managed=True, accepting_allocations=True),
+            GpuNodeSchedulingState(node_id='disabled', managed=True, accepting_allocations=False),
+        ])
+        if allocation_node:
+            now = datetime.now(timezone.utc)
+            db.add(GpuAllocation(allocation_id='current', run_id=run.run_id,
+                worker_instance_id='instance', worker_id='worker', node_id=allocation_node,
+                state=state, request_snapshot={'selection': 'auto'},
+                reserved_at=now, launch_deadline_at=now))
+            run.current_allocation_id = 'current'
+        db.commit()
+        response = get_training_run_resources(run.run_id, db).model_dump()
+        assert response['allocation_enabled'] is enabled
+        assert response['scheduler_stage'] == 'managed_allocation'
+        assert response['reason_code'] == expected_reason
+        assert response['reason_details'] == {'message': 'retained'}
+        assert response['resource_request']['run_id'] == run.run_id
+        assert len(response['allocation_history']) == bool(allocation_node)
+        if allocation_node:
+            assert response['allocation']['node_id'] == allocation_node
+            assert response['effective_request'] == {'selection': 'auto'}
+        assert not db.new and not db.dirty and not db.deleted
+
+
+def test_resource_status_missing_run_preserves_error(resource_db):
+    from train_platform.domains.training.resources.queries import get_training_run_resource_status
+    from train_platform.utils.exceptions import NotFoundError
+
+    with resource_db() as db, pytest.raises(NotFoundError, match='^Training run not found$'):
+        get_training_run_resource_status(db, 'missing')

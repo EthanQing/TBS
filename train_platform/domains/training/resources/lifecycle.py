@@ -9,8 +9,8 @@ from train_platform.domains.training.runs.lifecycle import finalize_execution, m
 from train_platform.models.v3.gpu_allocation import GpuAllocation
 from train_platform.models.v3.gpu_allocation import GpuAllocationDevice, GpuNodeSchedulingState
 from train_platform.models.v3.gpu_resource import GpuDevice, GpuWorkerInstance
-from train_platform.models.v3.training_run import TrainingRun
-from train_platform.models.v3.enums import TrainingRunStatus
+from train_platform.models.v3.training_run import TrainingRun, TrainingRunEvent
+from train_platform.models.v3.enums import LogLevel, TrainingRunStatus
 from train_platform.platform.runtime.process_scope import compare_process_scope
 
 
@@ -20,6 +20,24 @@ def _now(value: datetime | None) -> datetime:
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def mark_cleanup_pending(
+    db: Session, *, run_id: str, allocation_id: str,
+    execution_owner: dict | None, reason: str, error: str,
+) -> bool:
+    run = db.query(TrainingRun).filter_by(run_id=run_id).with_for_update().first()
+    allocation = db.query(GpuAllocation).filter_by(allocation_id=allocation_id).with_for_update().first()
+    if (allocation is None or run is None or allocation.execution_owner != execution_owner
+            or run.current_allocation_id != allocation_id):
+        return False
+    details = {"cleanup_status": reason, "error": error}
+    if run.resource_wait_reason != "cleanup_pending" or (run.resource_wait_details or {}) != details:
+        run.resource_wait_reason = "cleanup_pending"
+        run.resource_wait_details = details
+        db.add(TrainingRunEvent(run_id=run.run_id, level=LogLevel.INFO,
+                                event_type="cleanup_pending", message=reason, data=details))
+    return True
 
 
 def _locked(db: Session, allocation_id: str) -> GpuAllocation:

@@ -21,6 +21,7 @@ from train_platform.domains.training.resources.inventory import (
 from train_platform.platform.runtime import process_scope
 from train_platform.platform.runtime.gpu_probe import GpuProbeResult, probe_gpus
 from train_platform.platform.runtime.cuda_devices import probe_cuda_devices
+from train_platform.domains.training.resources.queries import get_active_allocation_ownership_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -30,15 +31,12 @@ def enrich_process_attribution(result: GpuProbeResult, node_id: str | None) -> G
     host_proc_root = getattr(settings, "gpu_host_proc_root", None)
     if not host_proc_root or not node_id or result.status != "success":
         return result
-    from train_platform.models.v3.gpu_allocation import GpuAllocation
     from train_platform.platform.runtime.gpu_processes import attribute_driver_processes, load_execution_registrations
 
     with session_scope() as db:
-        allocations = db.query(GpuAllocation).filter(
-            GpuAllocation.node_id == node_id, GpuAllocation.state != "released",
-        ).all()
-        owners = {item.allocation_id: dict(item.execution_owner) for item in allocations if item.execution_owner}
-        run_ids = {item.run_id for item in allocations if item.execution_owner}
+        allocations = get_active_allocation_ownership_snapshot(db, node_id=node_id)
+    owners = {item["allocation_id"]: item["execution_owner"] for item in allocations}
+    run_ids = {item["run_id"] for item in allocations}
     registrations = []
     for run_id in run_ids:
         registrations.extend(load_execution_registrations(settings.training_dir / run_id / "runtime/executions"))

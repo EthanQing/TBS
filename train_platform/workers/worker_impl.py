@@ -275,24 +275,15 @@ class DbQueueWorker:
         self._allocation_scan_cursor = AllocationScanCursor()
 
     def _record_cleanup_pending(self, allocation: Mapping[str, Any], reason: str, error: str) -> None:
-        from train_platform.models.v3.gpu_allocation import GpuAllocation
+        from train_platform.domains.training.resources.lifecycle import mark_cleanup_pending
         db = SessionLocal()
         try:
-            run = db.query(TrainingRun).filter_by(run_id=allocation["run_id"]).with_for_update().first()
-            locked = db.query(GpuAllocation).filter_by(
-                allocation_id=allocation["allocation_id"],
-            ).with_for_update().first()
-            owner = allocation.get("owner")
-            if (locked is None or run is None or locked.execution_owner != owner
-                    or run.current_allocation_id != allocation["allocation_id"]):
+            if not mark_cleanup_pending(
+                db, run_id=allocation["run_id"], allocation_id=allocation["allocation_id"],
+                execution_owner=allocation.get("owner"), reason=reason, error=error,
+            ):
                 db.rollback()
                 return
-            details = {"cleanup_status": reason, "error": error}
-            if run.resource_wait_reason != "cleanup_pending" or (run.resource_wait_details or {}) != details:
-                run.resource_wait_reason = "cleanup_pending"
-                run.resource_wait_details = details
-                db.add(TrainingRunEvent(run_id=run.run_id, level=LogLevel.INFO,
-                                        event_type="cleanup_pending", message=reason, data=details))
             db.commit()
         finally:
             db.close()
@@ -367,12 +358,10 @@ class DbQueueWorker:
         instance_id = getattr(self._gpu_resource_reporter, "instance_id", None)
         if not instance_id:
             return
-        from train_platform.models.v3.gpu_resource import GpuWorkerInstance
+        from train_platform.domains.training.resources.inventory import update_worker_running_task_count
         db = SessionLocal()
         try:
-            worker = db.get(GpuWorkerInstance, instance_id)
-            if worker is not None and hasattr(worker, "running_task_count"):
-                worker.running_task_count = len(self._running_jobs)
+            if update_worker_running_task_count(db, instance_id, len(self._running_jobs)):
                 db.commit()
         finally:
             db.close()

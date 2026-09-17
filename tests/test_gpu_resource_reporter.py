@@ -7,6 +7,57 @@ from train_platform.platform.runtime.gpu_probe import GpuProbeResult
 from train_platform.workers import gpu_resource_reporter as reporter
 
 
+def test_attribution_reads_snapshot_then_files_outside_transaction(monkeypatch, tmp_path):
+    from train_platform.platform.runtime import gpu_processes
+    from train_platform.platform.runtime.gpu_probe import GpuProbeDevice
+
+    in_transaction = False
+    observed = []
+    owner = {"process_scope": {"boot_id": "boot"}}
+
+    @contextmanager
+    def session_scope():
+        nonlocal in_transaction
+        assert not in_transaction
+        in_transaction = True
+        try:
+            yield object()
+        finally:
+            in_transaction = False
+
+    def snapshot(db, *, node_id):
+        assert in_transaction and node_id == "node"
+        observed.append("snapshot")
+        return [dict(allocation_id="allocation", run_id="run", execution_owner=owner)]
+
+    def load(path):
+        assert not in_transaction
+        assert path == tmp_path / "run/runtime/executions"
+        observed.append("files")
+        return [{"create_time": 1.0}, {"create_time": 99999999999.0}]
+
+    def attribute(processes, registrations, **kwargs):
+        assert not in_transaction
+        assert registrations == [{"create_time": 1.0}]
+        assert kwargs["active_owners"] == {"allocation": owner}
+        observed.append("attribution")
+        return SimpleNamespace(usage_by_allocation={"allocation": 5}, complete=True,
+                               has_duplicates=False, error=None)
+
+    monkeypatch.setattr(reporter, "settings", SimpleNamespace(gpu_host_proc_root="/host/proc", training_dir=tmp_path))
+    monkeypatch.setattr(reporter, "session_scope", session_scope)
+    monkeypatch.setattr(reporter, "get_active_allocation_ownership_snapshot", snapshot)
+    monkeypatch.setattr(gpu_processes, "load_execution_registrations", load)
+    monkeypatch.setattr(gpu_processes, "attribute_driver_processes", attribute)
+    sample = GpuProbeResult("success", "nvml", datetime.now(timezone.utc), [
+        GpuProbeDevice("GPU-a", "GPU", memory_used_mib=10,
+            process_snapshot={"complete": True, "processes": [{"memory_used_mib": 5}]}),
+    ], complete=True)
+    result = reporter.enrich_process_attribution(sample, "node")
+    assert observed == ["snapshot", "files", "attribution"]
+    assert result.devices[0].process_snapshot["usage_by_allocation"] == {"allocation": 5}
+
+
 def test_reporter_retries_registration_and_probe_failure(monkeypatch):
     registrations = []
     reports = []

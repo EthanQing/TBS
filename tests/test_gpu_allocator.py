@@ -100,6 +100,45 @@ def test_releasing_still_blocks_allocation(db):
     assert reserve(db, "b").reason_code == "gpu_exclusive_busy"
 
 
+def test_cleanup_pending_domain_preserves_owner_state_and_deduplicates(db, monkeypatch):
+    from train_platform.domains.training.resources.lifecycle import mark_cleanup_pending
+    from train_platform.models.v3.enums import LogLevel
+
+    run = enqueue(db, "cleanup")
+    allocation = reserve(db, run.run_id).allocation
+    owner = {"guard_pid": 202, "process_scope": SCOPE}
+    allocation.execution_owner = owner
+    allocation.state = "releasing"
+    db.commit()
+    allocation_id = allocation.allocation_id
+    args = dict(run_id=run.run_id, allocation_id=allocation_id,
+                execution_owner=owner, reason="unconfirmed", error="scope unknown")
+    monkeypatch.setattr(db, "commit", lambda: pytest.fail("domain committed"))
+    monkeypatch.setattr(db, "rollback", lambda: pytest.fail("domain rolled back"))
+    for _ in range(2):
+        assert mark_cleanup_pending(db, **args)
+        db.flush()
+    events = db.query(TrainingRunEvent).filter_by(event_type="cleanup_pending").all()
+    assert len(events) == 1
+    assert events[0].level == LogLevel.INFO and events[0].message == "unconfirmed"
+    assert events[0].data == {"cleanup_status": "unconfirmed", "error": "scope unknown"}
+    assert mark_cleanup_pending(db, **{**args, "error": "new evidence"})
+    db.flush()
+    assert db.query(TrainingRunEvent).filter_by(event_type="cleanup_pending").count() == 2
+    assert not mark_cleanup_pending(db, **{**args, "execution_owner": {"guard_pid": 999}})
+    assert not mark_cleanup_pending(db, **{**args, "run_id": "missing"})
+    assert not mark_cleanup_pending(db, **{**args, "allocation_id": "missing"})
+    assert run.current_allocation_id == allocation_id
+    assert run.status == TrainingRunStatus.QUEUED
+    assert allocation.state == "releasing" and allocation.released_at is None
+    assert allocation.execution_owner == owner
+    run.current_allocation_id = "another"
+    db.flush()
+    assert not mark_cleanup_pending(db, **args)
+    assert run.resource_wait_details["error"] == "new evidence"
+    assert db.query(TrainingRunEvent).filter_by(event_type="cleanup_pending").count() == 2
+
+
 def test_revoked_start_cannot_be_activated_late(db):
     from train_platform.domains.training.resources import lifecycle
 

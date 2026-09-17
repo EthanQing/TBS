@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from train_platform.models.v3 import V3Base
 from train_platform.models.v3.gpu_allocation import GpuAllocation, GpuNodeSchedulingState
+from train_platform.domains.training.resources.policy import apply_node_policy
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'docker' / 'apply_gpu_node_policy.py'
 spec = importlib.util.spec_from_file_location('apply_gpu_node_policy', SCRIPT)
@@ -154,3 +155,53 @@ def test_main_prints_only_policy(monkeypatch, capsys, sessions):
     monkeypatch.setattr(policy_script, 'apply_policy', lambda policy: apply(policy, sessions))
     assert policy_script.main() == 0
     assert json.loads(capsys.readouterr().out) == policy_script.read_policy(ENV)
+
+
+@pytest.mark.parametrize(('name', 'value'), [
+    ('node_id', ''), ('node_id', ' '), ('node_id', 'x' * 129), ('node_id', None),
+    ('managed', False), ('managed', 1), ('accepting_allocations', False),
+    ('shared_execution_enabled', 'true'), ('shared_execution_enabled', 1),
+    ('max_shared_tasks_per_device', 0), ('max_shared_tasks_per_device', True),
+    ('max_shared_tasks_per_device', 2.5), ('memory_safety_mib', -1),
+    ('memory_safety_mib', 2147483648), ('memory_safety_mib', False),
+])
+def test_domain_rejects_invalid_policy_before_database_access(name, value):
+    with pytest.raises(ValueError):
+        apply_node_policy(object(), {**policy_script.read_policy(ENV), name: value})
+
+
+def test_domain_requires_complete_policy():
+    policy = policy_script.read_policy(ENV)
+    for name in policy:
+        with pytest.raises(ValueError):
+            apply_node_policy(object(), {key: value for key, value in policy.items() if key != name})
+    with pytest.raises(ValueError):
+        apply_node_policy(object(), {**policy, 'unknown': True})
+
+
+def test_domain_leaves_transaction_to_caller(sessions, monkeypatch):
+    policy = policy_script.read_policy(ENV)
+    policy_script.apply_policy(policy, sessions)
+    with sessions() as db:
+        for method in ('commit', 'rollback', 'close'):
+            monkeypatch.setattr(db, method, lambda: pytest.fail('domain took over transaction'))
+        assert apply_node_policy(db, {**policy, 'memory_safety_mib': 7})['memory_safety_mib'] == 7
+        db.flush()
+        monkeypatch.undo()
+        db.rollback()
+    with sessions() as db:
+        assert db.get(GpuNodeSchedulingState, 'existing-node').memory_safety_mib == 4096
+
+
+def test_policy_locks_node_before_first_consistent_read(sessions):
+    statements = []
+    with sessions() as db:
+        def record(execute_state):
+            statements.append(execute_state.statement)
+        event.listen(db, 'do_orm_execute', record)
+        apply_node_policy(db, policy_script.read_policy(ENV))
+        assert len(statements) == 2
+        assert 'gpu_node_scheduling_states' in str(statements[0])
+        assert statements[0]._for_update_arg is not None
+        assert 'gpu_allocations' in str(statements[1])
+        assert statements[1]._for_update_arg is None
